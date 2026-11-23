@@ -400,3 +400,9 @@ executable exit. The three extra trace events reflect the added command-signatur
 
 No game Draw, ExecuteCommandLists, Present, menu or rendered frame is observed in these captures. The default
 configuration has not been remeasured here and remains separate from the four-option experimental path.
+
+## Indirect compute signature accepted
+
+On 24 November 2026 the same offline RTX 5080 / 621.14 diagnostic, using the signed shader index, the BVH cache and the four opt-ins, passed the third signature that previously returned an error. The slot 41 proxy regression passed on CPU. In the executable the first four signatures returned success. The fifth, a 12-byte mesh dispatch, returned unsupported. The first-chance trace contained 2,346 D3D12 events, including 2,298 ok and three unsupported (the mesh signature and two R16_UINT views). No game Draw, ExecuteCommandLists or Present was observed. See [the parent candidates and disposition](docs/peer_compatibility.md).
+
+A separate local Vulkan test loaded the actual builder DLL on the RTX 5080. Its constructor returned after 27.750 seconds with the false flag. All 53 compute pipeline requests succeeded, the destructor returned, and the harness recorded zero calls to TerminateProcess.

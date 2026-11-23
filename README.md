@@ -43,7 +43,7 @@ The direct run records **25 startup events** and **2,341 D3D12 trace events**: 2
 
 ## Current stop and run configurations
 
-The direct run stops on a **guest breakpoint (`0x80000003`)** after the successful pipeline creations. Follow-up tracing records two successful command signatures (draw and indexed draw), then the first failed HRESULT: a 12-byte signature with one argument of type 105. That type's meaning and the breakpoint's cause remain open. The two refused typed SRVs are separate void API calls. The earlier allocation-accounting assertion and secondary-thread null write are not observed in this run; the changes made between captures do not isolate why.
+The direct run stopped on a guest breakpoint after pipeline creation. Follow-up tracing identified the third indirect command signature as the first call returning an error. The slot 41 adapter now accepts its measured 12-byte compute argument (type 105). On the RTX 5080 the next probe created four signatures and stopped after the fifth, a mesh-dispatch signature, returned unsupported. The two R16_UINT buffer views also remain unsupported. See the [parent fixes under review](docs/peer_compatibility.md).
 
 | Configuration | Observed reach |
 |---|---|

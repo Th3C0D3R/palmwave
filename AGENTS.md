@@ -20,6 +20,8 @@ A port template for the Xbox Series build of Xbox Series title, built on the pla
 `make_game.py` carves and translates the shaders (RDNA2 → SPIR-V), exports the assets and builds `runtime/`, a PE
 loader that maps the game's executable and resolves its imports to shims. Nothing of the game is in the repository.
 
+Before designing the next compatibility fix, check the parent branch and its open and closed PRs. Use the [peer source and license comparison](docs/peer_compatibility.md) to record what can be adapted, what was consulted only for facts and what was actually incorporated.
+
 ## Where things are
 
 - The notes under `docs/` record measured formats, indexed by [docs/README.md](docs/README.md); `docs/design.md` is the one quoted most.
