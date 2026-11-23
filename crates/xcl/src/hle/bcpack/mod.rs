@@ -5,25 +5,31 @@
 //! symbol per lane for every 8 bytes of output, and the lanes share the byte stream
 //! (`lanes.rs`). The blocks are then rebuilt from the symbols; that part differs per format.
 //!
-//! What is here: the entropy stage for BC1, BC3, BC4, BC5, BC6H and BC7 ([`lane_widths`]); no
-//! lane layout is published for BC2. Nothing calls it yet: DirectStorage still refuses every
-//! request with a BCPack stage.
+//! What is here:
+//! * the entropy stage for BC1, BC3, BC4, BC5, BC6H and BC7 ([`lane_widths`]); no lane layout
+//!   is published for BC2,
+//! * the rebuild of BC1 blocks ([`bc1`]), which needs two tables of constants that are not in
+//!   the stream ([`bc1::Tables`]). XCL has the estimates bcpack-rs made of them
+//!   (`bc1_fitted.rs`), so its BC1 blocks are an approximation wherever an estimate is off.
 //!
-//! What is not: the rebuild of blocks from the symbols, for any format.
+//! What is not: the rebuild of the other formats. Their lanes decode, but how the symbols map
+//! to block bits is not published in a form XCL can use, so those requests are still refused.
 //!
 //! Nothing here was compared with what a console writes for the same input: the entropy stage
-//! follows Microsoft's published decoder sample and the public format notes of bcpack-decoder
-//! (Tim0219800) and bcpack-rs (Ahmet Dedeler), both MIT, whose authors report them as matching
-//! retail streams. The tests check against streams built independently from those notes
-//! (`tests/data/bcpack`), not against hardware output.
+//! follows Microsoft's published decoder sample and the BC1 rules the public format notes of
+//! bcpack-decoder (Tim0219800) and bcpack-rs (Ahmet Dedeler), both MIT, whose authors report
+//! them as matching retail streams. The tests check against streams built independently from
+//! those notes (`tests/data/bcpack`), not against hardware output.
 
+pub mod bc1;
+mod bc1_fitted;
 mod lanes;
 mod rans_tables;
 
 /// Why a stream was not unpacked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
-    /// no lane layout for this mode
+    /// no block rebuild for this mode (or no lane layout, or no tables)
     Unsupported,
     /// the output is not a whole number of blocks, or too large
     OutputSize,
@@ -39,6 +45,10 @@ pub enum Error {
     Stuck,
     /// bytes other than zero padding follow the stream
     Trailing { consumed: usize },
+    /// BC1 lane 1 is not zero; what it then means is not known
+    Lane1 { block: usize },
+    /// a block refers to an entry of the built-in history that is not known
+    History { block: usize, slot: usize },
 }
 
 impl Error {
@@ -53,6 +63,8 @@ impl Error {
             Error::EndState { .. } => "end state",
             Error::Stuck => "stuck",
             Error::Trailing { .. } => "trailing data",
+            Error::Lane1 { .. } => "lane 1",
+            Error::History { .. } => "unknown history",
         }
     }
 }
@@ -68,6 +80,8 @@ impl std::fmt::Display for Error {
             Error::EndState { lane } => write!(f, "lane {lane} ends in a state no encoder starts from"),
             Error::Stuck => write!(f, "the lanes cannot go on"),
             Error::Trailing { consumed } => write!(f, "data follows the stream's {consumed} bytes"),
+            Error::Lane1 { block } => write!(f, "BC1 block {block} has a non-zero lane 1 symbol"),
+            Error::History { block, slot } => write!(f, "BC1 block {block} refers to the unknown history entry {slot}"),
         }
     }
 }
@@ -99,6 +113,32 @@ pub fn decode_lanes(mode: u8, src: &[u8], out_len: usize) -> Result<Vec<u8>, Err
         return Err(Error::Trailing { consumed });
     }
     Ok(symbols)
+}
+
+/// The BC1 constants, when XCL has them: the estimates of bcpack-rs, and in the tests the
+/// made-up set their fixtures were built with.
+fn bc1_tables() -> Option<&'static bc1::Tables> {
+    #[cfg(test)]
+    {
+        Some(tests::tables())
+    }
+    #[cfg(not(test))]
+    {
+        Some(&bc1_fitted::TABLES)
+    }
+}
+
+/// Whether [`decode`] has a block rebuild for `mode`.
+pub fn can_decode(mode: u8) -> bool {
+    mode == 1 && bc1_tables().is_some()
+}
+
+/// Unpack a stream of `mode` to its `out_len` bytes of BCn blocks.
+pub fn decode(mode: u8, src: &[u8], out_len: usize) -> Result<Vec<u8>, Error> {
+    match (mode, bc1_tables()) {
+        (1, Some(t)) => bc1::decode(src, out_len, t),
+        _ => Err(Error::Unsupported),
+    }
 }
 
 #[cfg(test)]

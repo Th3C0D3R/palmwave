@@ -4,7 +4,20 @@
 
 use super::lanes::{self, L};
 use super::rans_tables::FREQ;
-use super::{decode_lanes, lane_widths, Error};
+use super::{bc1, decode_lanes, lane_widths, Error};
+
+/// The tables the fixtures' `.bc1` files were made with: history entry `slot` has the
+/// channels `(7 * slot + 13 * k) mod range`, and a quadrant symbol is its own selectors.
+pub(crate) fn tables() -> &'static bc1::Tables {
+    static T: std::sync::OnceLock<bc1::Tables> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let range = [32usize, 64, 32, 32, 64, 32];
+        bc1::Tables {
+            history: std::array::from_fn(|slot| Some(std::array::from_fn(|k| ((7 * slot + 13 * k) % range[k]) as u8))),
+            quadrants: std::array::from_fn(|s| s as u8),
+        }
+    })
+}
 
 pub(crate) fn data(name: &str) -> Option<Vec<u8>> {
     std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/bcpack").join(name)).ok()
@@ -68,6 +81,57 @@ fn fixtures_decode_to_their_lanes() {
         padded.push(1);
         assert_eq!(decode_lanes(mode, &padded, units * 8), Err(Error::Trailing { consumed: bin.len() }), "{stem}");
     }
+}
+
+#[test]
+fn bc1_fixtures_decode_to_their_blocks() {
+    for stem in FIXTURES.iter().filter(|s| s.starts_with("bc1-") && **s != "bc1-1-8") {
+        let (_, units) = fixture(stem);
+        let bin = data(&format!("{stem}.bin")).unwrap();
+        let blocks = bc1::decode(&bin, units * 8, tables()).unwrap();
+        match data(&format!("{stem}.bc1")) {
+            Some(want) => assert_eq!(blocks, want, "{stem}"),
+            None => assert_eq!(blocks, bc1::assemble(&large_fixture_symbols(1), tables()).unwrap(), "{stem}"),
+        }
+        assert_eq!(super::decode(1, &bin, units * 8).as_deref(), Ok(&blocks[..]), "{stem}");
+    }
+    // the modes without a block rebuild
+    for mode in [0u8, 2, 3, 4, 5, 6, 7, 8, 15] {
+        assert!(!super::can_decode(mode));
+        assert_eq!(super::decode(mode, &[], 16), Err(Error::Unsupported));
+    }
+}
+
+/// One BC1 block by hand: every field of the rebuild, without the entropy stage.
+#[test]
+fn bc1_block_rebuild() {
+    let t = tables();
+    // block 0: no reference; R0 +3, G0 -1, B0 0, R1 -2, G1 +5, B1 +1; the four quadrants
+    let b0 = [0u8, 0, 6, 1, 0, 3, 10, 2, 0b11_10_01_00, 0b00_00_00_01, 0b10_10_10_10, 0b11_00_11_00];
+    // block 1: one block back; R0 -4 (wraps to 31), the rest unchanged
+    let b1 = [2u8, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    // block 2: 255 back, which is before the stream: history entry 256 + 2 - 255 = 3
+    let b2 = [1u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let out = bc1::assemble(&[b0, b1, b2].concat(), t).unwrap();
+    let c = |r: u16, g: u16, b: u16| (r << 11 | g << 5 | b).to_le_bytes();
+    assert_eq!(out[0..2], c(3, 63, 0));
+    assert_eq!(out[2..4], c(30, 5, 1));
+    // rows: left quadrant's two texels in the low nibble, right quadrant's in the high one
+    assert_eq!(out[4..8], [0b00_01_01_00, 0b00_00_11_10, 0b11_00_10_10, 0b11_00_10_10]);
+    assert_eq!(out[8..10], c(31, 63, 0));
+    assert_eq!(out[10..12], c(30, 5, 1));
+    assert_eq!(out[12..16], [0; 4]);
+    let h = t.history[3].unwrap().map(|v| v as u16);
+    assert_eq!(out[16..20], [c(h[0], h[1], h[2]), c(h[3], h[4], h[5])].concat()[..]);
+
+    // lane 1 is not understood beyond "0"
+    let mut odd = b0;
+    odd[1] = 1;
+    assert_eq!(bc1::assemble(&odd, t), Err(Error::Lane1 { block: 0 }));
+    // an unknown history entry stops the stream instead of guessing
+    let mut holes = bc1::Tables { history: t.history, quadrants: t.quadrants };
+    holes.history[3] = None;
+    assert_eq!(bc1::assemble(&[b0, b1, b2].concat(), &holes), Err(Error::History { block: 2, slot: 3 }));
 }
 
 /// The 8-bit model 11 as US 11,234,023 prints it (its `base_table[8][12]`, counted from 1).
@@ -228,7 +292,13 @@ fn damaged_streams_end_cleanly() {
     for stem in ["bc1-2-0", "bc1-16-1", "bc1-16-9", "bc7-16-1", "bc1-700-2", "bc7-700-2"] {
         let (mode, units) = fixture(stem);
         let bin = data(&format!("{stem}.bin")).unwrap();
-        let check = |bytes: &[u8], units: usize| decode_lanes(mode, bytes, units * 8);
+        let check = |bytes: &[u8], units: usize| {
+            let lanes = decode_lanes(mode, bytes, units * 8);
+            if mode == 1 {
+                assert_eq!(super::decode(1, bytes, units * 8).is_ok(), lanes.is_ok());
+            }
+            lanes
+        };
         // every byte of a stream is some lane's: a shorter one is never whole
         for cut in (0..bin.len()).step_by((bin.len() / 300).max(1)) {
             assert!(check(&bin[..cut], units).is_err(), "{stem} cut at {cut}");
@@ -256,6 +326,7 @@ fn damaged_streams_end_cleanly() {
             let noise: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
             for mode in [1u8, 7] {
                 let _ = decode_lanes(mode, &noise, 64 * 8);
+                let _ = super::decode(mode, &noise, 64 * 8);
             }
         }
     }
@@ -263,4 +334,40 @@ fn damaged_streams_end_cleanly() {
     assert!(decode_lanes(7, &[0x00; 4096], 1 << 20).is_err());
     assert_eq!(decode_lanes(2, &[], 16), Err(Error::Unsupported));
     assert_eq!(decode_lanes(1, &[], 0), Ok(Vec::new()));
+}
+
+/// The tables XCL ships (`bc1_fitted.rs`) are whole and in the layout [`bc1::assemble`] reads.
+#[test]
+fn fitted_bc1_tables_are_well_formed() {
+    let t = &super::bc1_fitted::TABLES;
+    // every quadrant once, the four uniform ones first
+    let mut seen = [false; 256];
+    for &q in &t.quadrants {
+        assert!(!std::mem::replace(&mut seen[q as usize], true), "quadrant {q:#04x} twice");
+    }
+    let uniform = |s: usize| t.quadrants[s] & 3;
+    for s in 0..4 {
+        assert_eq!(t.quadrants[s], uniform(s) * 0x55);
+    }
+    for h in t.history.iter().flatten() {
+        assert!(h.iter().zip([32, 64, 32, 32, 64, 32]).all(|(&c, range)| c < range));
+    }
+
+    // a first block that takes the endpoints of the block before the stream as they are
+    let mut s = [0u8; 12];
+    s[0] = 2;
+    s[8..].copy_from_slice(&[0, 1, 2, 3]);
+    let b = bc1::assemble(&s, t).unwrap();
+    let e = t.history[255].unwrap().map(u16::from);
+    assert_eq!(b[..2], (e[0] << 11 | e[1] << 5 | e[2]).to_le_bytes());
+    assert_eq!(b[2..4], (e[3] << 11 | e[4] << 5 | e[5]).to_le_bytes());
+    let row = |left: usize, right: usize| uniform(left) * 5 | uniform(right) * 5 << 4;
+    assert_eq!(b[4..], [row(0, 1), row(0, 1), row(2, 3), row(2, 3)]);
+
+    // an entry the estimate does not have ends the rebuild
+    if let Some(slot) = (1..256).find(|&k| t.history[k].is_none()) {
+        let d = 256 - slot;
+        s[0] = if d < 128 { 2 * d } else { 2 * (255 - d) + 1 } as u8;
+        assert_eq!(bc1::assemble(&s, t), Err(Error::History { block: 0, slot }));
+    }
 }
