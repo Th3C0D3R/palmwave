@@ -8,6 +8,7 @@
 //     and with a null output or IID, with the references of every object it touches;
 //   - allocation failures in the proxy (operator new, the arrays it unwraps), injected in this executable only;
 //   - device slot 26 called the console's way (the struct's buffer in RCX, the device in RDX) and the PC way;
+//   - device slot 25 the same, with the description array as the stack word, passed through unchanged (--slot25 too);
 //   - console command lists from device slot 73: the object body, the console->PC slot table, ownership, unwrapping
 //     (allocator, bundle, heap array, queue ExecuteCommandLists), unsupported slots failing Close and refusing the
 //     submission until Reset, AllocateUploadMemory over a mapped mock buffer, and the unwrapped PC path of slot 12;
@@ -464,6 +465,35 @@ std::uint64_t WINAPI mock_clear_depth_stencil_view(Mock* self, std::uint64_t dsv
     return 0;
 }
 
+// PC ID3D12Device::GetResourceAllocationInfo (slot 25) as the MSVC C++ method is called: `this`, the hidden return
+// buffer, the visible node mask, the count, and the description array as the first stack word. The answer is set per
+// test; the descriptions are copied as they arrived. Other mock kinds keep the generic entry.
+struct AllocInfoCall {
+    int calls = 0;
+    Mock* self = nullptr;
+    void* out = nullptr;
+    std::uint64_t mask = 0, count = 0;
+    const D3D12_RESOURCE_DESC* descs = nullptr;
+    D3D12_RESOURCE_DESC seen[2]{};
+    D3D12_RESOURCE_ALLOCATION_INFO answer{};
+} g_alloc_info;
+
+std::uint64_t WINAPI mock_get_resource_allocation_info(Mock* self, std::uint64_t out, std::uint64_t mask,
+                                                       std::uint64_t count, std::uint64_t descs, std::uint64_t a5) {
+    if (self->kind != Kind::device) return mock_slot<25>(self, out, mask, count, descs, a5);
+    ++self->calls[25];
+    ++g_alloc_info.calls;
+    g_alloc_info.self = self;
+    g_alloc_info.out = reinterpret_cast<void*>(out);
+    g_alloc_info.mask = mask;
+    g_alloc_info.count = count;
+    g_alloc_info.descs = reinterpret_cast<const D3D12_RESOURCE_DESC*>(descs);
+    for (std::uint32_t i = 0; descs && i < static_cast<std::uint32_t>(count) && i < 2; ++i)
+        std::memcpy(&g_alloc_info.seen[i], &g_alloc_info.descs[i], sizeof(D3D12_RESOURCE_DESC));  // padding included
+    std::memcpy(reinterpret_cast<void*>(out), &g_alloc_info.answer, sizeof(g_alloc_info.answer));
+    return out;
+}
+
 template <std::size_t... I>
 void fill_mock_vtable(void** vtable, std::index_sequence<I...>) {
     ((vtable[I] = reinterpret_cast<void*>(&mock_slot<static_cast<unsigned>(I)>)), ...);
@@ -474,6 +504,7 @@ void** mock_vtable() {
     static const bool filled = [] {
         fill_mock_vtable(table, std::make_index_sequence<kMockSlots>{});
         table[12] = reinterpret_cast<void*>(&mock_create_command_list);
+        table[25] = reinterpret_cast<void*>(&mock_get_resource_allocation_info);
         table[27] = reinterpret_cast<void*>(&mock_create_committed_resource);
         table[47] = reinterpret_cast<void*>(&mock_clear_depth_stencil_view);
         return true;
@@ -2051,6 +2082,104 @@ int check_custom_heap_properties() {
     return 0;
 }
 
+// ---- 9a. Device slot 25, GetResourceAllocationInfo, the console's way and the PC's ----
+//
+// The console call: RCX = buffer for the 16-byte struct, RDX = device, R8 = node mask, R9 = count, the description
+// array as the fifth word on the stack. The descriptions carry made-up flag, layout and padding values: the proxy hands
+// the same pointer and bytes to the device and does not judge them.
+
+int check_resource_allocation_info() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 0, true);
+    EXPECT(device);
+    void* const* vtable = *reinterpret_cast<void* const* const*>(device);
+    const long host_refs = mock->refs;
+    const unsigned long proxy_refs = xs::device_proxy_ref_count(device);
+
+    D3D12_RESOURCE_DESC descs[2];
+    std::memset(descs, 0x5C, sizeof(descs));  // the padding after Dimension keeps this pattern
+    descs[0].Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    descs[0].Alignment = 0x10000;
+    descs[0].Width = 0x1234;
+    descs[0].Height = 0x567;
+    descs[0].DepthOrArraySize = 6;
+    descs[0].MipLevels = 9;
+    descs[0].Format = DXGI_FORMAT_BC7_UNORM;
+    descs[0].SampleDesc = {1, 0};
+    descs[0].Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+    descs[0].Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x80020000u);
+    descs[1].Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    descs[1].Alignment = 0;
+    descs[1].Width = 0xABCDE;
+    descs[1].Height = 1;
+    descs[1].DepthOrArraySize = 1;
+    descs[1].MipLevels = 1;
+    descs[1].Format = DXGI_FORMAT_UNKNOWN;
+    descs[1].SampleDesc = {1, 0};
+    descs[1].Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x1);
+    descs[1].Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x20004u);
+    std::uint8_t original[sizeof(descs)];
+    std::memcpy(original, descs, sizeof(descs));
+
+    struct Padded {
+        std::uint8_t before[16];
+        D3D12_RESOURCE_ALLOCATION_INFO value;
+        std::uint8_t after[64];
+    };
+    using ConsoleFn = std::uint64_t(WINAPI*)(void*, void*, std::uint64_t, std::uint64_t, const D3D12_RESOURCE_DESC*);
+    const auto console = reinterpret_cast<ConsoleFn>(vtable[25]);
+    EXPECT(xs::device_slot_overridden(25));
+
+    // Two answers: ordinary values in both fields, and UINT64_MAX (a rejected description), each passed back as is.
+    const D3D12_RESOURCE_ALLOCATION_INFO answers[] = {{0x0000000123456000ull, 0x0000000000010000ull},
+                                                      {UINT64_MAX, 0x0000000000000200ull}};
+    for (const D3D12_RESOURCE_ALLOCATION_INFO& answer : answers) {
+        g_alloc_info = {};
+        g_alloc_info.answer = answer;
+        Padded padded;
+        std::memset(&padded, 0xA5, sizeof(padded));
+        const auto hits = xs::device_slot_hits(25);
+        const std::uint64_t returned =
+            console(&padded.value, device, 0xdeadbeef00000001ull, 0xfeedface00000002ull, descs);
+        EXPECT(returned == word(&padded.value));
+        EXPECT(g_alloc_info.calls == 1 && mock->calls[25] == static_cast<unsigned>(&answer - answers) + 1);
+        EXPECT(g_alloc_info.self == mock);
+        EXPECT(static_cast<std::uint32_t>(g_alloc_info.mask) == 1 && static_cast<std::uint32_t>(g_alloc_info.count) == 2);
+        EXPECT(g_alloc_info.descs == descs);  // the title's array itself, not a copy
+        EXPECT(std::memcmp(g_alloc_info.seen, original, sizeof(original)) == 0);
+        EXPECT(std::memcmp(descs, original, sizeof(original)) == 0);
+        EXPECT(padded.value.SizeInBytes == answer.SizeInBytes && padded.value.Alignment == answer.Alignment);
+        for (const std::uint8_t byte : padded.before) EXPECT(byte == 0xA5);
+        for (const std::uint8_t byte : padded.after) EXPECT(byte == 0xA5);
+        EXPECT(xs::device_slot_hits(25) == hits + 1);
+        EXPECT(xs::is_device_proxy(device) && word(xs::device_proxy_real_device(device)) == word(mock) &&
+               xs::device_proxy_slot_count(device) == 44 && xs::device_proxy_ref_count(device) == proxy_refs &&
+               mock->refs == host_refs);
+    }
+
+    // A PC C++ caller: the proxy in RCX and its buffer in RDX; the same host method, the same arguments and answer.
+    for (const D3D12_RESOURCE_ALLOCATION_INFO& answer : answers) {
+        g_alloc_info = {};
+        g_alloc_info.answer = answer;
+        const D3D12_RESOURCE_ALLOCATION_INFO pc =
+            reinterpret_cast<ID3D12Device*>(device)->GetResourceAllocationInfo(1, 2, descs);
+        EXPECT(g_alloc_info.calls == 1 && g_alloc_info.self == mock);
+        EXPECT(g_alloc_info.out != device && g_alloc_info.out != nullptr);
+        EXPECT(static_cast<std::uint32_t>(g_alloc_info.mask) == 1 && static_cast<std::uint32_t>(g_alloc_info.count) == 2);
+        EXPECT(g_alloc_info.descs == descs && std::memcmp(g_alloc_info.seen, original, sizeof(original)) == 0);
+        EXPECT(std::memcmp(descs, original, sizeof(original)) == 0);
+        EXPECT(pc.SizeInBytes == answer.SizeInBytes && pc.Alignment == answer.Alignment);
+        EXPECT(xs::device_proxy_ref_count(device) == proxy_refs && mock->refs == host_refs);
+    }
+    EXPECT(mock->calls[25] == 4 && mock->calls[26] == 0 && mock->calls[43] == 0);
+
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: device slot 25 with the buffer in RCX, the device in RDX and the descriptions on the stack reaches "
+                "the PC method once with the title's array unchanged and returns its answer (UINT64_MAX included); the "
+                "PC form is forwarded unchanged\n", g_label);
+    return 0;
+}
+
 // ---- 9b. Title-backed descriptor heaps and CPU descriptor handles (upstream PRs #7021 and #7880, adapted) ----
 //
 // A synthetic allocator stands in for the bridge to __XMemAllocationHooks__ (d3d12_xs.cpp; its registry side is in
@@ -3018,6 +3147,7 @@ int main(int argc, char** argv) {
         rt::d3d12_trace::set_enabled(true);
         return check_srv_at_va();
     }
+    if (argc == 2 && std::strcmp(argv[1], "--slot25") == 0) return check_resource_allocation_info();
     if (argc == 3 && std::strcmp(argv[1], "--host-import-experiment") == 0) {
         if (std::strcmp(argv[2], "on") == 0) return run_host_import_experiment(true);
         if (std::strcmp(argv[2], "off") == 0) return run_host_import_experiment(false);
@@ -3033,7 +3163,7 @@ int main(int argc, char** argv) {
     if (check_placed_resource_refusal() || check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_xbox_queue_descriptions() ||
         check_lists() || check_shared_base_list() || check_experimental_flush() ||
-        check_custom_heap_properties() || check_descriptor_heaps() || check_list_descriptor_handles() ||
+        check_custom_heap_properties() || check_resource_allocation_info() || check_descriptor_heaps() || check_list_descriptor_handles() ||
         check_srv_at_va())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);

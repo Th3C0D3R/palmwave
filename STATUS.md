@@ -193,3 +193,19 @@ and 32 out-of-bounds zeros match, and all 32 shifted-control values differ. This
 strict resolver check: arena resources share their VkBuffer rather than owning an individual buffer handle.
 The host-import cases validate descriptor construction and existing copies; imported-buffer shader addressing
 remains unverified as described above.
+
+## Allocation-info calling convention
+
+Device slot 25 now accepts the measured console struct-return form as well as the PC C++ form. The description
+array, flags, layout and padding reach the backend unchanged; the adapter returns its size and alignment without
+substitution. Thirteen CPU mock CTests pass in 0.33 seconds, plus the dedicated slot-25 check, including stack
+arguments, output canaries, reference counts and an unchanged invalid-size result. No GPU is used by these mocks.
+
+The next offline RTX 5080 / driver 621.14 probe passes the former access violation. The first 3840x2160 RGBA8
+render-target allocation query succeeds with size 33,423,360 bytes and alignment 65,536, without added console
+padding. This validates that request on this backend, not the general console tiling or metadata contract. The
+probe records 23 startup events, four successful DLL initializations, no unimplemented import, and 2,236 D3D12
+events: 2,201 successful, 24 call records and eleven experimental records. Resource creation then reaches Xbox
+device slot 127, which is beyond the PC interface and returns E_NOTIMPL; a guest assertion follows. Both existing
+synchronization and host-import diagnostic options remain enabled. No Draw, ExecuteCommandLists, Present or
+rendered game frame is observed.

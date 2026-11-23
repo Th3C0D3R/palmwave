@@ -22,7 +22,7 @@ Palmwave is an experimental open-source Xbox Series compatibility layer and shad
 
 **The tested Xbox Series executable starts on PC and reaches Vulkan graphics initialization on NVIDIA RTX 5080. It then stops during startup. No menu or rendered game frame has been observed.**
 
-**Local compatibility milestone: graphics device reached.** The default run creates five queues, five fences, an allocator and the first Xbox command list, then stops at unimplemented list methods 132 and 131. With the explicitly opt-in synchronization and host-memory experiments, the run reaches **581 command lists created and closed, a real 174 MiB buffer import and the first descriptor heap**. It now passes that heap-address assertion and reaches SRV/UAV/CBV calls, including a RAW view through Xbox device slot 70. The next stop is the struct-return adapter for allocation information at slot 25. This experimental result does not establish a stable launch or a first frame. Measurements and limitations are recorded in [STATUS.md](STATUS.md); a successful presentation call alone would not establish a rendered image.
+**Local compatibility milestone: graphics device reached.** The default run creates five queues, five fences, an allocator and the first Xbox command list, then stops at unimplemented list methods 132 and 131. With the explicitly opt-in synchronization and host-memory experiments, the run reaches **581 command lists created and closed, a real 174 MiB buffer import and the first descriptor heap**. It now passes that heap-address assertion and reaches SRV/UAV/CBV calls, including a RAW view through Xbox device slot 70. The allocation-info adapter at slot 25 now succeeds; the next stop is resource creation at slot 127. This experimental result does not establish a stable launch or a first frame. Measurements and limitations are recorded in [STATUS.md](STATUS.md); a successful presentation call alone would not establish a rendered image.
 
 ## What it does
 
@@ -50,7 +50,7 @@ Measured on **Ryzen 9 9950X3D / NVIDIA RTX 5080 16 GB / driver 621.14 / Windows 
 | GPU pipeline creation | 18,500 completed with zero failures/skips; bulk build stopped to release memory; full-pass result pending |
 | Retail dry-run / initialization | Both exit 0; four DLL initializations succeed |
 | Retail execution | Vulkan device, five queues, five fences, an allocator and the first Xbox command list created on RTX 5080; recording stops at methods 132 and 131 |
-| Opt-in startup diagnostics | 581 lists created and closed; real 174 MiB buffer imported; heap-address assertion passed; SRV/UAV/CBV calls and slot-70 RAW view reached; stops at allocation-info slot 25; experimental ABI hypotheses |
+| Opt-in startup diagnostics | 581 lists created and closed; real 174 MiB buffer imported; heap-address assertion passed; SRV/UAV/CBV calls and slot-70 RAW view reached; allocation-info slot 25 succeeds; stops at resource-creation slot 127; experimental ABI hypotheses |
 | First rendered frame | Not verified |
 
 These counts are preparation results, not gameplay or rendering results. Historical measurements in the inherited `docs/` remain attributed to their original authors and hardware.

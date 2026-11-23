@@ -5,7 +5,7 @@
 // the same index through a 15-argument integer prototype. Every PC D3D12 device method takes integer/pointer
 // arguments only, so the x64 registers and stack words line up exactly; methods that return a struct keep their
 // hidden return pointer in RDX, which is passed through as the first argument unchanged. The measured exceptions
-// are IUnknown (0-2), slot 14 (which wraps the heap), 26 (the title passes the return buffer in RCX and the device in
+// are IUnknown (0-2), slot 14 (which wraps the heap), 25/26 (the title passes the return buffer in RCX and the device in
 // RDX), 62, 70 (a raw buffer SRV named by GPU VA, never the PC CreatePlacedResource1), 76 and 133
 // (CreatePlacedResourceX, handed to the device's registered handler), plus the heap proxy's 9/10 conversion from the PC hidden-pointer form to the Xbox RAX form. Slots
 // 8/75 (command queues), 36 (fences) and 32 (a shared fence) wrap what they create in queue and fence proxies built
@@ -2725,6 +2725,29 @@ D3D12_HEAP_PROPERTIES* proxy_get_custom_heap_properties(D3D12_HEAP_PROPERTIES* o
     return out;
 }
 
+// Device slot 25, GetResourceAllocationInfo, returning a 16-byte D3D12_RESOURCE_ALLOCATION_INFO. Measured on the
+// retail boot with the same form as slot 26: RCX = return buffer, RDX = device proxy, R8 = visible node mask,
+// R9 = resource count, and the description array as the fifth word on the stack ([entry RSP + 0x28]); the caller
+// reads both fields from the buffer after the call. The buffer's address goes back in RAX. The routing is adapted
+// from sneylol's Leonida PR #6973 (5dbc30bed79b399b527460501c0ee33f28712096, GPL-3.0), slot 25 only.
+//
+// The descriptions are handed to the device as they are: the same pointer and count, no copy, no rewrite of console
+// flags, layout or padding. Whatever the device answers (UINT64_MAX for a description it rejects) is returned
+// unchanged; that is a separate question from the call form fixed here.
+D3D12_RESOURCE_ALLOCATION_INFO* proxy_get_resource_allocation_info(D3D12_RESOURCE_ALLOCATION_INFO* out,
+                                                                   DeviceProxy* self, UINT visible_mask, UINT count,
+                                                                   const D3D12_RESOURCE_DESC* descs) {
+    note_slot(25);
+    *out = self->real->GetResourceAllocationInfo(visible_mask, count, descs);
+    const bool failed = out->SizeInBytes == UINT64_MAX;
+    d3d12_trace::record("Xbox GetResourceAllocationInfo (device slot 25)", failed ? "failed" : "ok");
+    if (d3d12_trace::enabled() || trace_enabled())
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 25 allocation node_mask=%u count=%u size=%llu alignment=%llu result=%s\n",
+                     visible_mask, count, static_cast<unsigned long long>(out->SizeInBytes),
+                     static_cast<unsigned long long>(out->Alignment), failed ? "failed" : "ok");
+    return out;
+}
+
 // Device slot 133 is the console's CreatePlacedResourceX: (va, desc, state, clear, riid, out), measured on the retail
 // executable (docs/retail_boot_chain.md section 3.4: riid IID_ID3D12Resource, the third word 0xFFFFFFFF, whose meaning
 // is not established). `va` is the start of memory the title has just mapped and `desc` a 56-byte description. The
@@ -3161,6 +3184,14 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             static_cast<std::uint32_t>(a3), reinterpret_cast<const void*>(a4), reinterpret_cast<const IID*>(a5),
             reinterpret_cast<void**>(a6)));
     } else {
+        if constexpr (Slot == 25) {
+            // Same rule as slot 26: the console form has the device in RDX, checked before `self` (the console
+            // caller's return buffer) is read. a4 is the first stack argument in both forms.
+            if (is_device_proxy(reinterpret_cast<const void*>(a1)))
+                return reinterpret_cast<std::uint64_t>(proxy_get_resource_allocation_info(
+                    reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(self), reinterpret_cast<DeviceProxy*>(a1),
+                    static_cast<UINT>(a2), static_cast<UINT>(a3), reinterpret_cast<const D3D12_RESOURCE_DESC*>(a4)));
+        }
         if constexpr (Slot == 26) {
             // The console form has the device in RDX. A PC C++ caller has the proxy in RCX and its return buffer in
             // RDX; that call goes to the forwarder below, as before.
@@ -3377,7 +3408,7 @@ void set_placed_at_va_handler(PlacedAtVaHandler handler) {
 }
 
 bool device_slot_overridden(unsigned slot) {
-    if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || (slot >= 17 && slot <= 24) || slot == 26 ||
+    if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || (slot >= 17 && slot <= 24) || slot == 25 || slot == 26 ||
         slot == 31 || slot == 32 || slot == 34 ||
         slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
         slot == 70 || slot == 75 || slot == 76 || slot == 133)
