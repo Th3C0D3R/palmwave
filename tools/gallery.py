@@ -499,7 +499,7 @@ def start_server(
 
     url = f"http://localhost:{addr[1]}"
     print(f"======================================================")
-    print(f"       PALMWAVE 3D ASSET STUDIO (VICE CITY EDITION)    ")
+    print(f"       PALMWAVE 3D ASSET STUDIO (VICE CITY EDITION)   ")
     print(f"======================================================")
     print(f"Web Studio URL:     {url}")
     print(f"Models Directory:   {StudioHandler.models_dir}")

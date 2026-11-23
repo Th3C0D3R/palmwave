@@ -40,7 +40,7 @@ rpf9dump; a solo assets run still lets rpf9dump use every core.
 Long steps log percent and a rough ETA (shader translation shards, asset exports, XMA decode, and overall
 weighted stage completion while they overlap).
 
-On an interactive terminal, a PALMWAVE setup screen asks for --jobs and whether to overlap stages, then a
+On an interactive terminal, a Palmwave setup screen asks for --jobs and whether to overlap stages, then a
 key-switchable per-stage log view (1-4 / Tab) keeps parallel output demuxed; full logs land in <work>/logs/.
 Pass --no-tui (or redirect stdout) for the plain interleaved console.
 """
@@ -2699,7 +2699,7 @@ def main() -> int:
                          "block; on by itself when the runtime's GPU reports maxPushConstantsSize below what "
                          "the shaders need (144, or 152 with --mesh-compute)")
     ap.add_argument("--no-tui", action="store_true",
-                    help="plain console logs (default when stdout is not a TTY); skip the PALMWAVE setup screen "
+                    help="plain console logs (default when stdout is not a TTY); skip the Palmwave setup screen "
                          "and per-stage log view")
     a = ap.parse_args()
     stages = STAGES
