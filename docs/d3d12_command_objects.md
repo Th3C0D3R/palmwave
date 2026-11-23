@@ -790,6 +790,30 @@ Queues and fences are wrapped the same way.
     `unsupported`, and returns `E_NOTIMPL` without a PC call. The list keeps the first such slot. Its `Close`
     still closes the real list but returns `E_NOTIMPL`, and queue `ExecuteCommandLists` refuses the whole call
     (traced `refused`) until a successful `Reset`. A partial list therefore never runs as if it were complete.
+  - **Experimental slots 131/132 (opt-in, off by default).** This is a diagnostic hypothesis, not a measured
+    contract. By default console slots 131 and 132 are unsupported like every other unmodelled slot. When
+    `PALMWAVE_EXPERIMENTAL_XBOX_FLUSH` is exactly `1` at list creation, four exact four-word argument tuples are
+    handled differently. All four 64-bit words are compared, because how many bits the console method reads is
+    unproved:
+    - 132: `(0x700000, 0, 0, 0x0000ffffffffff00)` and `(0x100000, 0, 0, 0x0000ffffffffff00)`;
+    - 131: `(0xc3c0, 0x80020000, 0, 0x0000ffffffffff00)` and `(0xc380, 0x20000, 0, 0x0000ffffffffff00)`.
+
+    For these tuples the proxy queries the backend list for `ID3D12GraphicsCommandList7`. On the returned pointer
+    it records one enhanced `Barrier` with a single `GLOBAL` group: `SYNC_ALL` before and after, `ACCESS_COMMON`
+    before and after. It then releases that pointer. The call is traced `experimental-hypothesis`, never `ok`, and
+    the first use of each slot is logged in a line marked EXPERIMENTAL HYPOTHESIS. The return register is 0, but no
+    contract is claimed for it.
+
+    Everything else stays strict and is traced `unsupported`, poisoning the list as above. That covers any other
+    value of the variable (unset, `0`, `true`, `1 `, ...), any changed word, a tuple on the other slot, any other
+    slot, and a backend list without GCL7. The experiment never clears an earlier poison mark. The barrier is void,
+    so if the backend cannot record it, the backend's list fails and the proxy's `Close` returns that failure.
+
+    A statically found third 131 form, `(0xc280, 0x20000, 0, 0x0000ffffffffff00)`, is deliberately not accepted
+    until it has been observed at run time. On the Vulkan layer this barrier becomes one `VkMemoryBarrier2`:
+    `ALL_COMMANDS` stages and `MEMORY_READ|MEMORY_WRITE` access on both sides (`runtime/src/vulkan_replay.h`,
+    `vulkan_barrier_access` / `vulkan_barrier_scope`). It needs synchronization2 at replay; without it the backend
+    reports the command unsupported. The evidence and the limits are in [BLOCKERS.md](BLOCKERS.md).
   - **Unwrapping.** Queue `ExecuteCommandLists` unwraps list proxies. The list itself unwraps the allocator at
     `Reset`, a bundle at `ExecuteBundle` and heap proxies at `SetDescriptorHeaps`.
   - **Upload memory.** `AllocateUploadMemory` carves from persistently mapped UPLOAD buffers. The six root
@@ -799,7 +823,10 @@ Queues and fences are wrapped the same way.
     6, unknown values) is refused with `E_NOTIMPL` instead of being coerced to direct, because the DMA-list
     vtable is not modelled.
   - **Tests.** `xs_proxy_mock_test` checks the layout, ownership, forwarding, unwrapping and refusals over
-    synthetic objects. Nothing here has been run against the retail executable or on a GPU.
+    synthetic objects. It also checks every off/mismatch/no-GCL7/poison/Close-failure case of the 131/132
+    experiment. The RTX 5080 Vulkan test executes four barriers between eight copies and reads back all
+    1024 bytes correctly with validation enabled. The offline experimental probe passes five list closures,
+    then refuses another creation interface. This tests the barrier path, not the Xbox ABI; see STATUS.md.
 
 Command allocators get the same kind of proxy: device slot 9 (`CreateCommandAllocator`) returns one.
 

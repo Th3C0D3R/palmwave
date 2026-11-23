@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "%s line %d: %s\n", label, __LINE__, #condition); return 1; } \
@@ -143,6 +144,133 @@ int copy_round(const char* label, ID3D12Device* device, ID3D12CommandQueue* queu
     const D3D12_RANGE none{0, 0};
     readback->Unmap(0, &none);
     EXPECT(wrong == 0);
+    return 0;
+}
+
+// Preserve the caller's opt-in setting, including an absent or empty value, on every exit path.
+class ScopedEnvironment {
+public:
+    explicit ScopedEnvironment(const char* name) : name_(name) {
+        SetLastError(ERROR_SUCCESS);
+        const DWORD needed = GetEnvironmentVariableA(name_, nullptr, 0);
+        present_ = needed != 0 || GetLastError() == ERROR_SUCCESS;
+        if (needed) {
+            value_.resize(needed);
+            const DWORD copied = GetEnvironmentVariableA(name_, value_.data(), needed);
+            valid_ = copied < needed && copied != 0;
+            if (valid_) value_.resize(copied);
+        } else {
+            valid_ = present_ || GetLastError() == ERROR_ENVVAR_NOT_FOUND;
+        }
+    }
+    ~ScopedEnvironment() {
+        if (valid_) SetEnvironmentVariableA(name_, present_ ? value_.c_str() : nullptr);
+    }
+    bool valid() const { return valid_; }
+private:
+    const char* name_;
+    std::string value_;
+    bool present_ = false;
+    bool valid_ = false;
+};
+
+// Recording methods are void. Never interpret their unspecified return register as an HRESULT.
+void record_console_slot(void* list, unsigned slot, std::uint64_t a1, std::uint64_t a2,
+                         std::uint64_t a3, std::uint64_t a4, std::uint64_t a5 = 0) {
+    using Fn = void(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                            std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                            std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
+    auto** vtable = *reinterpret_cast<void***>(list);
+    reinterpret_cast<Fn>(vtable[slot])(list, a1, a2, a3, a4, a5, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+}
+
+// Vulkan-only diagnostic: four independent COPY_WRITE -> COPY_READ dependencies. Each intermediate buffer has
+// only the experimental console call between its producer and consumer: no legacy transition, UAV barrier or
+// CPU fence makes that barrier redundant. Buffers have no transitionable layout under enhanced barriers.
+// Synchronization validation plus exact readback checks the real adapter/replay path; it does not establish the
+// console slots' semantics, or prove a data mismatch must occur on every GPU if a barrier is removed.
+int check_experimental_console_flush(const Backend& b) {
+    const char* label = b.label;
+    EXPECT(b.vulkan);
+    ScopedEnvironment saved("PALMWAVE_EXPERIMENTAL_XBOX_FLUSH");
+    EXPECT(saved.valid());
+    EXPECT(SetEnvironmentVariableA("PALMWAVE_EXPERIMENTAL_XBOX_FLUSH", "1") != FALSE);
+    const unsigned long device_refs = xs::device_proxy_ref_count(b.device);
+    {
+        Ref<ID3D12CommandAllocator> allocator;
+        Ref<ID3D12CommandQueue> queue;
+        Ref<ID3D12Fence> fence;
+        EXPECT(SUCCEEDED(b.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                          IID_PPV_ARGS(&allocator.p))));
+        D3D12_COMMAND_QUEUE_DESC queue_desc{};
+        EXPECT(SUCCEEDED(b.device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
+        EXPECT(SUCCEEDED(b.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+
+        Ref<ID3D12Resource> upload[4], intermediate[4], readback[4];
+        std::uint8_t expected[4][256]{};
+        for (unsigned n = 0; n < 4; ++n) {
+            if (make_buffer(label, b.device, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, upload[n]) ||
+                make_buffer(label, b.device, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, intermediate[n]) ||
+                make_buffer(label, b.device, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, readback[n]))
+                return 1;
+            for (unsigned i = 0; i < 256; ++i)
+                expected[n][i] = static_cast<std::uint8_t>((i * 37u + n * 53u) ^ 0xa5u);
+            void* mapped = nullptr;
+            const D3D12_RANGE none{0, 0};
+            EXPECT(SUCCEEDED(upload[n]->Map(0, &none, &mapped)) && mapped);
+            std::memcpy(mapped, expected[n], 256);
+            const D3D12_RANGE written{0, 256};
+            upload[n]->Unmap(0, &written);
+        }
+
+        // Full measured console IID; no PC graphics-list IID is requested from the shifted table.
+        constexpr IID console_iid{0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
+        const UINT desc[2] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 0};
+        Ref<IUnknown> list;
+        using CreateX = HRESULT(WINAPI*)(void*, const UINT*, ID3D12CommandAllocator*, ID3D12PipelineState*,
+                                         const IID*, void**);
+        auto** device_vtable = *reinterpret_cast<void***>(b.device);
+        EXPECT(SUCCEEDED(reinterpret_cast<CreateX>(device_vtable[73])(
+            b.device, desc, allocator.p, nullptr, &console_iid, reinterpret_cast<void**>(&list.p))));
+        EXPECT(xs::is_list_proxy(list.p));
+        Ref<ID3D12CommandList> submission;
+        EXPECT(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&submission.p))));
+        EXPECT(static_cast<void*>(submission.p) == static_cast<void*>(list.p));
+        const std::uint64_t before131 = xs::list_slot_hits(131), before132 = xs::list_slot_hits(132);
+        const std::uint64_t before_copy = xs::list_slot_hits(15);
+        const unsigned slots[4] = {132, 131, 132, 131};
+        const std::uint64_t first[4] = {0x700000, 0xc3c0, 0x100000, 0xc380};
+        const std::uint64_t second[4] = {0, 0x80020000, 0, 0x20000};
+        for (unsigned n = 0; n < 4; ++n) {
+            record_console_slot(list.p, 15, reinterpret_cast<std::uint64_t>(intermediate[n].p), 0,
+                                reinterpret_cast<std::uint64_t>(upload[n].p), 0, 256);
+            record_console_slot(list.p, slots[n], first[n], second[n], 0, 0x0000ffffffffff00ull);
+            EXPECT(xs::list_proxy_unsupported_slot(list.p) == 0);
+            record_console_slot(list.p, 15, reinterpret_cast<std::uint64_t>(readback[n].p), 0,
+                                reinterpret_cast<std::uint64_t>(intermediate[n].p), 0, 256);
+        }
+        EXPECT(xs::list_slot_hits(131) == before131 + 2 && xs::list_slot_hits(132) == before132 + 2);
+        EXPECT(xs::list_slot_hits(15) == before_copy + 8);
+        using Close = HRESULT(WINAPI*)(void*);
+        auto** list_vtable = *reinterpret_cast<void***>(list.p);
+        EXPECT(SUCCEEDED(reinterpret_cast<Close>(list_vtable[9])(list.p)));
+        ID3D12CommandList* lists[] = {submission.p};
+        queue->ExecuteCommandLists(1, lists);
+        EXPECT(SUCCEEDED(queue->Signal(fence.p, 1)));
+        if (wait_for(label, fence.p, 1)) return 1;
+        for (unsigned n = 0; n < 4; ++n) {
+            void* mapped = nullptr;
+            const D3D12_RANGE read{0, 256};
+            EXPECT(SUCCEEDED(readback[n]->Map(0, &read, &mapped)) && mapped);
+            const bool equal = std::memcmp(mapped, expected[n], 256) == 0;
+            const D3D12_RANGE none{0, 0};
+            readback[n]->Unmap(0, &none);
+            EXPECT(equal);
+        }
+    }
+    EXPECT(xs::device_proxy_ref_count(b.device) == device_refs);
+    std::printf("%s: EXPERIMENTAL console list 73: four slot-131/132 barriers between eight GPU copies; "
+                "1024 readback bytes match; this tests the barrier path, not the Xbox ABI hypothesis\n", label);
     return 0;
 }
 
@@ -365,7 +493,9 @@ int main() {
         ID3D12Device* device = nullptr;
         EXPECT(SUCCEEDED(xs::create_device_proxy(inner, __uuidof(ID3D12Device), reinterpret_cast<void**>(&device))));
         rt::d3d12::set_device_outer(inner, device);
-        const int result = check_backend(Backend{label, device, inner, true});
+        const Backend backend{label, device, inner, true};
+        int result = check_backend(backend);
+        if (!result) result = check_experimental_console_flush(backend);
         device->Release();
         if (result) return 1;
         EXPECT(inner->Release() == 0);  // nothing the proxies made kept the layer's device alive

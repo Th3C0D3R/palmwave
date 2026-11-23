@@ -59,7 +59,10 @@
 // 58, 60 -> EndEvent, 61 -> ExecuteIndirect, 139 -> Reset, 146 -> GCL7 Barrier, 148 AllocateUploadMemory) and the
 // console object body with the inline-record cursor pinned at its limits (+0x18 = +0x28 = +0x30), so inline writers
 // always take the vtable path. Any other slot is logged, traced "unsupported" and returns E_NOTIMPL; the list then
-// fails Close with E_NOTIMPL and queue ExecuteCommandLists refuses to submit it until a Reset. Queue
+// fails Close with E_NOTIMPL and queue ExecuteCommandLists refuses to submit it until a Reset. The one exception is an
+// opt-in EXPERIMENT, off by default: with PALMWAVE_EXPERIMENTAL_XBOX_FLUSH=1 (exactly) at list creation, console slots
+// 131/132 with four exact argument tuples record a real global SYNC_ALL/ACCESS_COMMON barrier through
+// ID3D12GraphicsCommandList7, traced "experimental-hypothesis" (not a known contract; docs/BLOCKERS.md). Queue
 // ExecuteCommandLists unwraps list proxies; the list unwraps allocator (Reset), bundle and heap proxies itself. The
 // console list's QueryInterface answers only the measured console IID (when the real list implements the PC interface
 // it maps to) and the layout-identical base chain IUnknown/ID3D12Object/ID3D12DeviceChild/ID3D12CommandList; PC

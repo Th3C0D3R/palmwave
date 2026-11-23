@@ -1345,6 +1345,8 @@ struct ListProxy {
     unsigned pc_slot_count = 0;  // slots the real list implements; a mapped slot past it is unsupported
     // The first console slot recorded since the last Reset that was not executed (0: none).
     std::atomic<unsigned> unsupported_slot{0};
+    // PALMWAVE_EXPERIMENTAL_XBOX_FLUSH was exactly "1" when this list was created (see list_experimental_flush).
+    bool experimental_flush = false;
 
     // The cursor and both limits point at +0x580, inside the body but past every measured field (the pipeline record
     // ends at +0x554), so even a writer that ignored the limit would not reach the header table or the record.
@@ -1421,6 +1423,95 @@ HRESULT list_unsupported(ListProxy* self, unsigned slot, unsigned pc) {
     }
     d3d12_trace::record(list_trace_name(slot), "unsupported");
     return E_NOTIMPL;
+}
+
+// ---- EXPERIMENTAL, opt-in: console list slots 131/132 as a global barrier (a hypothesis, not a known contract) ----
+//
+// Off by default. Only with PALMWAVE_EXPERIMENTAL_XBOX_FLUSH set to exactly "1" when the list is created, and only for
+// the four exact argument tuples below (all four 64-bit words compared; how many bits the console method consumes
+// is unproved), the proxy records ONE real enhanced barrier on the backend list through ID3D12GraphicsCommandList7:
+// a GLOBAL group with SyncBefore = SyncAfter = SYNC_ALL and AccessBefore = AccessAfter = ACCESS_COMMON. Anything
+// else (flag off or another value, another slot, any changed word, no GCL7) takes list_unsupported unchanged.
+//
+// Why a barrier: the low word of the 131 tuples matches AMD PAL's public Gfx10AcquireMemGcrCntl layout (0xc3c0 =
+// glkWb|glkInv|glvInv|gl1Inv|gl2Inv|gl2Wb; 0xc380 the same without glkWb), and the last word resembles a 256-byte-
+// aligned full-range size. Nothing public maps 132's 0x700000/0x100000. This does NOT prove the slots only
+// synchronize: a register write, query, memory write or resource transition they might perform is not emulated, and
+// the barrier can be stronger or weaker than the console's operation. The result is traced "experimental-hypothesis",
+// never "ok". See docs/BLOCKERS.md and docs/d3d12_command_objects.md §5.2.
+constexpr unsigned kConsoleListExperiment131 = 131;
+constexpr unsigned kConsoleListExperiment132 = 132;
+
+struct ExperimentalFlushTuple {
+    unsigned slot;
+    std::uint64_t words[4];
+};
+
+// Observed locally (first two) and in upstream PR #7076's public loop measurement (last two). A statically found
+// third 131 form is deliberately absent until it is seen at run time.
+constexpr ExperimentalFlushTuple kExperimentalFlushTuples[] = {
+    {kConsoleListExperiment132, {0x700000, 0, 0, 0x0000ffffffffff00ull}},
+    {kConsoleListExperiment131, {0xc3c0, 0x80020000, 0, 0x0000ffffffffff00ull}},
+    {kConsoleListExperiment132, {0x100000, 0, 0, 0x0000ffffffffff00ull}},
+    {kConsoleListExperiment131, {0xc380, 0x20000, 0, 0x0000ffffffffff00ull}},
+};
+
+// Exactly "1" enables; unset, empty, "0", "true", "1 " or anything longer disables. Read when a list is created.
+bool experimental_xbox_flush_requested() {
+    char value[4] = {};
+    const DWORD length = GetEnvironmentVariableA("PALMWAVE_EXPERIMENTAL_XBOX_FLUSH", value, sizeof(value));
+    return length == 1 && value[0] == '1';
+}
+
+bool experimental_flush_tuple(unsigned slot, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
+                              std::uint64_t a4) {
+    for (const ExperimentalFlushTuple& t : kExperimentalFlushTuples)
+        if (t.slot == slot && t.words[0] == a1 && t.words[1] == a2 && t.words[2] == a3 && t.words[3] == a4)
+            return true;
+    return false;
+}
+
+// True when the global barrier was handed to the backend list; false sends the caller to list_unsupported. The list's
+// unsupported mark is never read or cleared here, so a list poisoned earlier stays poisoned. Barrier is void: a
+// backend that cannot record it marks its own list, and the proxy's Close returns that failure.
+bool list_experimental_flush(ListProxy* self, unsigned slot, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
+                             std::uint64_t a4) {
+    if (!self->experimental_flush || !experimental_flush_tuple(slot, a1, a2, a3, a4)) return false;
+    ID3D12GraphicsCommandList7* gcl7 = nullptr;
+    const HRESULT hr =
+        self->real->QueryInterface(__uuidof(ID3D12GraphicsCommandList7), reinterpret_cast<void**>(&gcl7));
+    if (FAILED(hr) || !gcl7) {
+        if (gcl7) gcl7->Release();  // a non-conforming failure that still handed out a pointer
+        static std::atomic<bool> warned{false};
+        if (first_call(warned))
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: EXPERIMENTAL list slot %u: the backend list has no "
+                         "ID3D12GraphicsCommandList7 (0x%08lx); no barrier recorded, the slot stays unsupported\n",
+                         slot, static_cast<unsigned long>(FAILED(hr) ? hr : E_NOINTERFACE));
+        return false;
+    }
+    D3D12_GLOBAL_BARRIER global{};
+    global.SyncBefore = D3D12_BARRIER_SYNC_ALL;
+    global.SyncAfter = D3D12_BARRIER_SYNC_ALL;
+    global.AccessBefore = D3D12_BARRIER_ACCESS_COMMON;
+    global.AccessAfter = D3D12_BARRIER_ACCESS_COMMON;
+    D3D12_BARRIER_GROUP group{};
+    group.Type = D3D12_BARRIER_TYPE_GLOBAL;
+    group.NumBarriers = 1;
+    group.pGlobalBarriers = &global;
+    gcl7->Barrier(1, &group);  // on the pointer QueryInterface returned, which may differ from self->real
+    gcl7->Release();
+    static std::atomic<bool> first_use[2];
+    if (first_call(first_use[slot == kConsoleListExperiment132 ? 1 : 0]))
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: *** EXPERIMENTAL HYPOTHESIS *** list slot %u (args 0x%llx 0x%llx 0x%llx 0x%llx) "
+                     "recorded as a global SYNC_ALL/ACCESS_COMMON barrier because PALMWAVE_EXPERIMENTAL_XBOX_FLUSH=1. "
+                     "Not a known Xbox contract; any non-synchronization effect of the console method is not "
+                     "emulated. Results from this run are experimental.\n",
+                     slot, static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                     static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
+    d3d12_trace::record(list_trace_name(slot), "experimental-hypothesis");
+    return true;
 }
 
 // Only this base chain shares the console vtable layout. PC graphics-command-list IIDs must never expose the
@@ -1516,6 +1607,11 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
             if (!memory) d3d12_trace::record(list_trace_name(Slot), "failed");
             return memory;
         } else if constexpr (pc == kListNotForwarded) {
+            if constexpr (Slot == kConsoleListExperiment131 || Slot == kConsoleListExperiment132) {
+                // Opt-in experiment (above). The return register of this console method is unmeasured: 0 is passed
+                // back with no claimed contract.
+                if (list_experimental_flush(self, Slot, a1, a2, a3, a4)) return 0;
+            }
             return hr_to_u64(list_unsupported(self, Slot, pc));
         } else {
             if (pc >= self->pc_slot_count) return hr_to_u64(list_unsupported(self, Slot, pc));
@@ -1634,6 +1730,14 @@ HRESULT wrap_list(IUnknown* created, DeviceProxy* device, const IID* riid, void*
     proxy->pin_cursor_at_limit();
     proxy->refs.store(1, std::memory_order_relaxed);
     proxy->pc_slot_count = detect_list_slot_count(created);
+    proxy->experimental_flush = experimental_xbox_flush_requested();
+    if (proxy->experimental_flush) {
+        static std::atomic<bool> announced{false};
+        if (first_call(announced))
+            std::fprintf(stderr, "[rt] d3d12_xs: *** EXPERIMENTAL *** PALMWAVE_EXPERIMENTAL_XBOX_FLUSH=1: console list "
+                                 "slots 131/132 with four exact argument tuples become a global barrier (hypothesis "
+                                 "only, not a compatibility claim)\n");
+    }
     proxy_add_ref(device);  // the list keeps its Xbox-ABI device alive for GetDevice and the upload arena
 
     const HRESULT hr = list_query_interface(proxy, riid, out);

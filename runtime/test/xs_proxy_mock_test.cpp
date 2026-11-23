@@ -105,6 +105,15 @@ struct Mock {
     bool validate_queue_desc;  // device: opt in to the PC queue-description contract
     bool has_queue_desc;
     D3D12_COMMAND_QUEUE_DESC last_queue_desc;  // snapshot before a forwarded local copy expires
+    // list: the ID3D12GraphicsCommandList7 QueryInterface (counted; refused, or answered with another object), what
+    // Close (slot 9) returns, and the first group/barrier of the last Barrier (GCL7 slot 80) as it arrived.
+    unsigned gcl7_queries;
+    bool refuse_gcl7;
+    Mock* gcl7_alias;
+    HRESULT close_result;
+    std::uint64_t barrier_groups;
+    D3D12_BARRIER_GROUP barrier_group;
+    D3D12_GLOBAL_BARRIER barrier_global;
     unsigned calls[kMockSlots];
     std::uint64_t args[kMockSlots][5];
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
@@ -183,6 +192,15 @@ bool mock_has(const Mock* m, REFIID iid) {
 HRESULT mock_query(Mock* m, const IID* riid, void** out) {
     if (!out) return E_POINTER;
     *out = nullptr;
+    if (riid && m->kind == Kind::list && IsEqualIID(*riid, __uuidof(ID3D12GraphicsCommandList7))) {
+        ++m->gcl7_queries;
+        if (m->refuse_gcl7) return E_NOINTERFACE;
+        if (m->gcl7_alias) {  // a separate interface object: the caller must use (and release) this pointer
+            *out = m->gcl7_alias;
+            ++m->gcl7_alias->refs;
+            return S_OK;
+        }
+    }
     if (!riid || !mock_has(m, *riid)) return E_NOINTERFACE;
     *out = m;
     ++m->refs;
@@ -270,6 +288,16 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
             m->array[slot][0] = views[0].BufferLocation;
             m->array[slot][1] = views[0].BufferFilledSizeLocation;
         }
+        if (slot == 80) {                             // GCL7 Barrier(groups, group): the caller's structs are temporary
+            m->barrier_groups = a1;
+            const auto* group = reinterpret_cast<const D3D12_BARRIER_GROUP*>(a2);
+            if (group && static_cast<std::uint32_t>(a1) >= 1) {
+                m->barrier_group = *group;
+                if (group->Type == D3D12_BARRIER_TYPE_GLOBAL && group->NumBarriers >= 1 && group->pGlobalBarriers)
+                    m->barrier_global = group->pGlobalBarriers[0];
+            }
+        }
+        if (slot == 9) return static_cast<std::uint32_t>(m->close_result);  // Close
     }
     return S_OK;
 }
@@ -1144,6 +1172,232 @@ int check_lists() {
     return 0;
 }
 
+// ---- 7c. EXPERIMENTAL: console list slots 131/132 behind PALMWAVE_EXPERIMENTAL_XBOX_FLUSH (a hypothesis) ----
+//
+// The default stays strict (E_NOTIMPL, poisoned list, failed Close, refused submission). With the variable exactly
+// "1" at list creation, only the four exact tuples record one real global barrier on the backend list's
+// ID3D12GraphicsCommandList7. The experimental calls' return register is never checked (the console method's return
+// type is unmeasured); the mock's calls, references and the list state are.
+
+constexpr char kFlushEnv[] = "PALMWAVE_EXPERIMENTAL_XBOX_FLUSH";
+constexpr std::uint64_t kFullRange = 0x0000ffffffffff00ull;
+struct FlushCall {
+    unsigned slot;
+    std::uint64_t w[4];
+};
+constexpr FlushCall kFlushTuples[] = {
+    {132, {0x700000, 0, 0, kFullRange}},
+    {131, {0xc3c0, 0x80020000, 0, kFullRange}},
+    {132, {0x100000, 0, 0, kFullRange}},
+    {131, {0xc380, 0x20000, 0, kFullRange}},
+};
+
+std::uint64_t flush_call(void* list, const FlushCall& c) {
+    return raw(list, c.slot, c.w[0], c.w[1], c.w[2], c.w[3]);
+}
+
+// ACCESS_COMMON and BARRIER_TYPE_GLOBAL are both 0, so the recorded fields start as values no barrier carries.
+void arm_barrier_record(Mock* m) {
+    m->barrier_groups = 0xbad;
+    std::memset(&m->barrier_group, 0x5c, sizeof(m->barrier_group));
+    std::memset(&m->barrier_global, 0x5c, sizeof(m->barrier_global));
+}
+
+bool recorded_full_global_barrier(const Mock* m) {
+    return m->barrier_groups == 1 && m->barrier_group.Type == D3D12_BARRIER_TYPE_GLOBAL &&
+           m->barrier_group.NumBarriers == 1 && m->barrier_global.SyncBefore == D3D12_BARRIER_SYNC_ALL &&
+           m->barrier_global.SyncAfter == D3D12_BARRIER_SYNC_ALL &&
+           m->barrier_global.AccessBefore == D3D12_BARRIER_ACCESS_COMMON &&
+           m->barrier_global.AccessAfter == D3D12_BARRIER_ACCESS_COMMON;
+}
+
+// A console list made through device slot 73 with the variable set to `value` (null: unset) during creation only.
+void* make_flush_list(void* device, void* allocator, const char* value) {
+    const std::uint32_t direct_desc[4] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 0, 0, 0};
+    SetEnvironmentVariableA(kFlushEnv, value);
+    void* list = nullptr;
+    const HRESULT hr =
+        hr_of(raw(device, 73, word(direct_desc), word(allocator), 0, word(&kConsoleListIid), word(&list)));
+    SetEnvironmentVariableA(kFlushEnv, nullptr);
+    return SUCCEEDED(hr) && xs::is_list_proxy(list) ? list : nullptr;
+}
+
+// From a clean recording, `c` takes the existing unsupported path: E_NOTIMPL, no backend Barrier and no GCL7 query,
+// the list marked with c.slot, Close failing although the real list closed, and the queue refusing the submission.
+// Ends with a Reset, so the next case starts clean.
+int expect_strict(void* list, Mock* real, void* allocator, void* queue, Mock* queue_mock, const FlushCall& c) {
+    EXPECT(hr_of(raw(list, 139, word(allocator), 0)) == S_OK && xs::list_proxy_unsupported_slot(list) == 0);
+    const unsigned barriers = real->calls[80], queries = real->gcl7_queries, closes = real->calls[9];
+    const unsigned submissions = queue_mock->calls[10];
+    const long refs = real->refs;
+    EXPECT(hr_of(flush_call(list, c)) == E_NOTIMPL);
+    EXPECT(real->calls[80] == barriers && real->gcl7_queries == queries && real->refs == refs);
+    EXPECT(xs::list_proxy_unsupported_slot(list) == c.slot);
+    EXPECT(hr_of(raw(list, 9)) == E_NOTIMPL && real->calls[9] == closes + 1);
+    const std::uint64_t submitted[1] = {word(list)};
+    raw(queue, 10, 1, word(submitted));
+    EXPECT(queue_mock->calls[10] == submissions);
+    EXPECT(hr_of(raw(list, 139, word(allocator), 0)) == S_OK && xs::list_proxy_unsupported_slot(list) == 0);
+    return 0;
+}
+
+int check_experimental_flush() {
+    const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
+    SetEnvironmentVariableA(kFlushEnv, nullptr);
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true, true, true);  // full-chain lists: GCL6 for the IID, GCL7 for Barrier
+    EXPECT(device);
+    void* allocator = nullptr;
+    EXPECT(hr_of(raw(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, word(&allocator_iid), word(&allocator))) == S_OK);
+    void* queue = make_queue(device);
+    EXPECT(queue);
+    Mock* const queue_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(queue));
+
+    // 1. Flag off. Unset at creation: every exact tuple is strict, and setting the variable afterwards changes nothing
+    // (it is read when the list is created).
+    void* off = make_flush_list(device, allocator, nullptr);
+    EXPECT(off);
+    Mock* const off_real = mock->last_child;
+    for (const FlushCall& c : kFlushTuples)
+        if (expect_strict(off, off_real, allocator, queue, queue_mock, c)) return 1;
+    SetEnvironmentVariableA(kFlushEnv, "1");
+    const int late = expect_strict(off, off_real, allocator, queue, queue_mock, kFlushTuples[1]);
+    SetEnvironmentVariableA(kFlushEnv, nullptr);
+    if (late) return 1;
+    EXPECT(off_real->gcl7_queries == 0 && off_real->calls[80] == 0);
+    EXPECT(release(off) == 0 && off_real->refs == 0);
+    // Any value other than exactly "1" is off.
+    for (const char* value : {"", "0", "true", "yes", "1 ", " 1", "01", "11", "2"}) {
+        void* list = make_flush_list(device, allocator, value);
+        EXPECT(list);
+        Mock* const real = mock->last_child;
+        for (const FlushCall& c : kFlushTuples)
+            if (expect_strict(list, real, allocator, queue, queue_mock, c)) return 1;
+        EXPECT(real->gcl7_queries == 0 && release(list) == 0 && real->refs == 0);
+    }
+
+    // 2. Flag on, exact matches: each tuple queries GCL7 once, records one full global barrier on it, releases it,
+    // and leaves the list clean, so Close succeeds and the queue submits the real list.
+    void* list = make_flush_list(device, allocator, "1");
+    EXPECT(list);
+    Mock* const real = mock->last_child;
+    const long real_refs = real->refs;
+    EXPECT(real_refs == 1);
+    EXPECT(hr_of(raw(list, 139, word(allocator), 0)) == S_OK);
+    for (const FlushCall& c : kFlushTuples) {
+        const unsigned barriers = real->calls[80], queries = real->gcl7_queries;
+        arm_barrier_record(real);
+        flush_call(list, c);  // return register not checked
+        EXPECT(real->gcl7_queries == queries + 1 && real->calls[80] == barriers + 1);
+        EXPECT(recorded_full_global_barrier(real));
+        EXPECT(real->refs == real_refs && xs::list_proxy_unsupported_slot(list) == 0);
+    }
+    {
+        const unsigned closes = real->calls[9], submissions = queue_mock->calls[10];
+        EXPECT(hr_of(raw(list, 9)) == S_OK && real->calls[9] == closes + 1);
+        const std::uint64_t submitted[1] = {word(list)};
+        raw(queue, 10, 1, word(submitted));
+        EXPECT(queue_mock->calls[10] == submissions + 1 && queue_mock->array[10][0] == word(real));
+    }
+
+    // 3. Every single-word change of every tuple (a low bit and a high-dword bit), each tuple on the other slot, the
+    // statically found 131 form that has not been seen at run time, and neighbouring slots: all strict.
+    for (const FlushCall& c : kFlushTuples) {
+        for (int i = 0; i < 4; ++i) {
+            for (const std::uint64_t flip : {1ull, 1ull << 40}) {
+                FlushCall changed = c;
+                changed.w[i] ^= flip;
+                if (expect_strict(list, real, allocator, queue, queue_mock, changed)) return 1;
+            }
+        }
+        FlushCall other_slot = c;
+        other_slot.slot = c.slot == 131 ? 132 : 131;
+        if (expect_strict(list, real, allocator, queue, queue_mock, other_slot)) return 1;
+        for (const unsigned neighbour : {130u, 133u}) {
+            FlushCall moved = c;
+            moved.slot = neighbour;
+            if (expect_strict(list, real, allocator, queue, queue_mock, moved)) return 1;
+        }
+    }
+    if (expect_strict(list, real, allocator, queue, queue_mock, {131, {0xc280, 0x20000, 0, kFullRange}})) return 1;
+
+    // 4. No ID3D12GraphicsCommandList7 on the backend list: queried, refused, nothing recorded, strict.
+    real->refuse_gcl7 = true;
+    for (const FlushCall& c : kFlushTuples) {
+        EXPECT(hr_of(raw(list, 139, word(allocator), 0)) == S_OK);
+        const unsigned barriers = real->calls[80], queries = real->gcl7_queries, closes = real->calls[9];
+        const unsigned submissions = queue_mock->calls[10];
+        EXPECT(hr_of(flush_call(list, c)) == E_NOTIMPL);
+        EXPECT(real->gcl7_queries == queries + 1 && real->calls[80] == barriers && real->refs == real_refs);
+        EXPECT(xs::list_proxy_unsupported_slot(list) == c.slot);
+        EXPECT(hr_of(raw(list, 9)) == E_NOTIMPL && real->calls[9] == closes + 1);
+        const std::uint64_t submitted[1] = {word(list)};
+        raw(queue, 10, 1, word(submitted));
+        EXPECT(queue_mock->calls[10] == submissions);
+    }
+    real->refuse_gcl7 = false;
+
+    // 5. QueryInterface hands back a different object: the Barrier goes to that pointer (not the proxy's base list)
+    // and its reference is released.
+    Mock* const alias = new_mock(Kind::list);
+    alias->refs = 1;  // held by `real`
+    real->gcl7_alias = alias;
+    EXPECT(hr_of(raw(list, 139, word(allocator), 0)) == S_OK);
+    for (const FlushCall& c : kFlushTuples) {
+        const unsigned real_barriers = real->calls[80], alias_barriers = alias->calls[80];
+        arm_barrier_record(alias);
+        flush_call(list, c);
+        EXPECT(alias->calls[80] == alias_barriers + 1 && real->calls[80] == real_barriers);
+        EXPECT(recorded_full_global_barrier(alias));
+        EXPECT(alias->refs == 1 && real->refs == real_refs);
+        EXPECT(xs::list_proxy_unsupported_slot(list) == 0);
+    }
+    real->gcl7_alias = nullptr;
+    EXPECT(hr_of(raw(list, 9)) == S_OK);
+
+    // 6. A list already poisoned stays poisoned: the barrier is still recorded, but the first unsupported slot, the
+    // failed Close and the refused submission remain until Reset.
+    EXPECT(hr_of(raw(list, 139, word(allocator), 0)) == S_OK);
+    EXPECT(hr_of(raw(list, 27, 1, 2, 3, 4)) == E_NOTIMPL && xs::list_proxy_unsupported_slot(list) == 27);
+    for (const FlushCall& c : kFlushTuples) {
+        const unsigned barriers = real->calls[80];
+        arm_barrier_record(real);
+        flush_call(list, c);
+        EXPECT(real->calls[80] == barriers + 1 && recorded_full_global_barrier(real));
+        EXPECT(xs::list_proxy_unsupported_slot(list) == 27);
+    }
+    {
+        const unsigned submissions = queue_mock->calls[10];
+        EXPECT(hr_of(raw(list, 9)) == E_NOTIMPL);
+        const std::uint64_t submitted[1] = {word(list)};
+        raw(queue, 10, 1, word(submitted));
+        EXPECT(queue_mock->calls[10] == submissions);
+    }
+
+    // 7. The backend's own recording failure (a void Barrier it could not record marks its list) still surfaces at
+    // Close: the proxy returns the backend's HRESULT, not success.
+    EXPECT(hr_of(raw(list, 139, word(allocator), 0)) == S_OK);
+    flush_call(list, kFlushTuples[1]);
+    EXPECT(xs::list_proxy_unsupported_slot(list) == 0);
+    real->close_result = E_INVALIDARG;
+    {
+        const unsigned closes = real->calls[9];
+        EXPECT(hr_of(raw(list, 9)) == E_INVALIDARG && real->calls[9] == closes + 1);
+    }
+    real->close_result = S_OK;
+    EXPECT(hr_of(raw(list, 139, word(allocator), 0)) == S_OK);
+
+    EXPECT(release(list) == 0 && real->refs == 0 && alias->refs == 1);
+    EXPECT(release(queue) == 0 && release(allocator) == 0);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    SetEnvironmentVariableA(kFlushEnv, nullptr);
+    std::printf("%s: EXPERIMENTAL slots 131/132: strict unless PALMWAVE_EXPERIMENTAL_XBOX_FLUSH is exactly 1 at list "
+                "creation; then only the four exact tuples record one global SYNC_ALL/ACCESS_COMMON barrier on the "
+                "GCL7 pointer QueryInterface returned (released); changed words, other slots, no GCL7 stay strict; "
+                "an earlier poison and a backend Close failure still surface\n", g_label);
+    return 0;
+}
+
 // ---- 8. Environment overrides for the Xbox device slots (one process each, read once) ----
 
 int run_env_slots(bool valid) {
@@ -1437,7 +1691,7 @@ int main(int argc, char** argv) {
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_xbox_queue_descriptions() ||
-        check_lists() ||
+        check_lists() || check_experimental_flush() ||
         check_custom_heap_properties())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
