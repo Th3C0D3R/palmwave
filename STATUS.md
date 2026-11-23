@@ -20,7 +20,7 @@ Source revision: original upstream `dde82f27e994337094afc476ded0b1426f6e87e2`, m
 | Driver pipeline creation | Running on RTX 5080; final full-corpus counts pending |
 | Retail dry-run | Exit 0; five modules mapped |
 | Retail initialization | Exit 0; four DLL initializations succeed |
-| Retail execution | Vulkan device created on RTX 5080; next stop is the struct-return ABI of device slot 26 |
+| Retail execution | Vulkan device, two command queues and a fence created; next stop is a rejected Xbox queue description |
 | First rendered frame | Not verified |
 
 The scanner candidate is not counted as a shader translation failure. Generated data and full logs are private and stored outside the authoring repository. No game assets have been added to Git.
@@ -55,3 +55,6 @@ The offline run now passes factory creation and reaches `OpenFile`, which refuse
 ## Graphics device reached
 
 The named Xbox file interface now preserves the documented `GetHandle` contract. Its raw-vtable and lifetime regression brings DirectStorage coverage to 458 checks with zero failures; both focused CTests passed in 0.44 seconds on CPU. The next offline run reports `D3D12XboxCreateDevice ok` on the RTX 5080, with 19 startup events, four successful DLL initializations and no unimplemented-import event. Execution then stops on an access violation in device slot 26, before a draw or presentation. Debugging confirms a struct-return buffer is mistaken for the device pointer; this matches the `GetCustomHeapProperties` ABI issue already documented in the inherited boot chain. No frame is claimed.
+## Heap-properties calling convention
+
+The slot-26 adapter, adapted from sennecools' upstream PR #6964, passes the console return buffer and device in the measured order while retaining the PC method form. The new synthetic regression reproduces the old access violation; all six mock test modes pass with the fix. The authoring build also passed `device_proxy`, `device_proxy_trace` and `xs_proxy_mock` in 0.26 seconds (CPU/WARP). The next offline RTX 5080 run clears the access violation, creates two command queues and one fence, then receives `E_INVALIDARG` for another Xbox queue description. Its D3D12 trace contains four successful calls and one failed call; no draw or presentation is observed.

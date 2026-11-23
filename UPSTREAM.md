@@ -32,6 +32,12 @@ Palmwave changed the following:
 
 FiveStar (GPL-3.0-or-later) and OpenScarlett (MIT) were consulted for ABI facts only, through source review; no code was copied from either. Microsoft's public Xbox documentation confirms `GetHandle`, whose signature differs from the siblings' `GetFileInformation` assumptions. The base adaptation was written with Claude Code (Claude Opus 5.5); OpenAI Codex added the measured file IID, handle-ownership tests and documentation correction. Test results are recorded separately. See [docs/directstorage.md](docs/directstorage.md).
 
+## Device slot 26 struct return
+
+The `GetCustomHeapProperties` ABI adapter and synthetic proxy regression are adapted from sennecools's [Leonida PR #6964](https://github.com/ItsNotRexed/Leonida/pull/6964), revision `ed70b4c92002ce76934646c384dc661e1d02c491`, under GPL-3.0. A local offline debugger confirmed the return buffer in RCX and the device proxy in RDX, matching the inherited boot-chain notes. The adapter passes the request to the real device, copies its complete answer into the supplied buffer and returns that buffer's address; the PC calling convention remains supported.
+
+Palmwave strengthens the synthetic regression with a native C++ call through `ID3D12Device::GetCustomHeapProperties` for the PC convention. The console call checks truncation of the two 32-bit arguments, untouched surrounding bytes, one backend call and preserved proxy identity and reference counts. With the old forwarder this regression raised `0xC0000005`; after the fix all six `xs_proxy_mock` CTests passed in 0.20 seconds with MSVC 19.51 on CPU only. No GPU or game rendering validation is implied. The adaptation and local validation were assisted by OpenAI Codex.
+
 ## Project identity and tools
 
 Palmwave is developed under [Moon AI](https://realmoon.ai), the AI platform created by Stellarr Studio. The maintainer account is [fablinoo](https://github.com/fablinoo). The initial setup was AI-assisted with OpenAI Codex and OpenAI image generation; Claude Code was assigned a read-only source review. This records the actual tool provenance.
