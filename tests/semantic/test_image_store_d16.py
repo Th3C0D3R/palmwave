@@ -1,7 +1,8 @@
 """Semantic and validation tests for RDNA2 image_store with d16 (packed 16-bit data VGPRs).
 
 Covers FSPX/FSR4 blocker `image_store 2D a16 d16` and all supported STORE_DIMS (1D, 2D,
-2D_ARRAY, 3D), with and without a16 / glc, across full and sparse dmasks (0x0..0xf):
+2D_ARRAY, 3D), plus CUBE through its 2D-array view, with and without a16 / glc,
+across full and sparse dmasks (0x0..0xf):
   - Float/norm view: IEEE binary16 halves widened via UnpackHalf2x16 -> %v4float.
   - UINT view: 16-bit unsigned halves zero-extended via OpBitFieldUExtract -> %v4uint_st.
   - SINT view: 16-bit signed halves sign-extended via OpBitFieldSExtract -> %v4int_st.
@@ -280,6 +281,44 @@ class ImageStoreD16Tests(unittest.TestCase):
         self.assertEqual(got_b["float"], (0, 0, _f32_bits(1.0), 0))
         self.assertEqual(got_b["uint"], (0, 0, 0x3C00, 0))
 
+    def test_cube_d16_preserves_faces_and_typed_texel_values(self):
+        # Samplerless cube stores use integer (x, y, face), unlike cube samples.
+        # A16 packs x/y in the first word and face in the next word's low half.
+        # Layer 11 is an already flattened face of the second cube, not 8 * slice + face.
+        halves = (0x3800, 0xC400, 0x3E00, 0x8000)  # 0.5, -4.0, 1.5, -0.0
+        for a16 in (False, True):
+            for dmask in (0xF, 0x9):
+                for face in (*range(6), 11):
+                    with self.subTest(a16=a16, dmask=hex(dmask), face=face):
+                        coords = (0x8001, 0xFFFE, face)
+                        coord_words = (
+                            (_pack_u16(*coords[:2]), _pack_u16(face, 0xA5A5))
+                            if a16 else coords
+                        )
+                        setup = [f"v_mov_b32_e32 v{2 + i}, 0x{word:08x}"
+                                 for i, word in enumerate(coord_words)]
+                        setup += [
+                            f"v_mov_b32_e32 v6, 0x{_pack_u16(*halves[:2]):08x}",
+                            f"v_mov_b32_e32 v7, 0x{_pack_u16(*halves[2:]):08x}",
+                        ]
+                        addr = "v[2:3]" if a16 else "v[2:4]"
+                        vdata = "v[6:7]" if dmask == 0xF else "v6"
+                        got = _eval_image_store_texels(
+                            setup,
+                            f"image_store {vdata}, {addr}, s[8:15] dmask:0x{dmask:x} "
+                            f"dim:SQ_RSRC_IMG_CUBE unorm d16{' a16' if a16 else ''}",
+                        )
+                        self.assertEqual(got["coords"], coords)
+                        if dmask == 0xF:
+                            self.assertEqual(got["float"],
+                                             (_f32_bits(0.5), _f32_bits(-4.0), _f32_bits(1.5), 0x80000000))
+                            self.assertEqual(got["uint"], halves)
+                            self.assertEqual(got["sint"], (0x3800, 0xFFFFC400, 0x3E00, 0xFFFF8000))
+                        else:
+                            self.assertEqual(got["float"], (_f32_bits(0.5), 0, 0, _f32_bits(-4.0)))
+                            self.assertEqual(got["uint"], (0x3800, 0, 0, 0xC400))
+                            self.assertEqual(got["sint"], (0x3800, 0, 0, 0xFFFFC400))
+
     def test_all_store_dims_a16_glc_and_wave64_emulate_validate(self):
         cases = [
             ("1D", "v2", "dmask:0x1", "d16"),
@@ -287,6 +326,8 @@ class ImageStoreD16Tests(unittest.TestCase):
             ("2D", "v[2:3]", "dmask:0x3", "glc d16"),
             ("2D_ARRAY", "v[2:3]", "dmask:0xf", "a16 d16"),
             ("3D", "v[2:4]", "dmask:0x7", "glc d16"),
+            ("CUBE", "v[2:4]", "dmask:0xf", "d16"),
+            ("CUBE", "v[2:3]", "dmask:0x9", "a16 glc d16"),
             ("2D", "v2", "dmask:0x0", "a16 d16"),
         ]
         for dim, addr, dmask, extra in cases:
@@ -334,9 +375,13 @@ class ImageStoreD16Tests(unittest.TestCase):
                 rdna2spirv.WAVE64_EMULATE = old_w64
         _validate(spv)
 
-    def test_unsupported_dims_and_modifiers_still_refused(self):
+    def test_unsupported_dims_modifiers_and_short_coords_still_refused(self):
         for bad in (
-            "image_store v[4:5], v[2:4], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_CUBE unorm d16",
+            "image_store v[4:5], v[2:4], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D_MSAA unorm d16",
+            "image_store v[4:5], v[2:3], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_CUBE unorm d16",
+            "image_store v[4:5], v2, s[8:15] dmask:0xf dim:SQ_RSRC_IMG_CUBE unorm a16 d16",
+            "image_store v[4:5], v[2:4], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_CUBE unorm d16 tfe",
+            "image_store v[4:5], v[2:4], s[8:15] dmask:0xf dim:SQ_RSRC_IMG_CUBE unorm d16 lwe",
             "image_store v[4:5], v2, s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm d16 tfe",
             "image_store v[4:5], v2, s[8:15] dmask:0xf dim:SQ_RSRC_IMG_2D unorm d16 lwe",
         ):
