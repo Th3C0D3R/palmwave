@@ -36,7 +36,9 @@ def translate(lines, *, emulate=False):
     prev = rdna2spirv.WAVE64_EMULATE
     rdna2spirv.WAVE64_EMULATE = emulate
     try:
-        return support.translate_lines("cs_img_atomic_guard", lines + ["s_endpgm"], fssm=FSSM)
+        # Exercise inactive lanes: without an EXEC write, exec_static_true folds the guard to %true.
+        instructions = ["s_mov_b64 exec, 0x55555555", *lines, "s_endpgm"]
+        return support.translate_lines("cs_img_atomic_guard", instructions, fssm=FSSM)
     finally:
         rdna2spirv.WAVE64_EMULATE = prev
 
@@ -74,22 +76,33 @@ def parse_blocks(spv):
 
 
 def find_guarded_texel_block(spv):
-    """Verify every OpImageTexelPointer sits inside a basic block entered via an OpSelectionMerge
-    conditional branch whose condition is an OpLoad %bool %active, and return that block's instructions."""
+    """Require every incoming edge of a texel block to be a structured EXEC-true edge.
+
+    An active-guarded predecessor alone is insufficient: an inactive or unconditional edge must not
+    bypass it. Return the texel blocks' instructions for the descriptor, atomic and write-back checks.
+    """
     blocks = parse_blocks(spv)
     active_loads = set(re.findall(r"^\s*(%\w+) = OpLoad %bool %active\b", spv, re.M))
-    guarded_targets = set()
-    for insns in blocks.values():
+    incoming = {label: set() for label in blocks}
+    guarded_edges = set()
+    for label, insns in blocks.items():
         for i, ln in enumerate(insns):
-            if ln.startswith("OpSelectionMerge ") and i + 1 < len(insns):
-                br = insns[i + 1]
-                m = re.match(r"OpBranchConditional (%\w+) (%\w+) (%\w+)", br)
-                if m and m.group(1) in active_loads:
-                    guarded_targets.add(m.group(2))
+            parts = ln.split()
+            if parts[0] == "OpBranchConditional":
+                _, condition, yes, no = parts[:4]
+                incoming[yes].add((label, True))
+                incoming[no].add((label, False))
+                if i and insns[i - 1].startswith("OpSelectionMerge ") and condition in active_loads:
+                    guarded_edges.add((label, True))
+            elif parts[0] == "OpBranch":
+                incoming[parts[1]].add((label, None))
+            elif parts[0] == "OpSwitch":
+                for target in parts[2::2]:  # default, followed by literal/target pairs
+                    incoming[target].add((label, None))
     found = []
     for lbl, insns in blocks.items():
         if any("= OpImageTexelPointer " in ln for ln in insns):
-            if lbl not in guarded_targets:
+            if not incoming[lbl] or not incoming[lbl].issubset(guarded_edges):
                 raise AssertionError(f"OpImageTexelPointer in unguarded block {lbl}")
             found.append((lbl, insns))
     if not found:
@@ -107,6 +120,31 @@ def vgpr_ptrs(spv, reg_idx):
 
 
 class ImageAtomicsGuardTests(unittest.TestCase):
+    def test_guard_checker_rejects_mutated_exec_control_flow(self):
+        spv = translate([
+            "v_mov_b32_e32 v0, 5", "v_mov_b32_e32 v1, 1", "v_mov_b32_e32 v2, 2",
+            "image_atomic_add v0, v[1:2], s[4:11] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm glc",
+        ])
+        validate_spirv(spv)
+        label = find_guarded_texel_block(spv)[0][0]
+        guard = re.search(r"OpBranchConditional (%\w+) " + re.escape(label) + r" (%\w+)\b", spv)
+        self.assertIsNotNone(guard)
+        condition, end = guard.groups()
+        mutations = {
+            "constant true": spv.replace(guard[0], f"OpBranchConditional %true {label} {end}"),
+            "inverted guard": spv.replace(guard[0], f"OpBranchConditional {condition} {end} {label}"),
+            "inactive edge": spv.replace(guard[0], f"OpBranchConditional {condition} {label} {label}"),
+        }
+        # Retain the correct atomic guard but add an incoming path from the outer VALU selection.
+        outer = next(m for m in re.finditer(r"OpBranchConditional (%\w+) (%\w+) (%\w+)", spv)
+                     if m[0] != guard[0])
+        mutations["outer bypass"] = spv.replace(
+            outer[0], f"OpBranchConditional {outer[1]} {outer[2]} {label}")
+        for name, mutated in mutations.items():
+            with self.subTest(mutation=name):
+                with self.assertRaisesRegex(AssertionError, "OpImageTexelPointer in unguarded block"):
+                    find_guarded_texel_block(mutated)
+
     def test_all_image_atomics_2d_and_3d_guarded_and_valid(self):
         simple_ops = [
             ("image_atomic_add", "OpAtomicIAdd"),
