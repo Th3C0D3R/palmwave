@@ -118,6 +118,10 @@ Seven more `xmem.dll` imports follow argument shapes measured locally at a title
   keeps their protection, which mapped pages get (AWE's rule). The measured title also reserves a placeholder with
   `MEM_RESERVE_PLACEHOLDER` and carves windows out of it with `MEM_REPLACE_PLACEHOLDER`, and the shim passes both
   through. **ASSUMPTION:** nothing commits into a window with `kernel32!VirtualAlloc`, which a placeholder refuses.
+  Only under the opt-in experiment `PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT=1`, a view for a window that asks for
+  `PAGE_WRITECOMBINE` or `PAGE_NOCACHE` is created without the modifier. The window keeps its recorded protection,
+  and everything else is as before. This follows upstream #7492 and is a hypothesis, not console cache control
+  ([d3d12_vulkan.md](d3d12_vulkan.md#42-resources-heaps-placed-and-reserved), "Experimental host import").
 - `XMemVirtualAlloc` used to refuse 2 MiB pages, and five of the 23 measured calls commit them. They are now
   committed 2 MiB-aligned through `VirtualAlloc2`. The attribute word is recorded (`xmem_attributes`) and the
   console's `PAGE_GRAPHICS_*` bits are dropped from the protection, as before.

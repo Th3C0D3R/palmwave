@@ -34,6 +34,7 @@
 #include <utility>
 #include <vector>
 
+#include "experimental_host_import.h"
 #include "host_pins.h"
 #include "shims.h"
 #include "startup_trace.h"
@@ -753,10 +754,61 @@ bool map_page(uintptr_t address, uint64_t page, DWORD protect) {
     return true;
 }
 
+// PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT=1 (experimental_host_import.h): selected during static initialisation, before
+// any title mapping, so every view this shim creates in the process (each alias of a physical page included) gets the
+// same host cache policy, and no view made under the other policy exists to be retrofitted.
+[[maybe_unused]] const bool g_experimental_host_cache = [] {
+    const bool on = rt::experimental_host_import::enabled();
+    if (on)
+        std::fprintf(stderr,
+                     "[rt] xmem: EXPERIMENT PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT=1: physical-page views asking for "
+                     "write-combined or uncached pages are created as normal cached views (a hypothesis after Palmwave "
+                     "#7492, not an emulation of console cache control)\n");
+    return on;
+}();
+
+// The experiment's trace: each distinct requested window protection whose view it changes, once, on stderr and (with
+// palmwave --trace FILE) as an "xmem_experimental_host_cache" event. Called with g_phys_mutex held; its own lock is a leaf.
+void note_experimental_host_cache(DWORD requested, DWORD host) {
+    static std::mutex mutex;
+    static std::set<DWORD> seen;
+    try {
+        const std::lock_guard lock(mutex);
+        if (!seen.insert(requested).second) return;
+    } catch (const std::bad_alloc&) {
+        return;  // the view is still made; only its log line is lost
+    }
+    const char* const policy = (requested & PAGE_WRITECOMBINE) && (requested & PAGE_NOCACHE) ? "write-combined+uncached"
+                               : (requested & PAGE_WRITECOMBINE)                            ? "write-combined"
+                                                                                            : "uncached";
+    std::fprintf(stderr,
+                 "[rt] xmem: EXPERIMENTAL host cache: window protection 0x%lx (requested %s) -> host view protection "
+                 "0x%lx (normal cached); the window keeps 0x%lx. Hypothesis, not console cache control (logged once "
+                 "per protection)\n",
+                 static_cast<unsigned long>(requested), policy, static_cast<unsigned long>(host),
+                 static_cast<unsigned long>(requested));
+    if (rt::startup_trace::enabled())
+        rt::startup_trace::event("xmem_experimental_host_cache",
+                                 "\"experimental\":true,\"requested\":" +
+                                     rt::startup_trace::quote(rt::startup_trace::hex(requested)) +
+                                     ",\"requested_cache\":" + rt::startup_trace::quote(policy) + ",\"host\":" +
+                                     rt::startup_trace::quote(rt::startup_trace::hex(host)) +
+                                     ",\"host_cache\":\"cached\"");
+}
+
 // Two of the measured windows are reserved PAGE_NOACCESS for the CPU and the GPU alike; pages mapped there are still
 // GPU memory, which the D3D12 layer reads on the CPU.
+//
+// Only under the experiment: the view of a window that asks for PAGE_WRITECOMBINE or PAGE_NOCACHE is created without
+// that modifier (upstream #7492, hcristosm, 954fcb10617a456632b3f9b8697138988e7675cd, GPL-3.0, narrowed to the opt-in).
+// The access bits and PAGE_GUARD stay as the window has them, and the window's recorded protection is not changed. This
+// is the view's creation only: no existing view is reprotected, and host_protect (every other allocation) is unchanged.
 DWORD view_protect(const Window& window) {
-    return window.protect == PAGE_NOACCESS ? PAGE_READWRITE : window.protect;
+    if (window.protect == PAGE_NOACCESS) return PAGE_READWRITE;
+    if (!g_experimental_host_cache) return window.protect;
+    const DWORD host = rt::experimental_host_import::host_cache_view_protect(window.protect);
+    if (host != window.protect) note_experimental_host_cache(window.protect, host);
+    return host;
 }
 
 bool aligned_page_address(uintptr_t address) { return (address & (kPhysicalPageSize - 1)) == 0; }
@@ -1112,6 +1164,16 @@ BOOL WINAPI TitleUnmapViewOfFileEx(PVOID address, ULONG flags) {
 }
 
 }  // namespace
+
+// Test hook (experimental_host_import.h): the window's recorded protection, read under the physical-page lock.
+bool rt::experimental_host_import::xmem_window_protection(const void* address, DWORD* protect) {
+    if (!protect) return false;
+    const std::lock_guard lock(g_phys_mutex);
+    const Window* const window = find_window(reinterpret_cast<uintptr_t>(address), 1);
+    if (!window) return false;
+    *protect = window->protect;
+    return true;
+}
 
 // The title's memory calls the pin contract needs to see (host_pins.h).
 #define TITLE_VIRTUAL_ALLOC(dll) {dll, "VirtualAlloc", reinterpret_cast<void*>(&TitleVirtualAlloc)}, \

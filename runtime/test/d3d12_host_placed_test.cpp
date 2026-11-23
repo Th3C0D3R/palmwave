@@ -19,10 +19,19 @@
 //     state other than COMMON (the retail 0xFFFFFFFF included), no address, overflowing widths, reserved, read-only,
 //     guarded and partly committed pages, uncached and write-combined pages;
 //   - through the Xbox-ABI proxy's slot 133: the implemented call shape makes a buffer; console flag bits, a clear value
-//     and the retail state word are refused without a resource.
+//     and the retail state word are refused without a resource (and, by default, the experimental tuple too).
+//
+// --experimental (CTest sets PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT=1 for the process; the test never sets it): the same
+// checks, which the experiment must not change, plus one DIAGNOSTIC case (experimental_host_import.h). xmem physical
+// pages in a window that asks for write-combine are mapped as cached views; the exact experimental tuple through raw slot
+// 133 imports them; CPU bytes written before and after the import are what a GPU copy reads, and a GPU copy into the
+// buffer, after its fence, is what the CPU reads at the same VA. This proves buffer visibility through copies only: not a
+// shader's V# addressing, not shader UAV writes, not the console's meaning of 0x20000 or of the state word.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
+#include "../shims/d3d12_trace.h"
 #include "../shims/d3d12_xs_device.h"
+#include "../shims/experimental_host_import.h"
 #include "../shims/host_pins.h"
 #include "../shims/shims.h"
 
@@ -593,15 +602,205 @@ int check_proxy(Gpu& gpu, void* proxy, const Title& title) {
     EXPECT(refused_through_proxy(console_bits, kCommon, nullptr, E_NOTIMPL));
     const D3D12_CLEAR_VALUE clear{};
     EXPECT(refused_through_proxy(xbox, kCommon, &clear, E_INVALIDARG));
+    if (!rt::experimental_host_import::enabled()) {
+        // By default the exact experimental tuple is refused like any console bit (check_experimental covers opt-in).
+        D3D12_RESOURCE_DESC tuple = xbox;
+        tuple.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x20004);
+        EXPECT(refused_through_proxy(tuple, kRetailStateWord, nullptr, E_NOTIMPL));
+    }
     title.free(pages, 0, MEM_RELEASE);
     std::printf("%s: the implemented call shape makes a buffer on the title's pages; the retail state word, console "
                 "flag bits and a clear value are refused with nothing held\n", who);
     return 0;
 }
 
+// Raw device slot 133 as the title calls it: (va, desc, state word, clear, riid, out).
+HRESULT call_slot133(void* proxy, void* va, const D3D12_RESOURCE_DESC* desc, std::uint32_t state, const void* clear,
+                     ID3D12Resource** out) {
+    using SlotFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                          std::uint64_t, std::uint64_t);
+    static const GUID iid = __uuidof(ID3D12Resource);
+    void* const* vtable = *static_cast<void* const* const*>(proxy);
+    return static_cast<HRESULT>(static_cast<std::uint32_t>(reinterpret_cast<SlotFn>(vtable[133])(
+        proxy, reinterpret_cast<std::uint64_t>(va), reinterpret_cast<std::uint64_t>(desc), state,
+        reinterpret_cast<std::uint64_t>(clear), reinterpret_cast<std::uint64_t>(&iid),
+        reinterpret_cast<std::uint64_t>(out))));
+}
+
+// PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT=1 only: the exact experimental tuple through raw slot 133 on xmem physical pages
+// whose window asks for write-combine. A diagnostic experiment; see the file comment for what it does not prove.
+int check_experimental(Gpu& gpu, void* proxy, const XMem& x, const Title& title) {
+    const char* who = "EXPERIMENTAL slot 133 host import";
+    constexpr uint64_t kPages = 2;
+    constexpr UINT64 size = kPages * k64;
+    constexpr DWORD kWriteCombine = PAGE_READWRITE | PAGE_WRITECOMBINE;
+    auto* const window = static_cast<std::uint8_t*>(
+        x.virtual_alloc(nullptr, size, MEM_RESERVE | kXmem64kPages, 0, kWriteCombine));
+    auto* const alias = static_cast<std::uint8_t*>(
+        x.virtual_alloc(nullptr, k64, MEM_RESERVE | kXmem64kPages, 0, kWriteCombine));
+    EXPECT(window && alias);
+    uint64_t pages[kPages]{};
+    uint64_t count = kPages;
+    EXPECT(x.allocate(0, &count, pages) == TRUE && count == kPages);
+    EXPECT(x.map(window, kPages, pages) == window);
+    DWORD logical = 0;
+    EXPECT(rt::experimental_host_import::xmem_window_protection(window, &logical) && logical == kWriteCombine);
+    for (uint64_t i = 0; i < kPages; ++i) {
+        MEMORY_BASIC_INFORMATION region{};
+        EXPECT(VirtualQuery(window + i * k64, &region, sizeof(region)) == sizeof(region));
+        EXPECT(region.State == MEM_COMMIT && region.Protect == PAGE_READWRITE);  // a normal cached host view
+    }
+    fill(window, size, 11);  // CPU bytes written before the import
+
+    // The exact tuple, with garbage in the padding DWORD at +4 (written through bytes; it is not a field).
+    D3D12_RESOURCE_DESC tuple = buffer_desc(size);
+    tuple.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x1);
+    tuple.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x00020004);
+    const std::uint32_t padding = 0x5EC0DE11u;
+    std::memcpy(reinterpret_cast<unsigned char*>(&tuple) + 4, &padding, sizeof(padding));
+    unsigned char original[sizeof(tuple)];
+    std::memcpy(original, &tuple, sizeof(tuple));
+
+    ID3D12Resource* placed = nullptr;
+    EXPECT_HR(call_slot133(proxy, window, &tuple, kRetailStateWord, nullptr, &placed), S_OK);
+    EXPECT(placed != nullptr);
+    EXPECT(std::memcmp(original, &tuple, sizeof(tuple)) == 0);  // the title's description, byte for byte
+    EXPECT(placed->GetGPUVirtualAddress() == reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(window));
+    EXPECT(placed->GetDesc().Flags == D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS && placed->GetDesc().Width == size);
+    EXPECT((rt::d3d12::vulkan_memory_flags(placed) &
+            (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+           (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
+    EXPECT(rt::d3d12::host_import_count(gpu.device) == 1 && rt::host_pins::pin_count() == 1);
+    int failures = 0;
+    const auto release = [&] {
+        if (placed) placed->Release();
+        placed = nullptr;
+    };
+
+    // CPU before -> GPU copy, CPU after (no Map, no upload) -> GPU copy, GPU copy -> CPU at the same VA after the fence.
+    if (gpu.gpu_reads(placed, size, 11)) {
+        release();
+        return 1;
+    }
+    fill(window, size, 23);
+    if (gpu.gpu_reads(placed, size, 23) || gpu.gpu_writes(placed, size, 37)) {
+        release();
+        return 1;
+    }
+    if (!holds(window, size, 37)) {
+        std::fprintf(stderr, "%s: the CPU does not see the GPU copy's bytes at the imported VA\n", who);
+        ++failures;
+    }
+
+    // An alias of page 0 in another write-combine window: the same cached host view, the same bytes; a second import
+    // of it is refused (host_pins: aliases), with the live import untouched.
+    {
+        const bool mapped = x.map(alias, 1, &pages[0]) == alias;
+        MEMORY_BASIC_INFORMATION region{};
+        const bool cached = mapped && VirtualQuery(alias, &region, sizeof(region)) == sizeof(region) &&
+                            region.Protect == PAGE_READWRITE;
+        ID3D12Resource* second = reinterpret_cast<ID3D12Resource*>(1);
+        D3D12_RESOURCE_DESC alias_tuple = tuple;
+        alias_tuple.Width = k64;
+        const HRESULT hr = mapped ? call_slot133(proxy, alias, &alias_tuple, kRetailStateWord, nullptr, &second) : S_OK;
+        if (second && second != reinterpret_cast<ID3D12Resource*>(1)) second->Release();
+        if (!mapped || !cached || !holds(alias, k64, 37) || hr != E_NOTIMPL || second != nullptr ||
+            rt::d3d12::host_import_count(gpu.device) != 1 || rt::host_pins::pin_count() != 1) {
+            std::fprintf(stderr, "%s: alias: mapped %d cached %d hr 0x%08lx\n", who, mapped, cached,
+                         static_cast<unsigned long>(hr));
+            ++failures;
+        }
+        if (mapped && x.map(alias, 1, nullptr) != alias) ++failures;
+    }
+
+    // While the import lives: unmap, remap, free and VirtualProtect of its pages are refused.
+    {
+        const auto busy = [] { return GetLastError() == ERROR_BUSY; };
+        SetLastError(ERROR_SUCCESS);
+        const bool unmap_refused = x.map(window, kPages, nullptr) == nullptr && busy();
+        const uint64_t reversed[kPages] = {pages[1], pages[0]};
+        SetLastError(ERROR_SUCCESS);
+        const bool remap_refused = x.map(window, kPages, reversed) == nullptr && busy();
+        SetLastError(ERROR_SUCCESS);
+        const bool free_refused = x.free_pages(kPages, pages) == FALSE && busy();
+        DWORD old = 0;
+        SetLastError(ERROR_SUCCESS);
+        const bool protect_refused = title.protect(window, 0x1000, PAGE_READONLY, &old) == FALSE && busy();
+        if (!unmap_refused || !remap_refused || !free_refused || !protect_refused) {
+            std::fprintf(stderr, "%s: lifetime refusals: unmap %d remap %d free %d protect %d\n", who, unmap_refused,
+                         remap_refused, free_refused, protect_refused);
+            ++failures;
+        }
+    }
+
+    // Near misses stay refused under the opt-in, before the device: nothing new imported.
+    {
+        const auto near_miss = [&](const D3D12_RESOURCE_DESC& desc, std::uint32_t state, const void* clear) {
+            ID3D12Resource* out = reinterpret_cast<ID3D12Resource*>(1);
+            const HRESULT hr = call_slot133(proxy, window, &desc, state, clear, &out);
+            if (out && out != reinterpret_cast<ID3D12Resource*>(1)) out->Release();
+            return hr == E_NOTIMPL && out == nullptr && rt::d3d12::host_import_count(gpu.device) == 1 &&
+                   rt::host_pins::pin_count() == 1;
+        };
+        D3D12_RESOURCE_DESC d = tuple;
+        d.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x20000);
+        bool ok = near_miss(d, kRetailStateWord, nullptr);
+        d.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x2000C);
+        ok = ok && near_miss(d, kRetailStateWord, nullptr);
+        ok = ok && near_miss(tuple, kCommon, nullptr);
+        const D3D12_CLEAR_VALUE clear{};
+        ok = ok && near_miss(tuple, kRetailStateWord, &clear);
+        d = tuple;
+        d.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        ok = ok && near_miss(d, kRetailStateWord, nullptr);
+        if (!ok) {
+            std::fprintf(stderr, "%s: a near miss of the experimental tuple was not refused cleanly\n", who);
+            ++failures;
+        }
+    }
+
+    // Release: the GPU retires, the import and the pin go, the pages unmap and free.
+    release();
+    EXPECT(nothing_held(gpu.device));
+    EXPECT(x.map(window, kPages, nullptr) == window);
+    EXPECT(x.free_pages(kPages, pages) == TRUE);
+
+    // The device's own refusals still apply after the tuple matched: memory no shim owns is refused (E_NOTIMPL) with a
+    // null output and nothing held, and that real failure is what slot 133 returns.
+    {
+        void* const raw = VirtualAlloc(nullptr, k64, MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN, PAGE_READWRITE);
+        EXPECT(raw != nullptr);
+        D3D12_RESOURCE_DESC d = tuple;
+        d.Width = k64;
+        ID3D12Resource* out = reinterpret_cast<ID3D12Resource*>(1);
+        const HRESULT hr = call_slot133(proxy, raw, &d, kRetailStateWord, nullptr, &out);
+        if (out && out != reinterpret_cast<ID3D12Resource*>(1)) out->Release();
+        VirtualFree(raw, 0, MEM_RELEASE);
+        EXPECT(hr == E_NOTIMPL && out == nullptr && nothing_held(gpu.device));
+    }
+    if (failures) return failures;
+    std::printf("%s: write-combine window mapped as cached views (window keeps 0x%lx); the exact tuple (flags 0x20004, "
+                "state word 0xFFFFFFFF) imported as UAV / COMMON; CPU before/after -> GPU copy and GPU copy -> CPU at "
+                "the same VA match; alias import, unmap, remap, free and VirtualProtect refused while live; near misses "
+                "refused; nothing held after Release. Hypothesis only: copies, not V# or shader UAV writes\n",
+                who, static_cast<unsigned long>(logical));
+    return 0;
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool experimental = argc == 2 && std::strcmp(argv[1], "--experimental") == 0;
+    if (argc > 2 || (argc == 2 && !experimental)) return 2;
+    // The mode names the environment CTest gave this process; the test only reads it.
+    if (rt::experimental_host_import::enabled() != experimental) {
+        std::fprintf(stderr, "PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT does not match the mode (%s)\n",
+                     experimental ? "--experimental needs exactly 1" : "the default run needs it unset or not 1");
+        return 1;
+    }
+    // The experimental run records its D3D12 trace (as palmwave --trace-d3d12 does), so the "experimental" outcome of
+    // every slot-133 attempt is in the output.
+    if (experimental) rt::d3d12_trace::set_enabled(true);
     vktest::Device vk;
     const auto status = vk.initialize();
     if (status == vktest::DeviceStatus::unavailable) return 77;
@@ -665,6 +864,7 @@ int main() {
             failures += check_xmem_lifecycle(gpu, xmem, title);
             failures += check_refusals(gpu, title);
             failures += check_proxy(gpu, device.p, title);
+            if (experimental) failures += check_experimental(gpu, device.p, xmem, title);
         }
     }
     if (vk.validation_errors()) {

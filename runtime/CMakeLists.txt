@@ -210,6 +210,7 @@ if(WIN32 AND PALMWAVE_BUILD_WINDOWS_RUNTIME)
   add_executable(xmem_test
     test/xmem_test.cpp
     shims/xmem.cpp
+    shims/experimental_host_import.h
     shims/host_pins.h
     shims/registry.cpp
   )
@@ -944,6 +945,23 @@ if(BUILD_TESTING)
     # The routes are read once per process, so each override case is its own test.
     add_test(NAME xs_proxy_mock_env_slots COMMAND xs_proxy_mock_test --env-slots)
     add_test(NAME xs_proxy_mock_env_slots_invalid COMMAND xs_proxy_mock_test --env-slots-invalid)
+    # Slot 133's opt-in experiment (shims/experimental_host_import.h), read once per process: strict by default (the
+    # variable unset, "0" or another value), the experimental tuple only with exactly "1". The default run asserts the
+    # variable is not "1", so it is unset for it.
+    set_tests_properties(xs_proxy_mock PROPERTIES
+                         ENVIRONMENT_MODIFICATION "PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT=unset:")
+    add_test(NAME xs_proxy_mock_host_import_unset COMMAND xs_proxy_mock_test --host-import-experiment off)
+    set_tests_properties(xs_proxy_mock_host_import_unset PROPERTIES
+                         ENVIRONMENT_MODIFICATION "PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT=unset:")
+    add_test(NAME xs_proxy_mock_host_import_zero COMMAND xs_proxy_mock_test --host-import-experiment off)
+    set_tests_properties(xs_proxy_mock_host_import_zero PROPERTIES
+                         ENVIRONMENT "PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT=0")
+    add_test(NAME xs_proxy_mock_host_import_other COMMAND xs_proxy_mock_test --host-import-experiment off)
+    set_tests_properties(xs_proxy_mock_host_import_other PROPERTIES
+                         ENVIRONMENT "PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT=10")
+    add_test(NAME xs_proxy_mock_host_import_experimental COMMAND xs_proxy_mock_test --host-import-experiment on)
+    set_tests_properties(xs_proxy_mock_host_import_experimental PROPERTIES
+                         ENVIRONMENT "PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT=1")
   endif()
   if(TARGET root_sig_test)
     add_test(NAME root_sig COMMAND root_sig_test)
@@ -1075,6 +1093,10 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET xmem_test)
     add_test(NAME xmem COMMAND xmem_test)
+    set_tests_properties(xmem PROPERTIES ENVIRONMENT_MODIFICATION "PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT=unset:")
+    # The opt-in host cache experiment for physical-page views (shims/experimental_host_import.h), its own process.
+    add_test(NAME xmem_host_cache_experimental COMMAND xmem_test --host-cache-experiment)
+    set_tests_properties(xmem_host_cache_experimental PROPERTIES ENVIRONMENT "PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT=1")
   endif()
   if(WIN32 AND TARGET process_cmdline_test)
     add_test(NAME process_cmdline COMMAND process_cmdline_test)
@@ -1831,7 +1853,15 @@ if(TARGET Vulkan::Headers)
     target_link_options(d3d12_host_placed_test PRIVATE /OPT:NOREF)  # keep the self-registering shim tables
     add_test(NAME d3d12_host_placed COMMAND d3d12_host_placed_test)
     set_tests_properties(d3d12_host_placed PROPERTIES SKIP_RETURN_CODE 77
-                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-"
+                         ENVIRONMENT_MODIFICATION "PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT=unset:")
+    # The opt-in diagnostic experiment (shims/experimental_host_import.h): the same checks plus the exact experimental
+    # tuple through raw slot 133 on write-combine-window xmem pages mapped as cached views. A hypothesis under test, not a
+    # measured console ABI; its results are reported separately from the strict ones.
+    add_test(NAME d3d12_host_placed_experimental COMMAND d3d12_host_placed_test --experimental)
+    set_tests_properties(d3d12_host_placed_experimental PROPERTIES SKIP_RETURN_CODE 77
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-"
+                         ENVIRONMENT "PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT=1")
 
     # Fences and timing (D3D-30): multiple-fence waits, clock calibration, adapter LUID, custom heap properties.
     add_executable(d3d12_fence_timing_test test/d3d12_fence_timing_test.cpp)

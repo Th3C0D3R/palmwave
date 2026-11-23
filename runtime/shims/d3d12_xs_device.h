@@ -16,6 +16,7 @@
 //   slot 133  CreatePlacedResourceX(va, desc, state, clear, riid, out) -> the registered host-page handler, only for
 //             a plain row-major buffer, supported flags and no clear value. Unknown flags/layouts are refused without
 //             rewriting them. No handler: E_NOTIMPL, null output and an unsupported trace.
+//             PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT=1 opts into one diagnostic tuple (see the handler contract below).
 //   slot 48   CreateCommandQueueX(desc, riid, out) -> the same queue proxy as slot 8. The Xbox desc's first fields are
 //             D3D12_COMMAND_QUEUE_DESC's (public HLE).
 //   slot 73   CreateCommandListX(desc, allocator, initialState, riid, out) -> PC CreateCommandList(0, type, allocator,
@@ -132,6 +133,14 @@ ID3D12Device* device_proxy_real_device(const void* device);
 // COMMON, 0; its meaning on the console is not established, retail_boot_chain.md section 3.4). A failing handler must
 // leave *out null; the proxy clears it again on failure. Shape from upstream #7218 (tibzejoker,
 // a3eae955dcec4fb65864ca6c10b4ca3f2999c2d3, GPL-3.0).
+//
+// EXPERIMENT, opt-in only (experimental_host_import.h): with PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT exactly "1", the one
+// tuple BUFFER, Alignment 0, Width > 0, Height/DepthOrArraySize/MipLevels 1, Format UNKNOWN, SampleDesc {1, 0}, layout
+// word 0x1, Flags 0x00020004, state word 0xFFFFFFFF and a null clear value is passed to the handler as a NEW host
+// description with Flags ALLOW_UNORDERED_ACCESS (0x4) and the state word COMMON (0); the title's description is not
+// written and its padding DWORD at +4 is not read. Each such call is logged with the original and host values and
+// recorded on the D3D12 trace with an "experimental ok/unsupported/failed" outcome. That bit 0x20000 may be dropped and
+// that 0xFFFFFFFF means "no state" are hypotheses, not a measured console ABI. Every other value keeps the strict rules.
 using PlacedAtVaHandler = HRESULT (*)(ID3D12Device* real, void* va, const D3D12_RESOURCE_DESC& desc,
                                       std::uint32_t initial_state, REFIID riid, void** out);
 void set_placed_at_va_handler(PlacedAtVaHandler handler);

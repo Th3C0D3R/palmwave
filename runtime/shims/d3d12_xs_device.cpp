@@ -25,6 +25,7 @@
 // behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
 #include "d3d12_xs_device.h"
 #include "d3d12_trace.h"
+#include "experimental_host_import.h"
 #include "../src/shader_library.h"  // palmwave::fspx_payload_from_parts for slot 67
 
 #include <windows.h>
@@ -2223,7 +2224,27 @@ D3D12_HEAP_PROPERTIES* proxy_get_custom_heap_properties(D3D12_HEAP_PROPERTIES* o
 // the same value in the console's row-major word and the PC enum), flags among ALLOW_UNORDERED_ACCESS and
 // DENY_SHADER_RESOURCE, no clear value. Nothing is masked or rewritten: a console bit whose meaning is not established
 // (0x20000 included) is refused, not stripped. Every refusal leaves *out null and never reaches the handler.
+//
+// The one exception is an opt-in DIAGNOSTIC EXPERIMENT (experimental_host_import.h): with
+// PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT exactly "1", the single call shape in experimental_placement_shape is handed to
+// the same handler as a host description with flags ALLOW_UNORDERED_ACCESS and state word COMMON. That 0x20000 can be
+// dropped and that 0xFFFFFFFF means "no state" (D3D12_BARRIER_LAYOUT_UNDEFINED on the PC) are hypotheses; nothing here
+// establishes the console ABI. Any other shape, flag, state word or clear value goes through the strict checks below.
 std::atomic<PlacedAtVaHandler> g_placed_at_va{nullptr};
+
+constexpr std::uint32_t kExperimentalConsoleFlags = 0x00020004;  // ALLOW_UNORDERED_ACCESS | 0x20000 (meaning unknown)
+constexpr std::uint32_t kExperimentalStateWord = 0xFFFFFFFFu;    // retail_boot_chain.md 3.4; meaning not established
+
+// The whole experimental tuple, field by field. The DWORD at +4 (padding after Dimension) is not read: its content is
+// undefined. Width only has to be nonzero here; the device's own bounds checks still apply to it.
+bool experimental_placement_shape(const D3D12_RESOURCE_DESC& desc, std::uint32_t state, const void* clear) {
+    return desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && desc.Alignment == 0 && desc.Width != 0 &&
+           desc.Height == 1 && desc.DepthOrArraySize == 1 && desc.MipLevels == 1 &&
+           desc.Format == DXGI_FORMAT_UNKNOWN && desc.SampleDesc.Count == 1 && desc.SampleDesc.Quality == 0 &&
+           static_cast<std::uint32_t>(desc.Layout) == static_cast<std::uint32_t>(D3D12_TEXTURE_LAYOUT_ROW_MAJOR) &&
+           static_cast<std::uint32_t>(desc.Flags) == kExperimentalConsoleFlags && state == kExperimentalStateWord &&
+           clear == nullptr;
+}
 
 HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_RESOURCE_DESC* xbox_desc,
                                        std::uint32_t initial_state, const void* clear, const IID* riid, void** out) {
@@ -2243,6 +2264,36 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
     const char* refusal = nullptr;
     HRESULT hr = S_OK;
+    if (experimental_host_import::enabled() && experimental_placement_shape(desc, initial_state, clear)) {
+        // A new description, built field by field; the title's is not written.
+        D3D12_RESOURCE_DESC host{};
+        host.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        host.Alignment = 0;
+        host.Width = desc.Width;
+        host.Height = 1;
+        host.DepthOrArraySize = 1;
+        host.MipLevels = 1;
+        host.Format = DXGI_FORMAT_UNKNOWN;
+        host.SampleDesc.Count = 1;
+        host.SampleDesc.Quality = 0;
+        host.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        host.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        constexpr std::uint32_t kHostState = D3D12_RESOURCE_STATE_COMMON;
+        hr = handler(self->real, va, host, kHostState, *riid, out);
+        if (FAILED(hr)) *out = nullptr;
+        // Every experimental attempt, success or not, is logged and traced: the result depends on a hypothesis.
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 133 EXPERIMENTAL host import (PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT=1; a "
+                     "hypothesis, not a measured console ABI): va=%p width=%llu flags 0x%x -> 0x%x "
+                     "(ALLOW_UNORDERED_ACCESS; bit 0x20000 dropped, meaning unknown), state word 0x%x -> 0x%x (COMMON), "
+                     "clear=null -> 0x%08lx\n",
+                     va, static_cast<unsigned long long>(desc.Width), flags, static_cast<unsigned>(host.Flags),
+                     initial_state, kHostState, static_cast<unsigned long>(hr));
+        // boot_trace reads the last whitespace-delimited field as the outcome. Keep the experimental marker a
+        // single token; the real backend result is already traced by create_at_host_address and logged above.
+        d3d12_trace::record("Xbox CreatePlacedResourceX (device slot 133) EXPERIMENTAL host import", "experimental");
+        return hr;
+    }
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
         refusal = "not a buffer";
         hr = E_NOTIMPL;

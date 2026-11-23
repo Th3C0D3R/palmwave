@@ -105,6 +105,12 @@ its pages are at that moment. Stop 12's range is a physical-page window, so it n
 slot 133 with this path. Even when the import succeeds, the title's own V#s into these pages still don't reach
 them; that needs the address-space work in [d3d12_vulkan.md](d3d12_vulkan.md#33-one-gpu-address-space).
 
+An opt-in diagnostic experiment, `PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT=1`, accepts exactly the stop-12 tuple (flags
+`0x00020004`, third word `0xFFFFFFFF`, a plain row-major buffer, no clear value). It imports the tuple as
+`ALLOW_UNORDERED_ACCESS` / `COMMON`, and it maps write-combine xmem windows as cached views (d3d12_vulkan.md
+section 4.2, "Experimental host import"). This is a hypothesis under test. It does not establish what `0x20000` or
+the third word mean, and it is not a retail result: no retail run with it is recorded here.
+
 The proxy's slot table must also be longer than the title's highest slot. A shorter table leaves a null pointer,
 not an `E_NOTIMPL`.
 

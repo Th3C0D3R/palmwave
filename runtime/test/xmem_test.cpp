@@ -10,6 +10,12 @@
 // contents across unmap and remap, alias when mapped twice, and scatter-map per address. GPU-import pins
 // (host_pins.h) are granted only over memory the shims own and refused otherwise (or with no provider); while one lives
 // the served VirtualAlloc, VirtualFree, VirtualProtect, UnmapViewOfFile(Ex) and the xmem calls refuse to change it.
+//
+// Host cache policy of physical-page views (experimental_host_import.h). `xmem_test` (CTest unsets
+// PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT): a write-combine window's view keeps the modifier, as before. `xmem_test
+// --host-cache-experiment` (CTest sets the variable to "1"; the test never sets it): write-combined and uncached windows
+// get normal cached views, every alias of a page the same, read-only and the window's recorded protection kept, and
+// pinned views still refuse remap, unmap, free and VirtualProtect.
 #include <windows.h>
 #include <psapi.h>
 
@@ -22,6 +28,7 @@
 #include <string>
 #include <utility>
 
+#include "experimental_host_import.h"
 #include "host_pins.h"
 #include "shims.h"
 #include "startup_trace.h"
@@ -950,6 +957,145 @@ void test_title_virtual_alloc() {
     }
 }
 
+// ---- PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT: the host cache policy of physical-page views ----
+
+// The rule itself: only PAGE_WRITECOMBINE and PAGE_NOCACHE go; access bits and PAGE_GUARD stay.
+void test_host_cache_rule() {
+    namespace ex = rt::experimental_host_import;
+    check(ex::host_cache_view_protect(PAGE_READWRITE | PAGE_WRITECOMBINE) == PAGE_READWRITE,
+          "host cache rule: write-combine is removed from a read-write view");
+    check(ex::host_cache_view_protect(PAGE_READWRITE | PAGE_NOCACHE) == PAGE_READWRITE,
+          "host cache rule: uncached is removed from a read-write view");
+    check(ex::host_cache_view_protect(PAGE_READONLY | PAGE_WRITECOMBINE) == PAGE_READONLY,
+          "host cache rule: a read-only view stays read-only");
+    check(ex::host_cache_view_protect(PAGE_READWRITE | PAGE_GUARD | PAGE_WRITECOMBINE) == (PAGE_READWRITE | PAGE_GUARD),
+          "host cache rule: PAGE_GUARD is kept");
+    check(ex::host_cache_view_protect(PAGE_EXECUTE_READ | PAGE_NOCACHE) == PAGE_EXECUTE_READ,
+          "host cache rule: execute access is kept");
+    check(ex::host_cache_view_protect(PAGE_READWRITE) == PAGE_READWRITE,
+          "host cache rule: a protection without a cache modifier is unchanged");
+}
+
+constexpr DWORD kWriteCombineWindow = PAGE_READWRITE | PAGE_WRITECOMBINE;
+
+// Default (no experiment): a write-combine window's view is created with the window's protection, as before.
+void test_host_cache_default(const PhysicalApi& api) {
+    auto* const window = static_cast<uint8_t*>(api.virtual_alloc(nullptr, kPage64k, MEM_RESERVE | kXmem64kPages, 0x27,
+                                                                 kWriteCombineWindow | PAGE_GRAPHICS_READWRITE));
+    check(window != nullptr, "default host cache: XMemVirtualAlloc reserves a write-combine window");
+    if (!window) return;
+    DWORD logical = 0;
+    check(rt::experimental_host_import::xmem_window_protection(window, &logical) && logical == kWriteCombineWindow,
+          "default host cache: the window records the requested protection (console graphics bits dropped)");
+    uint64_t page = 0;
+    uint64_t count = 1;
+    check(api.allocate(0x280, &count, &page) == TRUE && count == 1, "default host cache: one page");
+    if (count != 1) return;
+    SetLastError(ERROR_SUCCESS);
+    if (api.map(window, 1, &page) == window) {
+        check(protection_of(window) == kWriteCombineWindow,
+              "default host cache: the view keeps the window's write-combine modifier (unchanged behaviour)");
+        check(api.map(window, 1, nullptr) == window, "default host cache: unmapped");
+    } else {
+        // Wine refuses the modifier in MapViewOfFile3 (upstream #7492); the default path does not work around it.
+        std::printf("xmem_test: default host cache: the host refused a write-combined view (error %lu); not checked "
+                    "further\n",
+                    GetLastError());
+    }
+    check(api.free_pages(1, &page) == TRUE, "default host cache: page freed");
+}
+
+// The experiment: every view this shim creates for a write-combined or uncached window is a normal cached view.
+void test_host_cache_experiment(const PhysicalApi& api) {
+    namespace pins = rt::host_pins;
+    namespace ex = rt::experimental_host_import;
+    using pins::PinResult;
+    const auto title_protect = reinterpret_cast<TitleVirtualProtectFn>(rt::shims::find("kernel32.dll", "VirtualProtect"));
+    check(title_protect != nullptr, "experimental host cache: the served VirtualProtect");
+    if (!title_protect) return;
+    constexpr DWORD kUncachedWindow = PAGE_READWRITE | PAGE_NOCACHE;
+    constexpr DWORD kReadOnlyWriteCombine = PAGE_READONLY | PAGE_WRITECOMBINE;
+    const auto window_of = [&](SIZE_T size, DWORD protect) {
+        return static_cast<uint8_t*>(api.virtual_alloc(nullptr, size, MEM_RESERVE | kXmem64kPages, 0x27, protect));
+    };
+    auto* const wc = window_of(2 * kPage64k, kWriteCombineWindow | PAGE_GRAPHICS_READWRITE);
+    auto* const nc = window_of(kPage64k, kUncachedWindow);
+    auto* const plain = window_of(kPage64k, PAGE_READWRITE);
+    auto* const read_only = window_of(kPage64k, kReadOnlyWriteCombine);
+    check(wc && nc && plain && read_only, "experimental host cache: four windows reserved");
+    if (!wc || !nc || !plain || !read_only) return;
+    uint64_t pages[2]{};
+    uint64_t count = 2;
+    check(api.allocate(0x280, &count, pages) == TRUE && count == 2, "experimental host cache: two pages");
+    if (count != 2) return;
+
+    // The write-combine window: cached read-write views, the window's own protection unchanged.
+    check(api.map(wc, 2, pages) == wc, "experimental host cache: pages map into a write-combine window");
+    check(protection_of(wc) == PAGE_READWRITE && protection_of(wc + kPage64k) == PAGE_READWRITE,
+          "experimental host cache: both views of the write-combine window are normal cached read-write");
+    DWORD logical = 0;
+    check(ex::xmem_window_protection(wc, &logical) && logical == kWriteCombineWindow,
+          "experimental host cache: the window keeps the requested write-combine protection");
+    fill_page(wc, 0x5100u);
+    fill_page(wc + kPage64k, 0x5200u);
+
+    // Aliases of page 0: an uncached window (XMemMapPhysicalPages) and a plain one (Scatter). One cache type for all.
+    check(api.map(nc, 1, &pages[0]) == nc && protection_of(nc) == PAGE_READWRITE,
+          "experimental host cache: an uncached window's alias view is normal cached read-write");
+    check(ex::xmem_window_protection(nc, &logical) && logical == kUncachedWindow,
+          "experimental host cache: the uncached window keeps PAGE_NOCACHE in its protection");
+    void* const plain_address[1] = {plain};
+    check(api.scatter(plain_address, 1, &pages[0]) == TRUE && protection_of(plain) == PAGE_READWRITE,
+          "experimental host cache: a plain window's alias view has the same protection");
+    check(page_holds(nc, 0x5100u) && page_holds(plain, 0x5100u), "experimental host cache: every alias shows the page");
+    static_cast<volatile uint32_t*>(static_cast<void*>(plain))[3] = 0xc0ffee11u;
+    check(read_u32(wc, 12) == 0xc0ffee11u && read_u32(nc, 12) == 0xc0ffee11u,
+          "experimental host cache: a write through one alias is seen through the others");
+
+    // Read-only stays read-only; only the cache modifier goes.
+    check(api.map(read_only, 1, &pages[1]) == read_only && protection_of(read_only) == PAGE_READONLY,
+          "experimental host cache: a read-only write-combine window gets a read-only cached view");
+    check(page_holds(read_only, 0x5200u), "experimental host cache: the read-only view shows the page");
+
+    // A pin over the cached views: remap, unmap, free and VirtualProtect are still refused, nothing changes.
+    const auto b = reinterpret_cast<uintptr_t>(wc);
+    check(pins::pin(b, b + 2 * kPage64k) == PinResult::pinned, "experimental host cache: the cached views pin");
+    const auto busy = [] { return GetLastError() == ERROR_BUSY; };
+    SetLastError(ERROR_SUCCESS);
+    check(api.map(wc, 2, nullptr) == nullptr && busy(), "experimental host cache: unmapping a pinned view is refused");
+    const uint64_t reversed[2] = {pages[1], pages[0]};
+    SetLastError(ERROR_SUCCESS);
+    check(api.map(wc, 2, reversed) == nullptr && busy(), "experimental host cache: remapping a pinned view is refused");
+    SetLastError(ERROR_SUCCESS);
+    check(api.free_pages(2, pages) == FALSE && busy(), "experimental host cache: freeing a pinned page is refused");
+    DWORD old = 0;
+    SetLastError(ERROR_SUCCESS);
+    check(title_protect(wc, 0x1000, PAGE_READONLY, &old) == FALSE && busy(),
+          "experimental host cache: VirtualProtect of a pinned view is refused");
+    check(protection_of(wc) == PAGE_READWRITE && page_holds(wc + kPage64k, 0x5200u),
+          "experimental host cache: after the refusals the views keep their protection and contents");
+    check(pins::unpin(b, b + 2 * kPage64k), "experimental host cache: unpinned");
+
+    check(api.map(read_only, 1, nullptr) == read_only && api.scatter(plain_address, 1, nullptr) == TRUE &&
+              api.map(nc, 1, nullptr) == nc && api.map(wc, 2, nullptr) == wc,
+          "experimental host cache: every view unmapped");
+    check(api.free_pages(2, pages) == TRUE, "experimental host cache: pages freed");
+    check(pins::pin_count() == 0, "experimental host cache: no pin left");
+
+    // Only physical-page views change: a committed XMemVirtualAlloc region asking for write-combine is not.
+    void* const committed = api.virtual_alloc(nullptr, kPage64k, MEM_RESERVE | MEM_COMMIT, 0x27, kWriteCombineWindow);
+    if (committed) {
+        const DWORD protect = protection_of(committed);
+        if (protect & PAGE_WRITECOMBINE)
+            check(true, "experimental host cache: committed allocations keep their write-combine modifier");
+        else
+            std::printf("xmem_test: experimental host cache: the host does not report write-combine on a committed "
+                        "region (0x%lx); host_protect not checked\n",
+                        static_cast<unsigned long>(protect));
+        VirtualFree(committed, 0, MEM_RELEASE);
+    }
+}
+
 void print_result() {
     if (g_failures == 0) {
         std::printf("xmem_test: OK (%d checks)\n", g_checks);
@@ -961,8 +1107,15 @@ void print_result() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     std::printf("xmem_test: registered xmem.dll shim ABI\n");
+    // The mode names the environment CTest gave this process; the test only reads it.
+    const bool host_cache_experiment = argc == 2 && std::strcmp(argv[1], "--host-cache-experiment") == 0;
+    if (argc > 2 || (argc == 2 && !host_cache_experiment)) return 2;
+    check(rt::experimental_host_import::enabled() == host_cache_experiment,
+          host_cache_experiment ? "PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT is exactly 1 for --host-cache-experiment"
+                                : "PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT is not 1 for the default run");
+    test_host_cache_rule();
 
     const auto alloc = reinterpret_cast<XMemAllocFn>(rt::shims::find("xmem.dll", "XMemAlloc"));
     const auto free_mem = reinterpret_cast<XMemFreeFn>(rt::shims::find("xmem.dll", "XMemFree"));
@@ -1033,6 +1186,10 @@ int main() {
         test_pins(physical, alloc, free_mem);
         test_pin_ownership(physical, alloc, free_mem);
         test_pin_protect_and_unmap(physical);
+        if (host_cache_experiment)
+            test_host_cache_experiment(physical);
+        else
+            test_host_cache_default(physical);
     }
 
     print_result();

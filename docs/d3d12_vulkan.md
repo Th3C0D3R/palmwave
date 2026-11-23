@@ -2408,6 +2408,57 @@ The trace will enumerate them.
     RTX 5080, driver 621.14, with Vulkan validation enabled and no validation errors (23 November 2026).
     These synthetic copies establish buffer visibility and lifetime behaviour; they do not establish the console
     flag/state contract or shader V# addressing. See `STATUS.md` for the separate offline retail refusal.
+  - **Experimental host import (opt-in diagnostic; a hypothesis, not a console ABI).** Off unless
+    `PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT` is exactly `1` (read once per process,
+    `runtime/shims/experimental_host_import.h`). Unset, empty, `0` or any other value leaves everything above
+    unchanged, the retail call refused. With it set, two things change and nothing else:
+    - The proxy accepts **one** tuple: `Dimension` BUFFER, `Alignment` 0, `Width` > 0 (the device's bounds checks
+      still apply), `Height`/`DepthOrArraySize`/`MipLevels` 1, `Format` UNKNOWN, `SampleDesc` {1, 0}, layout word
+      `0x1`, `Flags` exactly `0x00020004`, third word `0xFFFFFFFF`, null clear value. This is the shape seen in public
+      upstream observations of the retail call. It does not read the undefined padding DWORD at +4 and never writes
+      the title's description. It builds a new host description with `Flags` `ALLOW_UNORDERED_ACCESS` (`0x4`) and
+      passes the third word as `COMMON` (0) to the importer described above, with every check above applied: no
+      stand-in, fallback, zero fill or invented success. Each attempt prints the original and host values on stderr
+      and records `Xbox CreatePlacedResourceX (device slot 133) EXPERIMENTAL host import` on the D3D12 trace with the
+      outcome `experimental`; the backend separately records its real result. Every other flag set, state word,
+      shape or clear value keeps the strict refusal.
+    - The hypotheses: that bit `0x20000` can be dropped for a buffer, and that `0xFFFFFFFF` means "no state".
+      Microsoft's public `ID3D12Device10::CreatePlacedResource2` page takes a `D3D12_BARRIER_LAYOUT`, gives buffers
+      `D3D12_BARRIER_LAYOUT_UNDEFINED` and a null clear value, and DirectX-Headers
+      (`61c7718954ec73dbdd43c723240fe1a0452a3724`, `include/directx/d3d12.idl`) defines `UNDEFINED` as `0xFFFFFFFF`.
+      That fits the reading but doesn't prove the Xbox ordinal or method. Nothing establishes what `0x20000` means in
+      the console's `D3D12_RESOURCE_FLAGS`. The PC DDI's `D3D12DDI_RESOURCE_FLAG_0124_ALLOW_EXECUTE_TILE_MAPPINGS`
+      is also `0x20000`, but it belongs to a different enum, and no relation is assumed.
+    - xmem physical-page views (`runtime/shims/xmem.cpp`, `view_protect`): a view created for a window whose
+      protection asks for `PAGE_WRITECOMBINE` or `PAGE_NOCACHE` is created as a normal cached view, following
+      upstream #7492. Only the view protection at creation changes. The window's recorded protection, the access bits
+      (read-only stays read-only) and `PAGE_GUARD` are kept. The option is fixed during xmem's static
+      initialisation, so every alias of a payload that xmem maps gets the same policy. No existing view is
+      reprotected, and `host_protect` (every other allocation) is unchanged, so write-combined or uncached memory from
+      anywhere else is still refused by the import. Each distinct requested protection is logged once as
+      `EXPERIMENTAL host cache` (and as an `xmem_experimental_host_cache` startup-trace event). This changes the host
+      cache type of emulated physical-page views. It is not an emulation of console cache control. The public
+      reproducer by Zunraz (`d7d2d4076bfa2411476305d0ca8ca3fc19c6a77a`, GPL-3.0) reports correct CPU results but
+      corrupt GPU readback from write-combined imports on RTX 5090/4090 with no validation errors, and correct results
+      with read-write pages. That is upstream evidence, not a Palmwave measurement.
+    - Still open with the experiment on: shader V#s that add `heap_base` to these VAs (section 3.3), shader UAV writes
+      into the buffer, and any menu, frame or retail result.
+    - Tests: `xs_proxy_mock_host_import_{unset,zero,other,experimental}`, `xmem_host_cache_experimental` and
+      `d3d12_host_placed_experimental` (CTest sets the variable for each process; the tests never set it). The GPU case
+      maps write-combine-window xmem pages, imports them through raw slot 133 with the exact tuple, and checks CPU
+      writes before and after the import against a GPU copy, then a fenced GPU copy into the buffer against the CPU
+      at the same VA. That shows buffer visibility through copies, not raw shader V# semantics or shader UAV writes.
+      **Measured in Palmwave (23 November 2026):** thirteen focused CPU CTests pass in 0.58 seconds; the GPU
+      experimental case passes in 0.51 seconds on RTX 5080, driver 621.14, with Vulkan validation and no errors.
+      The separate offline retail diagnostic imports its 182,452,224-byte buffer and reaches descriptor-heap
+      creation, then stops at the next guest assertion. No Draw, Submit, Present or first frame is observed.
+    - **Local cache discriminator.** A separate synthetic test in two fresh RTX 5080 / 621.14 processes imported
+      32 mapped 64-KiB views (2,097,152 bytes). RW had zero CPU or GPU mismatches. WC imported and bound successfully,
+      with zero CPU mismatches but 4,205 incorrect GPU bytes. Both used memory type 2 (HOST_VISIBLE | HOST_COHERENT)
+      and reported no Vulkan validation errors. This supports creating cached views for this host experiment; it
+      does not establish console flag semantics. The 32 WC views reported RW after Vulkan cleanup without a
+      VirtualProtect call in the probe, but when and why that protection changed remain unknown. The probe adapts
+      Zunraz's public reproducer at `d7d2d4076bfa2411476305d0ca8ca3fc19c6a77a` (GPL-3.0).
 - `CreateReservedResource` **implemented** (`d3d12_vulkan_device.cpp`, `src/resource_tiling.h`, checked by
   `d3d12_vulkan_device_test` and `resource_tiling_test`):
   - `CreateReservedResource`, `CreateReservedResource1` (no protected sessions) and `CreateReservedResource2`

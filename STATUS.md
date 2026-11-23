@@ -20,7 +20,7 @@ Source revision: original upstream `dde82f27e994337094afc476ded0b1426f6e87e2`, m
 | Driver pipeline creation | Running on RTX 5080; final full-corpus counts pending |
 | Retail dry-run | Exit 0; five modules mapped |
 | Retail initialization | Exit 0; four DLL initializations succeed |
-| Retail execution | Vulkan device, five queues, five fences, an allocator and the first Xbox command list created; recording stops at methods 132 and 131 |
+| Retail execution (strict default) | Vulkan device, five queues, five fences, an allocator and the first Xbox command list created; recording stops at methods 132 and 131 |
 | First rendered frame | Not verified |
 
 The scanner candidate is not counted as a shader translation failure. Generated data and full logs are private and stored outside the authoring repository. No game assets have been added to Git.
@@ -113,3 +113,31 @@ it does not establish the console placement contract or successful retail import
 
 The import implementation and its revision were written with Claude Code (Claude Opus 5.5), independently
 reviewed, integrated and tested with OpenAI Codex. Compatible source attribution is in `UPSTREAM.md`.
+
+## Opt-in host import diagnostic
+
+`PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT=1` selects one bounded placement hypothesis: a plain row-major buffer
+with exactly flags `0x20004`, third word `0xffffffff` and no clear value is passed to the real importer as UAV /
+COMMON. The same opt-in makes newly created xmem physical-page views use normal cached host memory when the
+logical window requested WC/NC; the logical protection is retained and existing views are never reprotected.
+Other shapes and options remain strict, as does the default when the variable is absent or not exactly `1`.
+This does not establish the meaning of console bit `0x20000` or the Xbox method's initial-layout contract.
+
+The local synthetic cache discriminator used two fresh RTX 5080 / 621.14 processes, each with 32 mapped 64-KiB
+views. RW readback matched all 2,097,152 bytes. WC import and bind succeeded but GPU readback differed in 4,205
+bytes; the CPU oracle matched in both processes. Both used HOST_VISIBLE | HOST_COHERENT memory type 2 and
+reported zero Vulkan validation errors. After Vulkan cleanup all 32 WC views reported RW without a VirtualProtect
+call in the probe; the moment and cause of that change were not determined. This fixture supports creating RW
+views for the host experiment; it proves neither the console flag meaning nor general cache equivalence.
+
+On the integrated experimental candidate, thirteen CPU CTests pass in 0.58 seconds and the GPU experimental
+case passes in 0.51 seconds on RTX 5080 / 621.14 with Vulkan validation and no errors. It imports through raw slot
+133, checks CPU writes before/after import through GPU readback and GPU writes at the same CPU VA after a fence,
+and preserves alias, lifetime and argument refusals. This tests buffer copies, not shader V# addressing or shader
+UAV writes. Claude Code Opus 5.5 prepared the candidate; OpenAI Codex independently reviewed, integrated and tested it.
+
+The separate offline retail probe enabled both host-import and synchronization diagnostics. It recorded 22
+startup events, four successful DLL initializations and no unimplemented import. Its 1785 D3D12 events contain
+1763 `ok`, 11 `called`, 10 `experimental-hypothesis` and one `experimental`. A real 182,452,224-byte buffer import
+succeeds, followed by CreateDescriptorHeap and GetCPUDescriptorHandleForHeapStart, then a guest assertion.
+No Draw, Submit or Present is observed. A first rendered frame is still not verified.

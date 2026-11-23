@@ -12,10 +12,14 @@
 //     (allocator, bundle, heap array, queue ExecuteCommandLists), unsupported slots failing Close and refusing the
 //     submission until Reset, AllocateUploadMemory over a mapped mock buffer, and the unwrapped PC path of slot 12;
 //   - --fail-virtualalloc / --fail-virtualprotect / --fail-veh: the guard region's setup failing, injected by
-//     patching this executable's own import table before the first proxy table is built (one process each).
+//     patching this executable's own import table before the first proxy table is built (one process each);
+//   - --host-import-experiment on|off: device slot 133's opt-in experiment (PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT, set
+//     by CTest for the process, never by the test): the one experimental tuple reaches the handler as UAV / COMMON
+//     only when the variable is "1"; every near miss is refused before the handler either way.
 // Every device, queue, fence and resource here is a mock that records the calls it gets. No game data, no Xbox DLLs.
 #include "../shims/d3d12_xs_device.h"
 #include "../shims/d3d12_trace.h"
+#include "../shims/experimental_host_import.h"
 
 #include <d3d12.h>
 #include <windows.h>
@@ -23,6 +27,7 @@
 #include <crtdbg.h>
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -630,6 +635,17 @@ int check_levels() {
                 D3D12_RESOURCE_DESC desc = buffer;
                 desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(flags);
                 EXPECT(refused(&desc, nullptr, E_NOTIMPL));
+            }
+            // The default process (no experiment): the exact experimental tuple, retail state word included, is refused
+            // as strictly as any other console bit. The opt-in case is --host-import-experiment; CTest unsets the
+            // variable for this process.
+            EXPECT(!rt::experimental_host_import::enabled());
+            {
+                D3D12_RESOURCE_DESC desc = buffer;
+                desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x20004);
+                void* placed = reinterpret_cast<void*>(1);
+                const int before = handler_calls;
+                EXPECT(call(&desc, 0xFFFFFFFFull, nullptr, &placed) == E_NOTIMPL && !placed && handler_calls == before);
             }
             for (const std::uint32_t layout : {0x0u, 0x2u, 0x3u, 0x101u, 0xFFFFFFFFu}) {
                 D3D12_RESOURCE_DESC desc = buffer;
@@ -1721,6 +1737,183 @@ int check_xbox_queue_descriptions() {
     return 0;
 }
 
+// ---- 8b. Device slot 133's opt-in experiment (one process per environment, read once) ----
+//
+// CTest sets PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT for the process: "1" for `on`; unset, "0" or another value for `off`.
+// The test only reads it. `on`: the exact tuple (flags 0x20004, state word 0xFFFFFFFF, no clear value, with garbage in
+// the padding DWORD at +4) reaches the handler as a new description with flags 0x4 and state 0, with the real device, the
+// title's VA and riid; the title's bytes are unchanged. Both modes: every near miss is refused by the proxy (output null,
+// handler not called), and the strict shapes are forwarded byte for byte as before.
+
+struct Seen133 {
+    int calls = 0;
+    void* real = nullptr;
+    void* va = nullptr;
+    D3D12_RESOURCE_DESC desc{};
+    GUID iid{};
+    std::uint32_t state = 0;
+    HRESULT result = S_OK;
+};
+Seen133 g_seen133;
+
+HRESULT seen133_handler(ID3D12Device* real_device, void* va, const D3D12_RESOURCE_DESC& desc, std::uint32_t state,
+                        REFIID iid, void** out) {
+    ++g_seen133.calls;
+    g_seen133.real = real_device;
+    g_seen133.va = va;
+    g_seen133.desc = desc;
+    g_seen133.iid = iid;
+    g_seen133.state = state;
+    if (FAILED(g_seen133.result)) {
+        *out = reinterpret_cast<void*>(0xbad);  // a sloppy handler: the proxy must still return null
+        return g_seen133.result;
+    }
+    *out = reinterpret_cast<void*>(0x1330);
+    return S_OK;
+}
+
+int run_host_import_experiment(bool expect_on) {
+    g_label = expect_on ? "xs_proxy_mock host import experiment on" : "xs_proxy_mock host import experiment off";
+    EXPECT(rt::experimental_host_import::enabled() == expect_on);  // the CTest environment matches the mode
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device);
+    xs::set_placed_at_va_handler(&seen133_handler);
+    const GUID resource_iid = __uuidof(ID3D12Resource);
+    void* const va = reinterpret_cast<void*>(0x7f0000040000ull);
+    const auto call = [&](const D3D12_RESOURCE_DESC* desc, std::uint64_t state, const void* clear, void** placed) {
+        return hr_of(raw(device, 133, word(va), word(desc), state, word(clear), word(&resource_iid), word(placed)));
+    };
+
+    // The exact tuple, with garbage in the padding DWORD at +4 (written through bytes: it is not a field).
+    D3D12_RESOURCE_DESC tuple{};
+    tuple.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    tuple.Alignment = 0;
+    tuple.Width = 0x30000;
+    tuple.Height = 1;
+    tuple.DepthOrArraySize = 1;
+    tuple.MipLevels = 1;
+    tuple.Format = DXGI_FORMAT_UNKNOWN;
+    tuple.SampleDesc.Count = 1;
+    tuple.SampleDesc.Quality = 0;
+    tuple.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x1);
+    tuple.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x00020004);
+    static_assert(offsetof(D3D12_RESOURCE_DESC, Alignment) == 8, "the padding DWORD is at +4");
+    const std::uint32_t padding = 0xA5C3E1F7u;
+    std::memcpy(reinterpret_cast<unsigned char*>(&tuple) + 4, &padding, sizeof(padding));
+    unsigned char original[sizeof(tuple)];
+    std::memcpy(original, &tuple, sizeof(tuple));
+    constexpr std::uint64_t kStateWord = 0xFFFFFFFFull;
+
+    {
+        void* placed = reinterpret_cast<void*>(1);
+        const int before = g_seen133.calls;
+        const HRESULT hr = call(&tuple, kStateWord, nullptr, &placed);
+        EXPECT(std::memcmp(original, &tuple, sizeof(tuple)) == 0);  // the title's description, byte for byte
+        if (expect_on) {
+            EXPECT(hr == S_OK && placed == reinterpret_cast<void*>(0x1330) && g_seen133.calls == before + 1);
+            const D3D12_RESOURCE_DESC& d = g_seen133.desc;
+            EXPECT(d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && d.Alignment == 0 && d.Width == tuple.Width &&
+                   d.Height == 1 && d.DepthOrArraySize == 1 && d.MipLevels == 1 && d.Format == DXGI_FORMAT_UNKNOWN &&
+                   d.SampleDesc.Count == 1 && d.SampleDesc.Quality == 0 && d.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR);
+            EXPECT(static_cast<std::uint32_t>(d.Flags) == 0x4u && g_seen133.state == 0u);
+            EXPECT(g_seen133.real == xs::device_proxy_real_device(device) && g_seen133.va == va);
+            EXPECT(std::memcmp(&g_seen133.iid, &resource_iid, sizeof(GUID)) == 0);
+            // The handler's real failure comes back as it is, with the output null.
+            for (const HRESULT failure : {E_NOTIMPL, E_INVALIDARG, E_OUTOFMEMORY}) {
+                g_seen133.result = failure;
+                void* failed = reinterpret_cast<void*>(1);
+                EXPECT(call(&tuple, kStateWord, nullptr, &failed) == failure && !failed);
+            }
+            g_seen133.result = S_OK;
+        } else {
+            EXPECT(hr == E_NOTIMPL && !placed && g_seen133.calls == before);
+        }
+    }
+
+    // Near misses: refused by the proxy in both modes (flags 0x20004 are not a strict shape), handler not called.
+    const auto refused = [&](const D3D12_RESOURCE_DESC& desc, std::uint64_t state, const void* clear, HRESULT want) {
+        void* placed = reinterpret_cast<void*>(1);
+        const int before = g_seen133.calls;
+        return call(&desc, state, clear, &placed) == want && !placed && g_seen133.calls == before;
+    };
+    for (const std::uint32_t flags : {0x20000u, 0x2000Cu, 0x20204u, 0x20005u, 0x60004u, 0x80020004u}) {
+        D3D12_RESOURCE_DESC d = tuple;
+        d.Flags = static_cast<D3D12_RESOURCE_FLAGS>(flags);
+        EXPECT(refused(d, kStateWord, nullptr, E_NOTIMPL));
+    }
+    for (const std::uint64_t state : {std::uint64_t{0}, std::uint64_t{0xFFFFFFFEull}, std::uint64_t{0x7FFFFFFFull},
+                                      std::uint64_t{0x4}}) {
+        EXPECT(refused(tuple, state, nullptr, E_NOTIMPL));
+    }
+    {
+        const D3D12_CLEAR_VALUE clear_value{};
+        EXPECT(refused(tuple, kStateWord, &clear_value, E_NOTIMPL));  // the strict flag check comes first
+    }
+    {
+        D3D12_RESOURCE_DESC d = tuple;
+        d.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        EXPECT(refused(d, kStateWord, nullptr, E_NOTIMPL));
+        d = tuple;
+        d.Width = 0;
+        EXPECT(refused(d, kStateWord, nullptr, E_NOTIMPL));
+        d = tuple;
+        d.Height = 2;
+        EXPECT(refused(d, kStateWord, nullptr, E_NOTIMPL));
+        d = tuple;
+        d.DepthOrArraySize = 2;
+        EXPECT(refused(d, kStateWord, nullptr, E_NOTIMPL));
+        d = tuple;
+        d.MipLevels = 0;
+        EXPECT(refused(d, kStateWord, nullptr, E_NOTIMPL));
+        d = tuple;
+        d.Format = DXGI_FORMAT_R8_UNORM;
+        EXPECT(refused(d, kStateWord, nullptr, E_NOTIMPL));
+        d = tuple;
+        d.SampleDesc.Count = 2;
+        EXPECT(refused(d, kStateWord, nullptr, E_NOTIMPL));
+        d = tuple;
+        d.SampleDesc.Quality = 1;
+        EXPECT(refused(d, kStateWord, nullptr, E_NOTIMPL));
+        for (const std::uint32_t layout : {0x0u, 0x2u, 0x101u, 0xFFFFFFFFu}) {
+            d = tuple;
+            d.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(layout);
+            EXPECT(refused(d, kStateWord, nullptr, E_NOTIMPL));
+        }
+        d = tuple;
+        d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        EXPECT(refused(d, kStateWord, nullptr, E_NOTIMPL));
+    }
+    {
+        // Null pointers stay E_POINTER before anything else.
+        const int before = g_seen133.calls;
+        void* placed = reinterpret_cast<void*>(1);
+        EXPECT(call(nullptr, kStateWord, nullptr, &placed) == E_POINTER && !placed);
+        EXPECT(hr_of(raw(device, 133, word(va), word(&tuple), kStateWord, 0, 0, word(&placed))) == E_POINTER && !placed);
+        EXPECT(g_seen133.calls == before);
+    }
+
+    // The strict shapes are forwarded unchanged, byte for byte, in both modes.
+    for (const std::uint32_t flags : {0x0u, 0x4u, 0x8u, 0xCu}) {
+        for (const std::uint64_t state : {std::uint64_t{0}, kStateWord}) {
+            D3D12_RESOURCE_DESC d = tuple;
+            d.Flags = static_cast<D3D12_RESOURCE_FLAGS>(flags);
+            void* placed = nullptr;
+            const int before = g_seen133.calls;
+            EXPECT(call(&d, state, nullptr, &placed) == S_OK && placed == reinterpret_cast<void*>(0x1330));
+            EXPECT(g_seen133.calls == before + 1 && std::memcmp(&g_seen133.desc, &d, sizeof(d)) == 0 &&
+                   g_seen133.state == static_cast<std::uint32_t>(state));
+        }
+    }
+
+    xs::set_placed_at_va_handler(nullptr);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: the exact experimental tuple %s; every near miss is refused before the handler; strict shapes are "
+                "forwarded unchanged\n",
+                g_label, expect_on ? "reaches the handler as flags 0x4 / state 0" : "is refused (strict)");
+    return 0;
+}
+
 // ---- 9. Device slot 26, GetCustomHeapProperties, the console's way and the PC's ----
 
 int check_custom_heap_properties() {
@@ -1887,6 +2080,11 @@ int main(int argc, char** argv) {
     no_dialogs();
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc == 2 && std::strcmp(argv[1], "--slot133") == 0) return check_placed_resource_refusal();
+    if (argc == 3 && std::strcmp(argv[1], "--host-import-experiment") == 0) {
+        if (std::strcmp(argv[2], "on") == 0) return run_host_import_experiment(true);
+        if (std::strcmp(argv[2], "off") == 0) return run_host_import_experiment(false);
+        return 2;
+    }
     if (argc == 2) {
         if (std::strcmp(argv[1], "--env-slots") == 0) return run_env_slots(true);
         if (std::strcmp(argv[1], "--env-slots-invalid") == 0) return run_env_slots(false);
