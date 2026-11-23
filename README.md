@@ -48,7 +48,8 @@ Measured on **Ryzen 9 9950X3D / NVIDIA RTX 5080 16 GB / driver 621.14 / Windows 
 | Embedded BVH shaders | 52 / 52 translated and SPIR-V valid |
 | Embedded FSPX shaders | 18 / 29 translated and valid; 11 rejected as undecodable fall-through |
 | GPU pipeline creation | In progress; full-pass result pending |
-| Retail dry-run, initialization, execution | Not yet performed in this project |
+| Retail dry-run / initialization | Both exit 0; four DLL initializations succeed |
+| Retail execution | First missing export fixed; blocked by the executable's direct TLS-slot-zero access before D3D12 |
 | First rendered frame | Not verified |
 
 These counts are preparation results, not gameplay or rendering results. Historical measurements in the inherited `docs/` remain attributed to their original authors and hardware.

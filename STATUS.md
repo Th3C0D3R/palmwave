@@ -18,13 +18,16 @@ Source revision: original upstream `dde82f27e994337094afc476ded0b1426f6e87e2`, m
 | Embedded BVH programs | 52 / 52 translated and SPIR-V valid |
 | Embedded FSPX programs | 18 / 29 translated and valid; 11 rejected: fall-through into undecodable words |
 | Driver pipeline creation | Running on RTX 5080; final full-corpus counts pending |
-| Retail execution and frame | Pending; no rendered frame claimed |
+| Retail dry-run | Exit 0; five modules mapped |
+| Retail initialization | Exit 0; four DLL initializations succeed |
+| Retail execution | First missing export fixed in `eebabab`; next stop is direct TLS-slot-zero access before D3D12 |
+| First rendered frame | Not verified |
 
 The scanner candidate is not counted as a shader translation failure. Generated data and full logs are private and stored outside the authoring repository. No game assets have been added to Git.
 
 ## Isolation
 
-The planned retail run uses a Windows AppContainer token with no Internet or private-network capability, no loopback exemption, and inherited confinement for ordinary child processes. Overlay, saves, cache writes and startup/D3D12 traces use a writable temporary directory. This is the local runner's measured configuration, not a network guarantee supplied by palmwave itself.
+The local retail runs use a Windows AppContainer token with no Internet or private-network capability, no loopback exemption, and inherited confinement for ordinary child processes. Overlay, saves and cache writes use a private writable directory. Startup/D3D12 traces are created in TEMP and copied outside the sandbox before its temporary directory is cleaned up. This is the local runner's measured configuration, not a network guarantee supplied by palmwave itself.
 
 ## Reporting rules
 
@@ -34,4 +37,10 @@ Project: [Palmwave / Moon AI](https://realmoon.ai). Source provenance: [UPSTREAM
 
 ## Synthetic regression baseline
 
-The first full semantic run executed 5,956 tests across 447 files in 245 seconds, with two files failing because of stale fixtures: CUBE d16 rejection and a constant-EXEC assumption in atomic guard checks. Focused corrections add positive coverage and negative controls without changing translator code. A complete rerun is pending. `compileall` passed. These are CPU/tool validations, not game rendering tests.
+The first full semantic run executed 5,956 tests across 447 files in 245 seconds, with two files failing because of stale fixtures: CUBE d16 rejection and a constant-EXEC assumption in atomic guard checks. Focused corrections add positive coverage and negative controls without changing translator code. The complete rerun with LLVM and SPIR-V tools available passed all 5,958 tests across 447 files in 439 seconds. `compileall` passed. These are CPU/tool validations, not game rendering tests.
+
+## First local execution
+
+The baseline run ended with Windows status `0xC0000374`. A first-chance debugger revealed an earlier breakpoint after the dynamic `XErrorReport` lookup failed; the final status alone did not establish a heap bug. Commit `eebabab` exposes the existing offline report handler, adapted from upstream PR #6582. Both targeted runtime tests passed, and the next offline run successfully initialized the GDK runtime.
+
+The next first-chance exception is an access violation. Debugging confirms that the executable reads TLS slot zero directly while the loader assigned its TLS index six; the host and guest blocks differ. This matches the documented `/GA` loader issue. A scoped loader correction is being reviewed. No D3D12 call or rendered frame has been observed in these runs. Raw traces, addresses and disassembly remain private.
