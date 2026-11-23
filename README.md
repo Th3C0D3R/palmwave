@@ -31,7 +31,7 @@ Palmwave starts from the GPL-3.0 [Leonida](https://github.com/ItsNotRexed/Leonid
 - Implements the console-shaped D3D12 interfaces over a Vulkan device.
 - Captures startup and graphics traces so the next blocking call can be measured and fixed.
 
-All game input stays on the user's machine. This repository contains **no game package, game executable, generated game shaders, keys or decryption tools**. It does not connect to Xbox Live or Rockstar services.
+All game input stays on the user's machine. This repository contains **no game package, game executable, generated game shaders, keys or decryption tools**. Online Xbox Live and Rockstar services are out of scope; guest execution requires network isolation.
 
 ## Current local milestone
 
