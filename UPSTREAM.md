@@ -171,3 +171,18 @@ New synthetic tests were written in these files:
 Validation on Windows/MSVC 19.51: four focused CTests pass (`loader`, `device_proxy`, `device_proxy_trace`, `xs_proxy_mock`) in 11.74 seconds. The two device tests use WARP and read back RGBA (255, 0, 128, 255) and depth 0.25; they are not NVIDIA Vulkan tests. The offline RTX 5080 / 621.14 probe records 1,800 D3D12 events and no draw, submission or presentation. Both existing flush and host-import experiments were enabled for that diagnostic probe. No retail frame is claimed.
 
 The adaptation, tests and this note were written with Claude Code (Claude Opus 5.5) as a Moon AI project contribution. OpenAI Codex reviewed the adaptation, corrected the native-handle boundary and unpaired-allocator guard, and built and tested the change.
+
+### Vulkan descriptor readback regression
+
+`descriptor_proxy_gpu_test.cpp` exercises the same descriptor proxy on the Vulkan backend with an explicit
+source-crafted allocation pair; loader registration remains covered by the CPU/WARP tests above. Three 4x4 colour
+targets use two custom RTV handles and one handle from a heap created directly on the backend. The console list
+records both OMSetRenderTargets forms, typed ClearDepthStencilView, ClearRenderTargetView, transitions and copies.
+A real queue and fence precede comparison of every texel. Both allocated descriptor backings are released once.
+Early error paths wait for GPU work before resources are destroyed.
+
+Validation: the focused CTest passed in 0.41 seconds on NVIDIA GeForce RTX 5080, driver 621.14, with Vulkan and
+synchronization validation enabled. All 192 colour bytes and all 16 depth values matched; depth was exactly 0.25.
+There were zero validation errors through resource and device destruction. This is a synthetic readback test,
+not a retail frame or proof of the console descriptor contract. The test was written with Claude Opus 5.5 and
+reviewed, hardened for error-path cleanup, built and executed with OpenAI Codex.

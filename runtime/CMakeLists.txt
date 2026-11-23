@@ -1899,6 +1899,14 @@ if(TARGET Vulkan::Headers)
     target_compile_options(allocator_proxy_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME allocator_proxy COMMAND allocator_proxy_test)
     set_tests_properties(allocator_proxy PROPERTIES SKIP_RETURN_CODE 77)
+    # Synthetic title-backed RTV/DSV handles through console list thunks, with a Vulkan readback.
+    add_executable(descriptor_proxy_gpu_test test/descriptor_proxy_gpu_test.cpp)
+    target_link_libraries(descriptor_proxy_gpu_test PRIVATE palmwave_d3d12_com d3d12 dxgi)
+    target_compile_definitions(descriptor_proxy_gpu_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(descriptor_proxy_gpu_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    add_test(NAME descriptor_proxy_gpu COMMAND descriptor_proxy_gpu_test)
+    set_tests_properties(descriptor_proxy_gpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30
+                        FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
     # IDXGIDevice1 on the device proxy (the GDKX boot step: QueryInterface, GetAdapter, EnumOutputs), on the host
     # runtime and on the Vulkan device: COM identity with the device, the adapter's LUID. 77: no device at all.
     add_executable(dxgi_device_test test/dxgi_device_test.cpp)
