@@ -308,6 +308,14 @@ struct Json {
     // does not (the pair<string, Json> form used to fail to build there). Structured bindings still work.
     std::vector<JsonObjectEntry> object;
 
+    // All special members are defaulted out of line, after JsonObjectEntry is complete, for the same reason. The
+    // user-declared destructor alone suppresses the implicit moves, which made every std::move(item) in the reader
+    // and every vector reallocation deep-copy the nested tree; the moves are declared here so they transfer it.
+    Json() noexcept;
+    Json(const Json&);
+    Json(Json&&) noexcept;
+    Json& operator=(const Json&);
+    Json& operator=(Json&&) noexcept;
     ~Json();
     const Json* find(std::string_view key) const;
 };
@@ -317,6 +325,11 @@ struct JsonObjectEntry {
     Json value;
 };
 
+inline Json::Json() noexcept = default;
+inline Json::Json(const Json&) = default;
+inline Json::Json(Json&&) noexcept = default;
+inline Json& Json::operator=(const Json&) = default;
+inline Json& Json::operator=(Json&&) noexcept = default;
 inline Json::~Json() = default;
 
 inline const Json* Json::find(std::string_view key) const {

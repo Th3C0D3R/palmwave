@@ -10,6 +10,8 @@
 #include <initializer_list>
 #include <sstream>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #define CHECK(condition) do {                                    \
@@ -249,6 +251,98 @@ int fspx_checks() {
     return 0;
 }
 
+// Strings longer than any small-string buffer (15 or 22 characters), so they own heap storage that a move transfers.
+const std::string long_a(48, 'a'), long_b(48, 'b'), long_c(48, 'c');
+
+// The tree json_move_checks parses: strings, arrays and objects nested in each other.
+bool nested_ok(const palmwave::Json& j) {
+    using Kind = palmwave::Json::Kind;
+    const palmwave::Json* name = j.find("name");
+    const palmwave::Json* list = j.find("list");
+    const palmwave::Json* obj = j.find("obj");
+    if (j.kind != Kind::object || j.object.size() != 3 || !name || !list || !obj) return false;
+    if (name->string != long_a || list->kind != Kind::array || list->array.size() != 3) return false;
+    const auto& l = list->array;
+    if (l[0].string != long_b || l[1].array.size() != 3 || l[1].array[2].number != 3) return false;
+    const palmwave::Json* k = l[2].find("k");
+    const palmwave::Json* t = l[2].find("t");
+    if (!k || k->string != long_c || !t || !t->boolean) return false;
+    const palmwave::Json* inner = obj->find("inner");
+    return inner && inner->array.size() == 2 && inner->array[0].kind == Kind::null && inner->array[1].number == -4.5;
+}
+
+// Where the tree's owned buffers live: equal after a move when the storage was transferred, not copied.
+struct Storage {
+    const void* entries;
+    const char* name;
+    const void* list;
+    const void* numbers;
+    const char* nested_key;
+    const void* inner;
+    bool operator==(const Storage&) const = default;
+};
+
+Storage storage(const palmwave::Json& j) {
+    const auto& list = j.find("list")->array;
+    return {j.object.data(), j.find("name")->string.data(), list.data(), list[1].array.data(),
+            list[2].find("k")->string.data(), j.find("obj")->find("inner")->array.data()};
+}
+
+bool disjoint(const Storage& a, const Storage& b) {
+    return a.entries != b.entries && a.name != b.name && a.list != b.list && a.numbers != b.numbers &&
+           a.nested_key != b.nested_key && a.inner != b.inner;
+}
+
+// Json moves its nested tree (move construction, move assignment, vector reallocation, as an object entry's value)
+// instead of copying it, and copies stay deep and independent. Returns the failing line or 0.
+int json_move_checks() {
+    using namespace palmwave;
+    // Vector growth moves elements only when their move cannot throw; otherwise it copies every nested tree.
+    static_assert(std::is_nothrow_move_constructible_v<Json> && std::is_nothrow_move_assignable_v<Json>);
+    static_assert(std::is_nothrow_move_constructible_v<JsonObjectEntry> &&
+                  std::is_nothrow_move_assignable_v<JsonObjectEntry>);
+    static_assert(std::is_copy_constructible_v<Json> && std::is_copy_assignable_v<Json>);
+    static_assert(std::is_copy_constructible_v<JsonObjectEntry> && std::is_nothrow_default_constructible_v<Json>);
+
+    const std::string text = "{\"name\": \"" + long_a + "\", \"list\": [\"" + long_b + "\", [1, 2, 3], {\"k\": \"" +
+                             long_c + "\", \"t\": true}], \"obj\": {\"inner\": [null, -4.5]}}";
+    Json root;
+    CHECK(JsonReader(text).parse(root) && nested_ok(root));
+    const Storage original = storage(root);
+
+    Json constructed(std::move(root));
+    CHECK(nested_ok(constructed) && storage(constructed) == original && root.object.empty());
+
+    Json assigned;
+    CHECK(JsonReader("{\"old\": [\"" + long_c + "\"]}").parse(assigned));  // released by the assignment
+    assigned = std::move(constructed);
+    CHECK(nested_ok(assigned) && storage(assigned) == original);
+
+    std::vector<Json> values;
+    values.push_back(std::move(assigned));
+    for (const std::size_t capacity = values.capacity(); values.capacity() == capacity;) values.emplace_back();
+    CHECK(nested_ok(values.front()) && storage(values.front()) == original);
+
+    std::vector<JsonObjectEntry> entries;
+    entries.push_back({long_b, std::move(values.front())});
+    for (const std::size_t capacity = entries.capacity(); entries.capacity() == capacity;) entries.push_back({});
+    CHECK(entries.front().key == long_b && nested_ok(entries.front().value) && storage(entries.front().value) == original);
+
+    // Copies are deep: their own storage, and a change to one leaves the other as it was.
+    const Json& source = entries.front().value;
+    Json copy(source);
+    CHECK(nested_ok(copy) && disjoint(storage(copy), original));
+    copy.object[0].value.string = "changed";
+    copy.object[1].value.array[1].array.clear();
+    CHECK(nested_ok(source) && !nested_ok(copy));
+    Json copy_assigned;
+    copy_assigned = source;
+    CHECK(nested_ok(copy_assigned) && disjoint(storage(copy_assigned), original));
+    copy_assigned.object[2].value.object.clear();
+    CHECK(nested_ok(source) && storage(source) == original);
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -314,6 +408,7 @@ int main() {
     CHECK(!JsonReader("\"\\u0x41\"").parse(json));
     CHECK(!JsonReader("\"\\u00").parse(json));
     CHECK(JsonReader("\"\\u0041\"").parse(json) && json.string == "A");
+    if (const int line = json_move_checks()) return line;
 
     const auto shader = container({{dynamic, 600}});
     CHECK(dxbc_part(shader, "PRIV").size() == 4 && !dxbc_part(shader, "DXIL").empty() && dxbc_part(shader, "RTS0").empty());
