@@ -795,12 +795,10 @@ int check_experimental(Gpu& gpu, void* proxy, const XMem& x, const Title& title)
 // A title-backed descriptor heap (slot 14 with a test allocator whose backing is real memory), a real import of title
 // pages through raw slot 133, then raw slot 70 with the measured raw-buffer shape at a smaller width. The descriptor the
 // layer writes into the real heap must be the one PC slot 18 writes for the same live buffer and byte range: a raw V#
-// whose base is the title VA and whose record count is the width. Refusals leave a canary in the slot.
-//
-// NOT covered here: a shader reading through this V#. The translated shader contract adds heap_base to a V#'s base
-// (docs/d3d12_vulkan.md 3.3), and a title-page buffer's base is the title's host VA, so such a read misses the import;
-// dispatching one would read an unrelated device address. d3d12_compute_test reads a slot-70 view of an arena buffer,
-// which that contract does reach.
+// whose base is the imported buffer device address minus heap_base and whose record count is the width. The
+// public GPU VA remains the title VA. Refusals leave a canary in the slot.
+// This test checks the slot-70 route and descriptor encoding. d3d12_import_raw_view independently executes a
+// translated shader through RAW imported views, including its shader-write to host-read dependency.
 
 namespace xs = rt::d3d12_xs;
 
@@ -849,7 +847,7 @@ void call_slot70(void* proxy, const Slot70Args& args, std::uint64_t destination)
                                          reinterpret_cast<std::uint64_t>(args.view), destination);
 }
 
-int check_slot70(Gpu& gpu, void* proxy, const Title& title) {
+int check_slot70(Gpu& gpu, void* proxy, const Title& title, vktest::Device& vk) {
     const char* who = "slot 70 raw SRV over a host import";
     constexpr UINT64 kWidth = k64;
     auto* const pages = static_cast<std::uint32_t*>(
@@ -893,13 +891,35 @@ int check_slot70(Gpu& gpu, void* proxy, const Title& title) {
     Slot70Args call = args;
     call_slot70(proxy, call, title_cpu + 1 * inc);
     EXPECT(std::memcmp(&call, &args, sizeof(args)) == 0);
+    const std::uint64_t heap_base = rt::d3d12::device_heap_base(gpu.device);
+    const std::uint64_t address = vk.buffer_device_address
+        ? vk.device_address(rt::d3d12::vulkan_buffer(placed)) : 0;
+    constexpr std::uint64_t limit = std::uint64_t(1) << 47;
+    const bool representable = heap_base && address > heap_base && address <= UINT64_MAX - kWidth &&
+        address - heap_base < limit && kWidth <= limit - (address - heap_base) &&
+        !(((address - heap_base) ^ va) & 3);
+    if (!representable) {
+        EXPECT(xs::last_srv_at_va_outcome() == xs::SrvAtVaOutcome::not_shader_readable);
+        EXPECT(xs::srv_at_va_created_calls() == 0);
+        const std::vector<std::uint8_t> unchanged(inc, 0x5A);
+        EXPECT(std::memcmp(real_slot(1), unchanged.data(), inc) == 0);
+        EXPECT(std::memcmp(reinterpret_cast<const void*>(title_cpu), title_before.data(), title_before.size()) == 0);
+        placed->Release();
+        EXPECT(nothing_held(gpu.device));
+        heap.reset();
+        EXPECT(title.free(elsewhere, 0, MEM_RELEASE));
+        EXPECT(title.free(pages, 0, MEM_RELEASE));
+        std::printf("%s: device-address placement is unrepresentable; slot and title backing unchanged, no leak\n", who);
+        return 0;
+    }
+    const std::uint64_t view_base = address - heap_base;
     EXPECT(xs::last_srv_at_va_outcome() == xs::SrvAtVaOutcome::created && xs::srv_at_va_created_calls() == 1);
-    // The real slot holds a raw V# of exactly the title VA and width; the title's backing bytes are not written.
+    // Independent Vulkan BDA oracle: heap_base + the encoded base must reach this buffer, not the title CPU VA.
     palmwave::gfx10::BufferWords words{};
     std::memcpy(words.data(), real_slot(1), sizeof(words));
     palmwave::gfx10::Buffer decoded{};
     EXPECT(palmwave::gfx10::decode(words, decoded));
-    EXPECT(decoded.address == va && decoded.num_records == kWidth && decoded.stride == 0 &&
+    EXPECT(decoded.address == view_base && heap_base + decoded.address == address && decoded.num_records == kWidth && decoded.stride == 0 &&
            decoded.oob_select == palmwave::gfx10::OobSelect::raw &&
            decoded.format == palmwave::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT));
     EXPECT(std::memcmp(reinterpret_cast<const void*>(title_cpu), title_before.data(), title_before.size()) == 0);
@@ -926,11 +946,11 @@ int check_slot70(Gpu& gpu, void* proxy, const Title& title) {
     EXPECT(intact(slot70_args(reinterpret_cast<std::uint64_t>(elsewhere), 0x100), xs::SrvAtVaOutcome::unknown_va));
     EXPECT(intact(slot70_args(va + 4, 0x100), xs::SrvAtVaOutcome::invalid_range));
 
-    // CPU writes to the pages do not change the descriptor (it still names the title VA). This rereads the descriptor
-    // only: it is not evidence that a shader sees those bytes (see NOT covered above).
+    // CPU writes to the pages do not change the descriptor. This checks encoding only; the separate RAW shader
+    // regression checks that the GPU reads the same imported pages.
     for (UINT64 i = 0; i < kWidth / 4; ++i) pages[i] = ~(0x70000000u + static_cast<std::uint32_t>(i) * 3u);
     std::memcpy(words.data(), real_slot(1), sizeof(words));
-    EXPECT(palmwave::gfx10::decode(words, decoded) && decoded.address == va);
+    EXPECT(palmwave::gfx10::decode(words, decoded) && decoded.address == view_base);
 
     // After the last Release the VA names nothing: refused, canary intact, nothing imported or pinned.
     placed->Release();
@@ -942,8 +962,7 @@ int check_slot70(Gpu& gpu, void* proxy, const Title& title) {
     title.free(pages, 0, MEM_RELEASE);
     std::printf("%s: the title-backed slot holds PC slot 18's raw V# for the live import (VA 0x%llx, %llu bytes), the "
                 "title backing is not written, the reference is balanced; past-the-end, unimported, misaligned and "
-                "released VAs leave the slot untouched. NOT RUN: a shader read through this V# (heap_base + title VA, "
-                "docs/d3d12_vulkan.md 3.3)\n",
+                "released VAs leave the slot untouched. Encoded base + heap_base equals the imported Vulkan BDA.\n",
                 who, static_cast<unsigned long long>(va), static_cast<unsigned long long>(kWidth));
     return 0;
 }
@@ -963,6 +982,7 @@ int main(int argc, char** argv) {
     // every slot-133 attempt is in the output.
     if (experimental) rt::d3d12_trace::set_enabled(true);
     vktest::Device vk;
+    vk.request_buffer_device_address = true;
     const auto status = vk.initialize();
     if (status == vktest::DeviceStatus::unavailable) return 77;
     if (status != vktest::DeviceStatus::ready) return 1;
@@ -1025,7 +1045,7 @@ int main(int argc, char** argv) {
             failures += check_xmem_lifecycle(gpu, xmem, title);
             failures += check_refusals(gpu, title);
             failures += check_proxy(gpu, device.p, title);
-            failures += check_slot70(gpu, device.p, title);
+            failures += check_slot70(gpu, device.p, title, vk);
             if (experimental) failures += check_experimental(gpu, device.p, xmem, title);
         }
     }

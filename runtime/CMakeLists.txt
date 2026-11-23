@@ -2478,8 +2478,42 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_buffer_uav_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_buffer_uav COMMAND d3d12_buffer_uav_test)
       set_tests_properties(d3d12_buffer_uav PROPERTIES SKIP_RETURN_CODE 77)
+
+      # Palmwave: RAW SRV/UAV views of slot-133 imports of the title's pages, read and written by the translated
+      # cs_import_raw.asm through the V#s the layer wrote, next to arena views in the same table, with the runtime's one
+      # heap_base. xmem.cpp and registry.cpp give it the served title VirtualAlloc and the pin provider, as for
+      # d3d12_host_placed_test. Skips (77) without a Vulkan device, the bindless features or the extension, and when the
+      # driver placed an import where no V# base can name it (the refusal is still checked); validation messages fail.
+      set(PALMWAVE_IMPORT_RAW_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/import_raw_shaders)
+      set(PALMWAVE_IMPORT_RAW_FILES ${PALMWAVE_IMPORT_RAW_DIR}/spirv/index.json
+                                   ${PALMWAVE_IMPORT_RAW_DIR}/fssm/cs_import_raw.fssm)
+      add_custom_command(
+        OUTPUT ${PALMWAVE_IMPORT_RAW_FILES}
+        COMMAND ${CMAKE_COMMAND} -E remove_directory ${PALMWAVE_IMPORT_RAW_DIR}
+        # PALMWAVE_USER_DATA_SHIFT=4: root arguments from s4 in a D3D12 compute PSO (see the M4 shaders above).
+        COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${PALMWAVE_LLVM_MC}" "PALMWAVE_SPIRV_TOOLS=${PALMWAVE_SPIRV_TOOLS_NATIVE}"
+                PALMWAVE_USER_DATA_SHIFT=4
+                $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${PALMWAVE_IMPORT_RAW_DIR} cs_import_raw
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_import_raw.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
+        COMMENT "Translating cs_import_raw for the imported RAW view test"
+        VERBATIM)
+      add_executable(d3d12_import_raw_view_test test/d3d12_import_raw_view_test.cpp shims/xmem.cpp shims/host_pins.h
+                     shims/registry.cpp ${PALMWAVE_IMPORT_RAW_FILES})
+      target_link_libraries(d3d12_import_raw_view_test PRIVATE palmwave_d3d12_com psapi)
+      target_compile_definitions(d3d12_import_raw_view_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 PALMWAVE_TEST_IMPORT_RAW_DIR="${PALMWAVE_IMPORT_RAW_DIR}")
+      target_compile_options(d3d12_import_raw_view_test PRIVATE /W4 /permissive- /utf-8)
+      target_link_options(d3d12_import_raw_view_test PRIVATE /OPT:NOREF)  # keep the self-registering shim tables
+      add_test(NAME d3d12_import_raw_view COMMAND d3d12_import_raw_view_test)
+      set_tests_properties(d3d12_import_raw_view PROPERTIES SKIP_RETURN_CODE 77
+                           FAIL_REGULAR_EXPRESSION "Validation Error;VUID-"
+                           ENVIRONMENT_MODIFICATION "PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT=unset:")
     else()
-      message(STATUS "llvm-mc (set LLVM_MC) or the SDK's spirv-as/spirv-val not found: d3d12_translated_draw_test, d3d12_m2_textured_test, d3d12_m2_formats_test, d3d12_m3_frame_test, d3d12_m4_compute_test and d3d12_buffer_uav_test are not built")
+      message(STATUS "llvm-mc (set LLVM_MC) or the SDK's spirv-as/spirv-val not found: d3d12_translated_draw_test, d3d12_m2_textured_test, d3d12_m2_formats_test, d3d12_m3_frame_test, d3d12_m4_compute_test, d3d12_buffer_uav_test and d3d12_import_raw_view_test are not built")
     endif()
     # ID3D12Resource::GetHeapProperties and ID3D12DescriptorHeap::GetDesc (node masks, resolved heap flags) against the
     # host runtime and WARP; run explicitly on a Vulkan GPU.
@@ -3125,10 +3159,23 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(replay_query_edges_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME replay_query_edges COMMAND replay_query_edges_test)
+    # Palmwave: the shader-write -> host-read dependency at the end of a submission while a CPU-read-back buffer is
+    # registered (VulkanQueue::host_read_barrier), with CPU mocks (no GPU or game data).
+    add_executable(host_read_barrier_test test/host_read_barrier_test.cpp)
+    target_link_libraries(host_read_barrier_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(host_read_barrier_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME host_read_barrier COMMAND host_read_barrier_test)
     # GFX10 T#/S#/V# descriptor encoding and its Vulkan mappings (src/gfx10_descriptors.h).
     add_executable(gfx10_descriptors_test test/gfx10_descriptors_test.cpp)
     target_link_libraries(gfx10_descriptors_test PRIVATE Vulkan::Headers)
     add_test(NAME gfx10_descriptors COMMAND gfx10_descriptors_test)
+    # Palmwave: the V# base of a RAW view of an imported host buffer (src/imported_view_address.h): representable
+    # views through the translator's address formula, and the 2^47 / underflow / wrap refusals, without a GPU.
+    add_executable(imported_view_address_test test/imported_view_address_test.cpp)
+    target_link_libraries(imported_view_address_test PRIVATE Vulkan::Headers)
+    add_test(NAME imported_view_address COMMAND imported_view_address_test)
     # CPU cost of the D3D12 -> Vulkan replay per command (record, prepare, emit) with no-op Vulkan entry points:
     # no GPU or driver. ctest runs its quick self-test; run it without arguments for the numbers.
     add_executable(replay_cpu_bench test/replay_cpu_bench.cpp)

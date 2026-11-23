@@ -223,3 +223,26 @@ The backend rejects resource flags 0x00300005 with E_INVALIDARG (0x80070057), th
 one request (backend and wrapper). Startup still has 23 events, four successful DLL initializations and no
 unimplemented import. No Draw, ExecuteCommandLists, Present or rendered game frame is observed. The console flags
 and initial-layout word need an explicit compatibility contract; this adapter does not silently strip them.
+
+## Imported RAW shader addressing and host visibility
+
+RAW views of imported buffers now encode the buffer's Vulkan device address relative to the shader arena,
+instead of using the console CPU address. Representable views reach the original imported bytes without a
+copy or shadow allocation. Shader submissions add the required host-read dependency before a fence can
+make their writes visible to the CPU. Nonrepresentable and foreign-device views leave the descriptor untouched.
+
+A clean integrated build passed 24 targeted CTests in 17.50 seconds on NVIDIA GeForce RTX 5080 / 621.14
+with Vulkan synchronization validation enabled. The imported RAW shader regression made 66,112 exact word
+comparisons; strict and experimental host imports, the slot-70 descriptor route and arena compute also passed.
+An obsolete incremental object had initially invalidated the result; a fresh build now tracks 73 dependencies
+for the Vulkan device source, including the shared backend header.
+
+The following offline executable probe revealed a real remaining limitation: its 174 MiB imported buffer
+was placed below the shader arena in Vulkan device-address space. The current zero-extended relative address
+cannot name that placement. Slot 70 and the RAW UAV call now refuse it explicitly; earlier descriptor creation
+did not demonstrate shader access. The probe records 23 startup events, four successful DLL initializations,
+no unimplemented import, and 2,238 D3D12 events (2,200 ok, 23 called, 10 experimental-hypothesis,
+one experimental, two refused and two failed). Allocation information still succeeds and the strict
+committed-texture route still rejects the console resource flags. No Draw, ExecuteCommandLists, Present
+or rendered frame was observed. Signed relative addressing is being investigated independently of the texture
+and presentation work.

@@ -3000,7 +3000,7 @@ const char* srv_at_va_reason(SrvAtVaOutcome outcome) {
             return "the destination is not a CBV_SRV_UAV slot of a heap this device created";
         case SrvAtVaOutcome::no_resolver: return "no buffer resolver on this device";
         case SrvAtVaOutcome::unknown_va: return "no live buffer of this device holds the whole range";
-        case SrvAtVaOutcome::not_shader_readable: return "the buffer denies shader-resource access";
+        case SrvAtVaOutcome::not_shader_readable: return "the buffer cannot supply the requested shader-resource view";
         case SrvAtVaOutcome::resolver_failed: return "the resolver failed or answered an inconsistent range";
         default: return "unknown";
     }

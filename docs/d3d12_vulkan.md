@@ -1499,11 +1499,88 @@ a console client can address is an arena range, whichever heap it comes from.
 Why not give each buffer its own BDA and set `heap_base = 0`? Because 25,865 of the 26,503 shaders (97.6%)
 truncate descriptor-table pointers to 32 bits, and host BDAs are not guaranteed to be below 4 GB. The arena keeps console VAs low and stable.
 
-**Slot-133 buffers are outside this equation (open).** A buffer on the title's own pages (section 4.2, "Slot 133")
-is its own imported `VkBuffer`, and its console VA is the title's host address. Copies, views and root arguments
-that name it by VA find it through the VA index. A shader that reads that VA from a V# adds `heap_base` and misses
-it. Importing the pages does not fix this, and setting `heap_base` to 0 doesn't either, for the reason above. One
-address space covering both the arena and the title's pages (for example #5378's sparse arena) is separate work.
+**Slot-133 buffers are outside this equation (partly addressed for RAW views).** A buffer on the title's own pages
+(section 4.2, "Slot 133") is its own imported `VkBuffer`, and its console VA is the title's host address. Copies,
+views and root arguments that name it by VA find it through the VA index. A shader that reads that VA from a V# adds
+`heap_base` and misses it. Importing the pages does not fix this, and setting `heap_base` to 0 doesn't either, for the
+reason above. One address space covering both the arena and the title's pages (for example #5378's sparse arena) is
+separate work.
+
+Palmwave narrows the gap for the RAW buffer views the layer writes itself, without changing the translator, the
+title's VA or `heap_base` (`runtime/src/imported_view_address.h`, `CreateShaderResourceView` and
+`CreateUnorderedAccessView` in `runtime/shims/d3d12_vulkan_device.cpp`):
+
+- **The contract read from the translator.** `tools/rdna2spirv.py` `buffer_address` builds the V# base as
+  `word0 | (word1 & 0xFFFF) << 32`, zero-extended to 64 bits, adds the 32-bit view offset (`OpUConvert`), and
+  `host_addr` adds `%heap_base`: the access reads `heap_base + zext64(base48) + o` (mod 2^64), and a RAW view
+  (OOB_SELECT 3) accesses byte `o` only when `o + bytes <= NUM_RECORDS`. The `s_buffer_load` path reads the same field
+  with its low two bits cleared.
+- **The encoding.** For a slot-133 buffer at device address `B`, a RAW view at byte `offset` of it gets
+  `base48 = (B - heap_base) + offset`. Every access then reads `B + offset + o`, the view's own byte, on the imported
+  allocation the CPU also writes: no copy, mirror or second `heap_base`. Arena resources in the same table keep their
+  console VAs, and `GetGPUVirtualAddress` still returns the title VA, so the VA index and every copy, root argument and
+  vertex/index view that names the buffer by VA are unchanged.
+- **When it is accepted.** `heap_base < B` (no underflow; `B == heap_base` is the arena's own address),
+  `B + width` below 2^64, the view inside the buffer, `(B - heap_base) + offset + size <= 2^47` with the base itself
+  below 2^47, and `B - heap_base` congruent to the title VA mod 4 (so `s_buffer_load`'s dword truncation selects the
+  bytes the console's V# would). The bound is 2^47 rather than 2^48 so that every reachable byte has bit 47 clear: the
+  field then means the same under zero-extension (this translator) and sign-extension (GFX10's canonical 48-bit VA),
+  and an in-view offset a shader adds to the base in SGPRs never carries into word1's STRIDE bits.
+- **Refused, not truncated.** A well-formed RAW view that fails an address-representability condition is refused before the slot is written: the slot keeps
+  what it held (no null descriptor, no wild V#), the reason and addresses are printed once per reason and size
+  (`[rt] d3d12: ...: RAW view of a slot-133 buffer refused`), and the D3D12 trace records the call as `refused`.
+  An import owned by a different device is also refused before any descriptor write. Other malformed-view handling
+  follows the existing API validation; the untouched-slot guarantee is not a new promise for all invalid D3D12 calls.
+- **The UAV clear.** `ClearUnorderedAccessView*` reads the V# back to find the view's offset. For a RAW V# it now
+  subtracts the same base (`rt::d3d12::raw_buffer_view_base`), so a clear of an imported RAW view lands where the
+  shader's writes do.
+- **Placement-dependent.** A synthetic RTX 5080 / 621.14 run placed both imports above the arena and passed the
+  shader test below. Whether `B` lies above `heap_base` for other allocations remains the driver's choice. The
+  D3D-53 measurement above found upload buffers, created after the arena, *below* it on both test GPUs. If imports land
+  the same way, every imported RAW view on that device is refused, and the runtime-only remedy covers nothing there.
+  Covering `B < heap_base` with this descriptor-only scheme would need a translator contract change: sign-extend V#
+  bit 47 (`B - heap_base` in
+  [-2^47, 2^47) becomes representable; arena VAs, below 2^32, are unaffected). That changes the base of every buffer
+  access (`buffer_address`, the `s_buffer_load` path and every other reader of word1[15:0]), so it needs the whole
+  corpus (26,503 shaders), translated and `spirv-val`-valid counts before and after, and a census of V# word1 values
+  with bit 15 set that shaders build themselves. It is not done here.
+- **Not covered.** Structured and typed views and UAV counters on slot-133 buffers (their V#s still hold the title
+  VA), constant-buffer views (`CreateConstantBufferView` takes a VA, which for these buffers is the title's), V#s the
+  title builds itself (bytes it writes into a heap, or a base it computes in shader code; a `CopyDescriptors` of a
+  layer-written V# keeps its base and stays covered), and root descriptors and any other raw VA a shader reads.
+- **Shader writes reaching the CPU.** A shader writes these buffers by device address, which no replay command names,
+  so the copy-tracked `wrote_readback` flag never covered it. `VulkanQueue::execute` now ends a submission with a
+  device -> host dependency when the submission runs shaders (a `Dispatch`, a `Draw` including `DispatchMesh`, or an
+  `ExecuteIndirect`) while any registered buffer is both CPU-read-back and CPU-written: a `host_readable` binding with a
+  CPU-written mapping, that is a slot-133 import or a CUSTOM write-back heap (`VulkanContext::host_shared_buffer`). The
+  source is every shader stage the queue supports with `MEMORY_WRITE`, the destination `HOST` / `HOST_READ`
+  (`VulkanQueue::host_read_barrier`), as in the Khronos Vulkan Guide's synchronization example "CPU read back of data
+  written by a compute shader"; the memory is `HOST_COHERENT`, so the CPU needs no invalidate after the fence. It is
+  conservative: the replay cannot enumerate which buffers a shader's V#s or raw VAs reach, so any such buffer
+  registered when the submission is recorded triggers it, whichever buffer the shaders write. Unchanged: a copy queue
+  never names a shader stage; a submission that runs no shader, or a device with no such buffer (READBACK heaps have no
+  CPU-written mapping and cannot hold a D3D12 UAV), records only the existing copy-tracked barrier, if any. Not
+  covered: acceleration-structure builds and copies (their stages are not shader stages here) and the layer's own
+  helper dispatches, which are not `Dispatch` commands; their host-visible results keep the existing tracking. A
+  per-queue counter (`rt::d3d12::shader_host_read_barriers`) records each such submission for tests.
+- **Tests.** `imported_view_address_test` (CPU) encodes accepted bases into a V#, decodes them and checks the
+  translator's formula reaches `B + offset` for the first and last dword; it refuses underflow, `B == heap_base`, the
+  2^47 bound (exact edge, one byte past, an empty view at 2^47, a base at 2^48 - 4), wrap, malformed and misaligned
+  views with the output untouched. `d3d12_import_raw_view_test` (GPU) imports two 64 KiB ranges of a title
+  `VirtualAlloc`, writes non-uniform words into the original pages after the import, and runs the translated
+  `test/shaders/cs_import_raw.asm` over one table of an imported RAW SRV, an arena RAW SRV, an imported RAW UAV
+  (read-modify-write) and an arena RAW UAV. Its first submission holds only that dispatch (and a copy into a DEFAULT
+  arena buffer): no UAV clear, no copy into READBACK. The test checks that the queue recorded the shader host-read
+  dependency, waits for the fence, and compares every word of the 128 KiB range on the title's pages (results,
+  guards, untouched words). Only then does a second submission clear a second imported RAW UAV and copy to READBACK,
+  without moving that counter, and the range and the copies are compared again. A scope guard waits for queued work
+  before anything it uses is released. When the driver places an import where no base is representable, it checks
+  that the slots were left as they were and exits 77. `host_read_barrier_test` (CPU mocks) checks the barrier decision
+  on every queue kind and a mocked `Dispatch` submission with and without such a buffer registered. All three
+  focused CTests passed (0.85 seconds total); the GPU case took 0.69 seconds on RTX 5080 / 621.14 with validation and
+  synchronization validation enabled, 66,112 exact word comparisons and zero errors through device destruction.
+  A second device's SRV/UAV calls were also refused without changing any of the 32 descriptor bytes. These are
+  synthetic results on representable allocations, not a retail frame or general address-space coverage.
 
 Why one arena rather than several? Because the shader gets exactly one `heap_base` for buffer, descriptor-table and
 code accesses. A draw can reference a descriptor table in one heap and a vertex buffer in another; both must
@@ -2349,7 +2426,8 @@ The trace will enumerate them.
     make the query pass. If any of the three entry points is missing, slot 133 is `E_NOTIMPL`.
   - **Memory.** Only `HOST_VISIBLE | HOST_COHERENT` types. The title keeps reading and writing the pages with no flush
     or invalidate. The resource is `host_readable`, so a GPU write is followed by a host-read barrier before a fence
-    the CPU waits on. `GetGPUVirtualAddress` and `Map` return the title's VA; the reported heap is `CUSTOM` /
+    the CPU waits on: a tracked copy or clear as before, and (Palmwave) any submission that runs shaders while the
+    import is registered (section 3.3, "Shader writes reaching the CPU"). `GetGPUVirtualAddress` and `Map` return the title's VA; the reported heap is `CUSTOM` /
     `WRITE_BACK` / `L0`.
   - **Range.** `va` rounded out to `minImportedHostPointerAlignment` (4096 on the target RTX 5080 with driver 621.14,
     per the maintainer's capability query). The whole range must be committed `PAGE_READWRITE`, with no guard page;
@@ -2389,9 +2467,10 @@ The trace will enumerate them.
     Allocation failures in the import or pin registries are `E_OUTOFMEMORY`, with no memory or pin left behind and
     no exception crossing the COM boundary.
   - **Not covered.** Textures on the title's pages. Dedicated-only or dedicated-required imports. Memory no title
-    shim owns. Pages changed behind the shims by raw host or NT calls. The retail third word (above). Raw shader
-    V#s that name these VAs: the shader adds `heap_base`, so the gap in section 3.3 stays open whether or not the
-    import succeeds.
+    shim owns. Pages changed behind the shims by raw host or NT calls. The retail third word (above). Shader V#s
+    that name these VAs: the shader adds `heap_base`, so the gap in section 3.3 stays open whether or not the
+    import succeeds, except for the RAW SRV/UAV views the layer writes, which Palmwave encodes relative to
+    `heap_base` where representable and refuses otherwise (section 3.3, "partly addressed for RAW views").
   - **Tests.** `d3d12_host_placed_test` allocates its positive cases through the served shims: a title
     `VirtualAlloc` range, xmem physical pages and an `XMemAlloc` block. It covers:
     - CPU writes before and after creation reaching a GPU copy, and GPU writes reaching the CPU;
@@ -2441,8 +2520,9 @@ The trace will enumerate them.
       reproducer by Zunraz (`d7d2d4076bfa2411476305d0ca8ca3fc19c6a77a`, GPL-3.0) reports correct CPU results but
       corrupt GPU readback from write-combined imports on RTX 5090/4090 with no validation errors, and correct results
       with read-write pages. That is upstream evidence, not a Palmwave measurement.
-    - Still open with the experiment on: shader V#s that add `heap_base` to these VAs (section 3.3), shader UAV writes
-      into the buffer, and any menu, frame or retail result.
+    - Still open with the experiment on: shader V#s that add `heap_base` to these VAs (section 3.3; RAW views the
+      layer writes are encoded where representable, the rest are not), shader UAV writes into the buffer outside that
+      synthetic test, and any menu, frame or retail result.
     - Tests: `xs_proxy_mock_host_import_{unset,zero,other,experimental}`, `xmem_host_cache_experimental` and
       `d3d12_host_placed_experimental` (CTest sets the variable for each process; the tests never set it). The GPU case
       maps write-combine-window xmem pages, imports them through raw slot 133 with the exact tuple, and checks CPU
@@ -4333,3 +4413,16 @@ The public Xbox graphics index retrieved for this document lists interfaces up t
 `ID3D12GraphicsCommandList7`; the shipped DLL names `Device11` and `CommandList8`, which the index does not cover.
 This is why the layer targets the Windows SDK's newer public chain rather than assuming the Xbox public index is
 complete.
+
+#### Integrated runtime measurement
+
+The combined build passed 24 targeted CTests in 17.50 seconds on NVIDIA GeForce RTX 5080 / 621.14,
+with Vulkan synchronization validation enabled. The RAW shader test made 66,112 exact comparisons;
+both host-import modes, the slot-70 descriptor route and the arena compute regression passed.
+
+A subsequent offline executable probe showed the limitation in a real allocation: the imported buffer's
+device address was below the arena base. Slot 70 and the RAW UAV call therefore refused the views,
+leaving their destination descriptors unchanged. This replaces the earlier successful descriptor-creation
+claim with a checked refusal for this placement; it does not establish that the executable can read the import.
+The probe still reached the strict slot-127 texture flag refusal, with 2,238 D3D12 events and no Draw,
+ExecuteCommandLists or Present observed. Supporting a negative relative base remains necessary.

@@ -251,7 +251,7 @@ struct BufferAtVa {
 enum class BufferAtVaStatus {
     found,                // `out` is filled: [va, va + bytes) lies in [start, start + size)
     not_found,            // no live buffer of this device holds all of [va, va + bytes)
-    not_shader_readable,  // the buffer holding it denies shader-resource access (or is not a plain buffer)
+    not_shader_readable,  // the buffer denies access, is not plain, or its RAW view has no valid shader address
     failed,               // the resolver could not answer
 };
 // `real` is the device behind the proxy. On anything but `found`, out->resource must be null.
@@ -271,7 +271,7 @@ enum class SrvAtVaOutcome {
     invalid_destination, // not a CBV_SRV_UAV descriptor slot of a heap this device proxy created
     no_resolver,         // no buffer resolver installed on this proxy
     unknown_va,          // no live buffer of this device holds the whole range
-    not_shader_readable, // the buffer denies shader-resource access
+    not_shader_readable, // the buffer denies access or its RAW view has no valid shader address
     resolver_failed,     // the resolver failed or answered a range that does not hold the request
 };
 SrvAtVaOutcome last_srv_at_va_outcome();

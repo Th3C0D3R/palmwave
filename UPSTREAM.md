@@ -213,3 +213,29 @@ A local offline probe measured device slot 127 with the argument list of the pub
 - **What Palmwave changed.** The adapter forwards every word exactly as passed: no description copy, no masking or layout change, no opt-in, no fallback. The call goes to the interface pointer `QueryInterface` returns (which may differ from the base device), released once afterwards. Without `ID3D12Device10` the call returns `E_NOTIMPL`. Null heap, description or IID return `E_POINTER` without reaching the backend. The output is optional, so the S_FALSE capability check is kept; otherwise it is cleared first and stays null on failure. Every outcome is traced. A configured Xbox route moved onto 127 keeps priority, as on slot 70. The measured request's unknown flag bits reach the unchanged Vulkan backend. The subsequent offline probe confirmed `E_INVALIDARG` for resource flags, followed by the application's assertion: 2,238 D3D12 trace events, including 2 failed outcomes for the backend and adapter. No draw, submission or present was observed.
 - **Tests.** `xs_proxy_mock_test` (`check_committed_resource3`, also in the default run; `--slot127` with the trace on; `--env-slots-127` for the route priority, both registered in CMake). OpenAI Codex reviewed the candidate, merged the published slot-25 regression, built with MSVC 19.51 using four parallel jobs, and ran all 15 `xs_proxy_mock` CTests: 15/15 passed in 0.38 seconds. No GPU was used by these mock tests. The separate offline probe used an RTX 5080 (driver 621.14).
 - **Credits.** Coded with Claude Code (Claude Opus 5.5), reviewed and validated with OpenAI Codex, as a Moon AI project contribution. This is a component change, not a frame.
+
+## Imported RAW buffer views and the shader host-read dependency
+
+Original Palmwave code; no third-party code was copied. Written with Claude Code (Claude Opus 5.5) as a Moon AI
+project contribution, without shell, build, GPU or game access. OpenAI Codex reviewed the code, added the foreign-device guards and tests, hardened cleanup and count maintenance, and built and ran the tests.
+
+- **RAW V# bases** (`runtime/src/imported_view_address.h`, the RAW SRV/UAV hunks of `d3d12_vulkan_device.cpp`, the
+  UAV-clear decode in `d3d12_com.cpp`): a slot-133 buffer's RAW views name its device address minus `heap_base` where
+  representable and are refused otherwise (docs/d3d12_vulkan.md 3.3). Codex reported for this first candidate: core
+  build 36/36; `imported_view_address` passed in 0.04 seconds; `d3d12_import_raw_view` passed in 0.62 seconds on NVIDIA
+  GeForce RTX 5080, driver 621.14, with Vulkan validation and synchronization validation and zero errors, 33,344 words
+  exact. That run's `heap_base` was `0x70e0000` and both imports (`0x171f0000`, `0x174a0000`) were representable. That is
+  one synthetic placement, not general placement support.
+- **Shader host-read dependency** (`runtime/src/vulkan_backend.h`: `VulkanQueue::host_read_barrier`, the count of
+  CPU-read-back buffers in `VulkanContext`, a diagnostic counter; `runtime/test/host_read_barrier_test.cpp`; the
+  two-submission GPU test). It follows the Khronos Vulkan Guide's synchronization example "CPU read back of data
+  written by a compute shader" (shader write -> HOST / HOST_READ, then the fence; coherent memory needs no invalidate).
+  Final validation: all three focused CTests (`imported_view_address`, `host_read_barrier`, and
+  `d3d12_import_raw_view`) passed in 0.85 seconds. The GPU case passed in 0.69 seconds on NVIDIA GeForce RTX 5080,
+  driver 621.14, with Vulkan and synchronization validation enabled and zero errors through device destruction.
+  It made 66,112 exact word comparisons: the original 128 KiB pages immediately after the shader-only submission,
+  those pages again after a separate clear/copy submission, and the READBACK results. The first submission increased
+  the actual shader host-read barrier counter by one; the second left it unchanged. Foreign-device SRV/UAV calls
+  left all 32 destination bytes intact. The shader was translated and passed spirv-val without translator changes
+  or a corpus run. A fresh 19-step build with verified header dependencies replaced an invalid incremental build
+  whose localized MSVC include prefix had left an obsolete object; no runtime workaround was introduced.

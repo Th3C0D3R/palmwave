@@ -18,6 +18,7 @@
 #include "host_pins.h"
 #include "../src/arena_size.h"
 #include "../src/gfx10_descriptors.h"
+#include "../src/imported_view_address.h"
 #include "../src/depth24_fragment.h"
 #include "../src/uav_clear.h"
 #include "../src/vulkan_bindless.h"
@@ -1942,6 +1943,11 @@ public:
     std::uint64_t image_address() const { return image_address_; }  // what a T# names the texture by
     VkMemoryPropertyFlags memory_flags() const { return memory_flags_; }  // of the memory type behind it
     const DeviceState& device_state() const { return device_; }
+    // Palmwave: a slot-133 buffer (create_host_buffer) and its Vulkan device address (0 without one). Its RAW views
+    // name their bytes by that address minus heap_base (Device::imported_raw_base), not by its GPU VA, which stays
+    // the title's host address for the CPU-side VA index.
+    bool host_import() const { return host_import_; }
+    std::uint64_t buffer_device_address() const { return buffer_va_; }
 
     // Default-heap buffers are ranges of the GPU address arena: console VA = offset, zeroed through the arena's host
     // mapping. Upload and readback buffers keep their own host memory; with buffer device addresses their console
@@ -2176,8 +2182,10 @@ public:
     // strict: coherent host memory only, the range validated while pinned, shared imports, no fallback.
     //
     // Its console VA is `address`, the VA the title chose, so copies, vertex/index views and root arguments the title
-    // names by that VA find this buffer (VulkanContext::buffer_at). A shader that adds heap_base to a VA it read from a
-    // V# does not reach it: that needs the single address space of docs/d3d12_vulkan.md section 3.3, not decided here.
+    // names by that VA find this buffer (VulkanContext::buffer_at). A shader that adds heap_base to that VA does not
+    // reach it. Palmwave: RAW SRV/UAV V#s the layer writes for it use its device address minus heap_base instead, when
+    // that is representable (Device::imported_raw_base, src/imported_view_address.h); other views, descriptors the
+    // title writes and raw VAs a shader reads still name the title VA (docs/d3d12_vulkan.md section 3.3).
     // The pages stay the caller's: nothing is zeroed.
     HRESULT create_host_buffer(void* address) {
         auto& vk = device_.context->vk;
@@ -5622,6 +5630,17 @@ public:
             found->GetGPUVirtualAddress() != start || desc.Width < size)
             return refuse(Status::not_shader_readable);
         if (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) return refuse(Status::not_shader_readable);
+        if (found->host_import()) {
+            std::uint64_t view_base = 0;
+            const auto result = palmwave::imported_view_address(
+                state_.arena.buffer ? state_.arena.address : 0, found->buffer_device_address(),
+                found->GetGPUVirtualAddress(), desc.Width, va - start, bytes, view_base);
+            if (result != palmwave::ImportedViewAddress::ok) {
+                std::fprintf(stderr, "[rt] d3d12: slot 70 imported RAW view refused: %s\n",
+                             palmwave::imported_view_refusal(result));
+                return refuse(Status::not_shader_readable);
+            }
+        }
         out.resource = found;
         out.start = start;
         out.size = size;
@@ -6502,6 +6521,63 @@ public:
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
     }
 
+    // The bytes [offset, offset + size) of a RAW buffer SRV this layer accepts: R32_TYPELESS, no stride, the RAW flag
+    // alone, at least one element, inside the resource, a byte count that fits NUM_RECORDS. False otherwise.
+    static bool raw_srv_bytes(const D3D12_SHADER_RESOURCE_VIEW_DESC& desc, UINT64 width, UINT64& offset, UINT64& size) {
+        if (desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER || desc.Format != DXGI_FORMAT_R32_TYPELESS ||
+            desc.Buffer.StructureByteStride != 0 || desc.Buffer.Flags != D3D12_BUFFER_SRV_FLAG_RAW ||
+            !desc.Buffer.NumElements || desc.Buffer.FirstElement > width / 4)
+            return false;
+        offset = desc.Buffer.FirstElement * 4;
+        size = UINT64(desc.Buffer.NumElements) * 4;
+        return size <= width - offset && size <= UINT32_MAX;
+    }
+
+    // The same for a RAW buffer UAV (write_buffer_uav's checks for one): R32_TYPELESS with the RAW flag, inside the
+    // resource, a byte count that fits NUM_RECORDS, and no counter (a counter belongs to a structured view).
+    static bool raw_uav_bytes(const D3D12_UNORDERED_ACCESS_VIEW_DESC& desc, bool counter, UINT64 width, UINT64& offset,
+                              UINT64& size) {
+        const D3D12_BUFFER_UAV& view = desc.Buffer;
+        if (desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER || desc.Format != DXGI_FORMAT_R32_TYPELESS ||
+            !(view.Flags & D3D12_BUFFER_UAV_FLAG_RAW) || counter || view.CounterOffsetInBytes ||
+            view.FirstElement > width / 4 || UINT64(view.FirstElement) + view.NumElements > width / 4 ||
+            UINT64(view.NumElements) * 4 > ~0u)
+            return false;
+        offset = view.FirstElement * 4;
+        size = UINT64(view.NumElements) * 4;
+        return true;
+    }
+
+    // Palmwave: the V# base of the RAW view [offset, offset + size) of a slot-133 buffer: its device address minus
+    // heap_base, the arena's device address every translated shader adds (src/imported_view_address.h has the
+    // argument and the conditions). The title VA stays the resource's GPU VA; only the V# changes. False when no V#
+    // can name those bytes under that contract: the call is reported (once per reason and view size) and traced
+    // "refused", and the caller leaves the descriptor slot as it was, so no null or wild view is written in its place.
+    bool imported_raw_base(const Resource& r, UINT64 offset, UINT64 size, const char* method, std::uint64_t& out) {
+        const std::uint64_t heap_base = state_.arena.buffer ? state_.arena.address : 0;
+        const palmwave::ImportedViewAddress result = palmwave::imported_view_address(
+            heap_base, r.buffer_device_address(), const_cast<Resource&>(r).GetGPUVirtualAddress(), r.desc().Width,
+            offset, size, out);
+        if (result == palmwave::ImportedViewAddress::ok) return true;
+        static std::mutex mutex;
+        static std::set<std::pair<int, std::uint64_t>> seen;
+        bool first = false;
+        {
+            std::lock_guard lock(mutex);
+            first = seen.insert({int(result), size}).second;
+        }
+        if (first)
+            std::fprintf(stderr,
+                         "[rt] d3d12: %s: RAW view of a slot-133 buffer refused, the slot is left as it was: %s "
+                         "(device address 0x%llx, heap_base 0x%llx, view +0x%llx, 0x%llx bytes)\n",
+                         method, palmwave::imported_view_refusal(result),
+                         static_cast<unsigned long long>(r.buffer_device_address()),
+                         static_cast<unsigned long long>(heap_base), static_cast<unsigned long long>(offset),
+                         static_cast<unsigned long long>(size));
+        d3d12_trace::record(method, "refused");
+        return false;
+    }
+
     // A shader-resource view of a texture is a T# in the slot (docs section 3.4): the shader loads those eight
     // dwords through its descriptor table and finds the image by them. A buffer SRV writes a 16-byte GFX10 V# in the
     // first half of the slot (raw, structured, or typed). A slot left as zeros is a null descriptor.
@@ -6511,6 +6587,22 @@ public:
         d3d12_trace::record("ID3D12Device::CreateShaderResourceView");
         using palmwave::gfx10::ImageType;
         if (!destination.ptr) return;
+        // Palmwave: a RAW view of a slot-133 buffer gets its V# base before the slot is written, so a view no V# can
+        // name is refused with the slot as it was (imported_raw_base). Any view this check does not accept goes on
+        // below and is handled (or nulled) as before.
+        std::uint64_t imported_raw = 0;
+        if (const Resource* imported = Resource::from<Resource>(resource); imported && imported->host_import()) {
+            if (&imported->device_state() != &state_) {
+                log_once("shader-resource view of a host import from another device refused", 0);
+                d3d12_trace::record("ID3D12Device::CreateShaderResourceView", "refused");
+                return;
+            }
+            UINT64 offset = 0, size = 0;
+            if (desc && !(imported->desc().Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) &&
+                raw_srv_bytes(*desc, imported->desc().Width, offset, size) &&
+                !imported_raw_base(*imported, offset, size, "ID3D12Device::CreateShaderResourceView", imported_raw))
+                return;
+        }
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
         const Resource* r = Resource::from<Resource>(resource);
         if (!r) {
@@ -6535,12 +6627,11 @@ public:
             if (!base_va || !desc->Buffer.NumElements || (desc->Buffer.Flags & ~D3D12_BUFFER_SRV_FLAG_RAW)) return;
             palmwave::gfx10::Buffer buffer{};
             if (desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) {
-                if (desc->Format != DXGI_FORMAT_R32_TYPELESS || desc->Buffer.StructureByteStride != 0) return;
-                if (desc->Buffer.FirstElement > width / 4) return;
-                const UINT64 byte_off = desc->Buffer.FirstElement * 4;
-                const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * 4;
-                if (byte_size > width - byte_off || byte_size > UINT32_MAX) return;
-                buffer.address = base_va + byte_off;
+                UINT64 byte_off = 0, byte_size = 0;
+                if (!raw_srv_bytes(*desc, width, byte_off, byte_size)) return;
+                // Palmwave: a slot-133 buffer's RAW view uses the base found above, never its title VA.
+                if (r->host_import() && !imported_raw) return;
+                buffer.address = r->host_import() ? imported_raw : base_va + byte_off;
                 buffer.stride = 0;
                 buffer.num_records = std::uint32_t(byte_size);
                 buffer.format = palmwave::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
@@ -6678,8 +6769,10 @@ public:
     // index is checked against NUM_RECORDS, docs/buffer_bounds.md). A slot left as zeros is a null descriptor.
     // A UAV counter (docs section 3.4, "UAV counters") is a second, raw V# of 4 bytes in the slot's upper 16 bytes: the
     // counter resource's address plus CounterOffsetInBytes. Append and consume are atomics a shader does on it.
+    // Palmwave: `imported_raw` is the V# base CreateUnorderedAccessView found for a RAW view of a slot-133 buffer
+    // (imported_raw_base), 0 for any other view.
     void write_buffer_uav(ID3D12Resource* resource, ID3D12Resource* counter, const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc,
-                          D3D12_CPU_DESCRIPTOR_HANDLE destination) {
+                          D3D12_CPU_DESCRIPTOR_HANDLE destination, std::uint64_t imported_raw) {
         namespace g = palmwave::gfx10;
         const D3D12_RESOURCE_DESC& rd = Resource::from<Resource>(resource)->desc();
         if (!(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
@@ -6739,7 +6832,10 @@ public:
         const UINT64 counter_va = counter ? counter->GetGPUVirtualAddress() : 0;
         if (!va || (counter && !counter_va)) return;
         g::Buffer buffer{};
-        buffer.address = va + view.FirstElement * unit;
+        // Palmwave: a slot-133 buffer's RAW view uses the base found before the slot was written, never its title VA.
+        const bool imported_raw_view = raw && Resource::from<Resource>(resource)->host_import();
+        if (imported_raw_view && !imported_raw) return;
+        buffer.address = imported_raw_view ? imported_raw : va + view.FirstElement * unit;
         buffer.stride = structured || typed ? std::uint32_t(unit) : 0;
         buffer.num_records = std::uint32_t(structured || typed ? view.NumElements : UINT64(view.NumElements) * 4);
         buffer.format = format_code;
@@ -6765,13 +6861,28 @@ public:
                                                      D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
         d3d12_trace::record("ID3D12Device::CreateUnorderedAccessView");
         if (!destination.ptr) return;
+        // Palmwave: as in CreateShaderResourceView, a RAW view of a slot-133 buffer gets its V# base before the slot
+        // is written, and one no V# can name is refused with the slot as it was (imported_raw_base).
+        std::uint64_t imported_raw = 0;
+        if (const Resource* imported = Resource::from<Resource>(resource); imported && imported->host_import()) {
+            if (&imported->device_state() != &state_) {
+                log_once("unordered-access view of a host import from another device refused", 0);
+                d3d12_trace::record("ID3D12Device::CreateUnorderedAccessView", "refused");
+                return;
+            }
+            UINT64 offset = 0, size = 0;
+            if (desc && (imported->desc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
+                raw_uav_bytes(*desc, counter != nullptr, imported->desc().Width, offset, size) &&
+                !imported_raw_base(*imported, offset, size, "ID3D12Device::CreateUnorderedAccessView", imported_raw))
+                return;
+        }
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
         const Resource* r = Resource::from<Resource>(resource);
         if (!r) {
             if (resource) stub("ID3D12Device::CreateUnorderedAccessView(resource from another device)");
             return;
         }
-        if (!r->image()) return write_buffer_uav(resource, counter, desc, destination);
+        if (!r->image()) return write_buffer_uav(resource, counter, desc, destination, imported_raw);
         if (counter) {
             log_once("unordered-access view of a texture with a counter resource; dimension", int(r->desc().Dimension));
             return;
@@ -8968,6 +9079,32 @@ std::uint64_t device_arena_size(ID3D12Device* device) {
     if (!real) real = device;
     const Device* d = Device::from<Device>(real);
     return d ? d->state().arena.size : 0;
+}
+
+// Palmwave.
+std::uint64_t device_heap_base(ID3D12Device* device) {
+    if (!device) return 0;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (!real) real = device;
+    const Device* d = Device::from<Device>(real);
+    return d && d->state().arena.buffer ? d->state().arena.address : 0;
+}
+
+// Palmwave: the inverse of the RAW view bases CreateShaderResourceView / CreateUnorderedAccessView write, for a caller
+// that reads a RAW V# back (the UAV clear): a slot-133 buffer's first byte is its device address minus heap_base when
+// that is representable (src/imported_view_address.h with an empty view at offset 0); any other resource's is its GPU
+// VA, as before.
+bool raw_buffer_view_base(ID3D12Resource* resource, std::uint64_t& base) {
+    if (!resource) return false;
+    Resource* r = Resource::from<Resource>(resource);
+    if (!r || !r->host_import()) {
+        base = resource->GetGPUVirtualAddress();
+        return true;
+    }
+    const DeviceState& device = r->device_state();
+    return palmwave::imported_view_address(device.arena.buffer ? device.arena.address : 0, r->buffer_device_address(),
+                                          r->GetGPUVirtualAddress(), r->desc().Width, 0, 0, base) ==
+           palmwave::ImportedViewAddress::ok;
 }
 
 namespace {

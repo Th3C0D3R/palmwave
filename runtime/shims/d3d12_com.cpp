@@ -1062,7 +1062,10 @@ private:
         std::memcpy(buffer_words.data(), words.data(), sizeof(buffer_words));
         g::Buffer buffer{};
         if (!g::decode(buffer_words, buffer)) return false;
-        const UINT64 base = resource->GetGPUVirtualAddress();
+        // Palmwave: a RAW V# of a slot-133 buffer names its bytes relative to heap_base, not by the resource's GPU VA
+        // (raw_buffer_view_base); every other view, and every other resource, by the GPU VA as before.
+        std::uint64_t base = resource->GetGPUVirtualAddress();
+        if (!buffer.format && !buffer.stride && !raw_buffer_view_base(resource, base)) return false;
         if (buffer.address < base) return false;
         out.buffer = true;
         out.offset = buffer.address - base;
@@ -1505,6 +1508,9 @@ public:
     }
 
     bool ok() const { return queue_.ok(); }
+    // Palmwave: VulkanQueue::shader_host_read_barriers, for tests.
+    std::uint64_t shader_host_read_barriers() const { return queue_.shader_host_read_barriers(); }
+
     palmwave::ReplayResult last_result() {
         // A batch the queue held fails when it is released, after the call returned: the failure is the result.
         if (const auto held = queue_.take_held_failure(); held != palmwave::ReplayResult::success) last_result_ = held;
@@ -1970,6 +1976,13 @@ palmwave::ReplayResult last_execute_result(ID3D12CommandQueue* queue) {
     if (ID3D12CommandQueue* real = d3d12_xs::queue_proxy_real_queue(queue)) queue = real;  // the Xbox-ABI proxy
     CommandQueue* q = CommandQueue::from(queue);
     return q ? q->last_result() : palmwave::ReplayResult::unsupported;
+}
+
+// Palmwave.
+std::uint64_t shader_host_read_barriers(ID3D12CommandQueue* queue) {
+    if (ID3D12CommandQueue* real = d3d12_xs::queue_proxy_real_queue(queue)) queue = real;  // the Xbox-ABI proxy
+    const CommandQueue* q = CommandQueue::from(queue);
+    return q ? q->shader_host_read_barriers() : 0;
 }
 
 bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT& back) {

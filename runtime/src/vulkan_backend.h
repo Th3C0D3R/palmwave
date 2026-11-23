@@ -1167,6 +1167,7 @@ public:
             if (it == resources_.end()) return;
             img = it->second.image;
             unindex_buffer(id, it->second);
+            if (host_shared_buffer(it->second)) --host_shared_buffers_;
             resources_.erase(it);
             if (auto sparse = sparse_resources_.find(id); sparse != sparse_resources_.end()) {
                 sparse_resource = std::move(sparse->second);
@@ -1255,6 +1256,12 @@ public:
     std::uint64_t heap_base() {
         std::shared_lock lock(resource_mutex_);
         return replay_.heap_base;
+    }
+    // Palmwave: how many registered buffers the CPU writes and reads back while shaders may write them
+    // (host_shared_buffer). For tests.
+    std::size_t host_shared_buffer_count() {
+        std::shared_lock lock(resource_mutex_);
+        return host_shared_buffers_;
     }
 
     // Pipelines are registered by an opaque id (the PSO object) for as long as the PSO lives.
@@ -1546,13 +1553,21 @@ private:
     void unindex_buffer(ResourceId id, const ResourceBinding& b) {
         if (addressable(b)) buffer_vas_.erase(b.va, id);
     }
+    // Palmwave: a buffer the CPU writes and reads back while the GPU may write it: a host_readable binding with a
+    // CPU-written mapping (a CUSTOM write-back heap, or a slot-133 import of the title's pages). A shader can reach one
+    // by device address through any V# or raw VA, so no command names it; VulkanQueue::execute ends every submission
+    // that runs shaders with a shader-write -> host-read dependency while one is registered. READBACK heaps have no
+    // CPU-written mapping (`host` is null), cannot hold a D3D12 UAV, and keep their copy-tracked barrier only.
+    static bool host_shared_buffer(const ResourceBinding& b) { return !b.image && b.buffer && b.host_readable && b.host; }
     // resources_[id] = binding, with the VA index kept in step (a re-registered ID drops its old range first).
     void set_resource_locked(ResourceId id, const ResourceBinding& binding) {
         auto [it, inserted] = resources_.try_emplace(id, binding);
         if (!inserted) {
             unindex_buffer(id, it->second);
+            if (host_shared_buffer(it->second)) --host_shared_buffers_;
             it->second = binding;
         }
+        if (host_shared_buffer(binding)) ++host_shared_buffers_;
         if (addressable(binding)) buffer_vas_.insert(binding.va, binding.size, id);
     }
 
@@ -1661,6 +1676,7 @@ private:
     std::unique_ptr<FenceWaitDispatcher> fence_dispatcher_;
     QueueHolds<VkSemaphore> holds_;
     std::unordered_map<ResourceId, ResourceBinding> resources_;
+    std::size_t host_shared_buffers_ = 0;   // Palmwave: host_shared_buffer bindings in resources_ (resource_mutex_)
     BufferVaIndex<ResourceId> buffer_vas_;  // the addressable buffers of resources_, by VA range (buffer_at)
     std::unordered_map<ResourceId, std::shared_ptr<SparseResource>> sparse_resources_;
     std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
@@ -1816,6 +1832,40 @@ public:
                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT;
         }
     }
+
+    // The device -> host dependency that ends a submission, so the CPU reads the GPU's writes once the fence after it
+    // has signalled (the Vulkan synchronization examples' "CPU read back of data written by a compute shader":
+    // shader write -> HOST / HOST_READ, then the fence; coherent memory needs no invalidate). `stages` 0: none.
+    //   - wrote_readback: a command the replay tracks wrote a host_readable buffer, from `readback_stages`;
+    //   - shader_host_writes (Palmwave): the submission runs shaders while a host_shared_buffer is registered. A shader
+    //     can write one through any V# or raw VA, which the replay cannot enumerate, so every shader stage this queue
+    //     supports is a source, with MEMORY_WRITE (which covers storage and physical-storage-buffer writes).
+    // Sources are kept within queue_supported_stages, so a copy queue never names a shader stage. Without either
+    // reason no barrier is recorded, as before.
+    struct HostReadBarrier {
+        VkPipelineStageFlags2 stages = 0;
+        VkAccessFlags2 access = 0;
+    };
+    static constexpr HostReadBarrier host_read_barrier(QueueKind kind, bool wrote_readback,
+                                                       VkPipelineStageFlags2 readback_stages,
+                                                       bool shader_host_writes) noexcept {
+        const VkPipelineStageFlags2 allowed = queue_supported_stages(kind);
+        VkPipelineStageFlags2 stages = 0;
+        if (wrote_readback) {
+            stages = readback_stages & allowed;
+            if (!stages) stages = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        }
+        if (shader_host_writes)
+            stages |= (VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT) & allowed;
+        if (!stages) return {};
+        const bool copy_only = (stages & ~(VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT)) == 0;
+        return {stages, copy_only ? VK_ACCESS_2_TRANSFER_WRITE_BIT : VK_ACCESS_2_MEMORY_WRITE_BIT};
+    }
+
+    // Palmwave: submissions this queue ended with a host-read dependency because they ran shaders while a
+    // host_shared_buffer was registered (counted when the command buffer reached vkQueueSubmit). For tests: a driver
+    // whose memory happens to be coherent without it cannot hide a missing dependency.
+    std::uint64_t shader_host_read_barriers() const { return shader_host_read_barriers_.load(); }
 
     VulkanQueue(VulkanContext& context, VkQueue queue, std::uint32_t family, QueueKind kind = QueueKind::direct)
         : context_(context), queue_(queue), kind_(kind), family_(family) {
@@ -2504,15 +2554,17 @@ private:
             readback_stages |= list.readback_src_stages;
         }
         close_labels(command_buffer, replay, open_labels);
-        // Only flush GPU writes to the host domain when this batch actually wrote to a readback buffer.
-        if (wrote_readback) {
-            const VkPipelineStageFlags2 allowed = queue_supported_stages(kind_);
-            VkPipelineStageFlags2 src_stages = readback_stages & allowed;
-            if (!src_stages) src_stages = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-            const bool copy_only =
-                (src_stages & ~(VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT)) == 0;
-            const VkAccessFlags2 src_access =
-                copy_only ? VK_ACCESS_2_TRANSFER_WRITE_BIT : VK_ACCESS_2_MEMORY_WRITE_BIT;
+        // Only flush GPU writes to the host domain when this batch wrote a readback buffer through a tracked command,
+        // or (Palmwave) ran shaders while a buffer the CPU reads back is registered: a shader reaches those by device
+        // address, which no command names (host_read_barrier). resource_mutex_ is still held, so the count is the set
+        // of buffers registered when this submission was recorded.
+        const bool shader_host_writes =
+            runs_shaders && kind_ != QueueKind::copy && context_.host_shared_buffers_ != 0;
+        const HostReadBarrier host_read = host_read_barrier(kind_, wrote_readback, readback_stages, shader_host_writes);
+        if (host_read.stages) {
+            const VkPipelineStageFlags2 src_stages = host_read.stages;
+            const bool copy_only = host_read.access == VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            const VkAccessFlags2 src_access = host_read.access;
 
             if (context_.vk.vkCmdPipelineBarrier2) {
                 VkMemoryBarrier2 host{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
@@ -2567,6 +2619,7 @@ private:
             wait_values_.pop_back();
         }
         if (submitted) {
+            if (shader_host_writes) shader_host_read_barriers_.fetch_add(1);
             context_.tracker_ = std::move(next_tracker);
             slot->predicate = std::move(batch);
             slot->predicated_copy = std::move(copy_batch);
@@ -3155,6 +3208,7 @@ private:
     };
     std::deque<TicketedPin> pin_queue_;  // released once progress_ reaches the ticket
     std::atomic<int> held_failure_{0};                 // a ReplayResult: the first held batch that failed
+    std::atomic<std::uint64_t> shader_host_read_barriers_{0};  // Palmwave: shader_host_read_barriers()
 };
 
 } // namespace palmwave

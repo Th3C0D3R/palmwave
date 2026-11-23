@@ -248,7 +248,10 @@ VkAccelerationStructureKHR vulkan_acceleration_structure(ID3D12Device* device, D
 // write-combined or uncached range, a range overlapping another import or the arena's console VAs, a placement the
 // driver cannot bind, a dedicated-only or dedicated-required import, no coherent host memory type), E_INVALIDARG (a
 // malformed buffer description, a null address, overflowing width, pages that are not committed read-write) or
-// E_OUTOFMEMORY. Raw shader V# addressing of these buffers (heap_base + VA) is not provided: docs/d3d12_vulkan.md 3.3.
+// E_OUTOFMEMORY. A shader V# holding the title VA (heap_base + VA) does not reach these buffers. Palmwave: the RAW
+// SRV/UAV V#s this layer writes for them hold their device address minus heap_base instead, and are refused (the slot
+// left as it was) when that is not representable; structured and typed views, descriptors the title writes and raw
+// VAs a shader reads are not covered (docs/d3d12_vulkan.md 3.3).
 HRESULT create_buffer_at_host_address(ID3D12Device* device, void* address, const D3D12_RESOURCE_DESC& desc,
                                       std::uint32_t initial_state, REFIID riid, void** out);
 // Live slot-133 host imports on `device` (each shared by one or more resources). For tests.
@@ -288,6 +291,13 @@ bool device_sparse_buffer_tiles(ID3D12Device* device);
 
 // The size in bytes of the device's GPU address arena, or 0 without one. For tests.
 std::uint64_t device_arena_size(ID3D12Device* device);
+// Palmwave: the arena's device address, the heap_base every translated shader on `device` adds to a V#'s base, or 0
+// without an arena. For tests.
+std::uint64_t device_heap_base(ID3D12Device* device);
+// Palmwave: the address a RAW buffer V# written by this layer names `resource`'s first byte by: its GPU VA, or for a
+// slot-133 buffer its device address minus heap_base (src/imported_view_address.h). False for a slot-133 buffer no
+// such V# can name (its RAW views are refused) and for a null resource.
+bool raw_buffer_view_base(ID3D12Resource* resource, std::uint64_t& base);
 
 // The bindless set 0 a device with VulkanDeviceInfo::bindless keeps (vulkan_bindless.h), and its layout: what a
 // pipeline whose shader declares set-0 bindings is created with and binds. Null without such a set. The set is
@@ -426,6 +436,10 @@ inline constexpr UINT descriptor_size = 32;
 
 // ExecuteCommandLists returns void; this is what the last call on the queue did.
 palmwave::ReplayResult last_execute_result(ID3D12CommandQueue* queue);
+// Palmwave: submissions on `queue` that ran shaders while a buffer the CPU reads back (a CUSTOM write-back heap or a
+// slot-133 import) was registered, and so ended with a shader-write -> host-read dependency (VulkanQueue::
+// host_read_barrier). 0 for a queue this layer did not make. For tests.
+std::uint64_t shader_host_read_barriers(ID3D12CommandQueue* queue);
 
 // True when the current thread or process token has SeIncreaseBasePriorityPrivilege enabled (or the test override
 // forces it), which D3D12 requires for D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME.
