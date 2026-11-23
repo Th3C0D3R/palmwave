@@ -64,9 +64,11 @@
 // 131/132 with four exact argument tuples record a real global SYNC_ALL/ACCESS_COMMON barrier through
 // ID3D12GraphicsCommandList7, traced "experimental-hypothesis" (not a known contract; docs/BLOCKERS.md). Queue
 // ExecuteCommandLists unwraps list proxies; the list unwraps allocator (Reset), bundle and heap proxies itself. The
-// console list's QueryInterface answers only the measured console IID (when the real list implements the PC interface
-// it maps to) and the layout-identical base chain IUnknown/ID3D12Object/ID3D12DeviceChild/ID3D12CommandList; PC
-// ID3D12GraphicsCommandList..8 IIDs are refused, since the console table is shifted from theirs. Device slot 12 (the PC CreateCommandList) is forwarded unchanged and returns the PC-shaped real list, for callers
+// console list's QueryInterface answers the measured console IID (when the real list implements its PC capability)
+// and the layout-identical base chain IUnknown/ID3D12Object/ID3D12DeviceChild/ID3D12CommandList. Only proxies created
+// at slot 73 with the shared ID3D12GraphicsCommandList base GUID also answer that same GUID with their console table; PC
+// ID3D12GraphicsCommandList1..8 IIDs are refused, since the console table is shifted from theirs. Device slot 12
+// (the PC CreateCommandList) is forwarded unchanged and returns the PC-shaped real list, for callers
 // compiled against the PC headers (the synthetic GPU tests and fixtures).
 #pragma once
 

@@ -1119,7 +1119,7 @@ int check_lists() {
     EXPECT(release(device) == 0 && mock->refs == 0);
     EXPECT(chunk->refs == 0 && chunk->calls[9] == 1 && big_chunk->refs == 0 && big_chunk->calls[9] == 1);
 
-    // Creation failures: an IID the proxy does not model (including the PC graphics-list IIDs), and a refused
+    // Creation failures: an IID the proxy does not model (including PC graphics-list revision IIDs), and a refused
     // allocation for the proxy, all release the real list and leave the device's references as they were.
     Mock* mock2 = nullptr;
     void* device2 = make_device(mock2, 9, true, true, true);
@@ -1131,9 +1131,9 @@ int check_lists() {
     EXPECT(hr_of(raw(device2, 73, word(direct_desc), word(allocator2), 0, word(&kQueueIid), word(&out))) ==
            E_NOINTERFACE);
     EXPECT(!out && mock2->last_child->kind == Kind::list && mock2->last_child->refs == 0);
-    // A PC graphics-list IID through slot 73 is refused the same way although the real list implements it: the
-    // console-shaped proxy is never handed out as a PC list.
-    for (const IID& pc_iid : {__uuidof(ID3D12GraphicsCommandList), __uuidof(ID3D12GraphicsCommandList6)}) {
+    // PC revision IIDs through slot 73 are refused even when the real list implements them. The shared base GUID
+    // has its own bounded console-creation path, checked separately below.
+    for (const IID& pc_iid : {__uuidof(ID3D12GraphicsCommandList1), __uuidof(ID3D12GraphicsCommandList6)}) {
         out = reinterpret_cast<void*>(1);
         EXPECT(hr_of(raw(device2, 73, word(direct_desc), word(allocator2), 0, word(&pc_iid), word(&out))) ==
                E_NOINTERFACE);
@@ -1162,13 +1162,72 @@ int check_lists() {
     const std::uint64_t pc_submitted[1] = {word(pc_list)};
     raw(queue2, 10, 1, word(pc_submitted));
     EXPECT(queue2_mock->calls[10] == 1 && queue2_mock->array[10][0] == word(pc_list));
+    raw(pc_list, 28, 0, 0);  // PC SetDescriptorHeaps stays at its own slot.
+    EXPECT(reinterpret_cast<Mock*>(pc_list)->calls[28] == 1 && reinterpret_cast<Mock*>(pc_list)->calls[32] == 0);
     EXPECT(release(pc_list) == 0 && release(queue2) == 0);
     EXPECT(release(device2) == 0 && mock2->refs == 0);
     std::printf("%s: slot 73 lists are console-shaped (body, cursor pinned, console/base IIDs only, PC graphics-list "
-                "IIDs refused, GetDevice), forward by the console "
+                "QIs refused on console-IID creation, GetDevice), forward by the console "
                 "table with allocator/bundle/heap/queue unwrapping, fail Close and refuse submission after an "
                 "unsupported slot until Reset, carve upload memory from a mapped buffer whose GPU address the setters "
                 "receive; slot 12 stays PC-shaped\n", g_label);
+    return 0;
+}
+
+// The base graphics-list GUID is shared by Xbox and PC. Factory slot 73 fixes the ABI for this object; QI must
+// subsequently preserve that identity. A base-only backend proves this route does not require GCL6 capability.
+int check_shared_base_list() {
+    const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
+    const IID shared_iid = __uuidof(ID3D12GraphicsCommandList);
+    const std::uint32_t desc[4] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 0, 0, 0};
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true, true, false);
+    EXPECT(device);
+    const unsigned long device_refs = xs::device_proxy_ref_count(device);
+    void* allocator = nullptr;
+    EXPECT(hr_of(raw(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, word(&allocator_iid), word(&allocator))) == S_OK);
+    Mock* const real_allocator = mock->last_child;
+    void* list = reinterpret_cast<void*>(1);
+    EXPECT(hr_of(raw(device, 73, word(desc), word(allocator), 0, word(&shared_iid), word(&list))) == S_OK);
+    Mock* const real = mock->last_child;
+    EXPECT(xs::is_list_proxy(list) && real->kind == Kind::command_list && real->refs == 1);
+    EXPECT(xs::list_proxy_real_list(list) == reinterpret_cast<ID3D12GraphicsCommandList*>(real));
+    EXPECT(xs::list_proxy_slot_count(list) == 60 && xs::list_proxy_ref_count(list) == 1);
+    EXPECT(xs::device_proxy_ref_count(device) == device_refs + 2);
+
+    for (const IID& iid : {shared_iid, __uuidof(IUnknown), __uuidof(ID3D12Object),
+                           __uuidof(ID3D12DeviceChild), __uuidof(ID3D12CommandList)}) {
+        void* asked = nullptr;
+        EXPECT(hr_of(raw(list, 0, word(&iid), word(&asked))) == S_OK && asked == list);
+        EXPECT(xs::list_proxy_ref_count(list) == 2 && real->refs == 1);
+        EXPECT(release(asked) == 1);
+    }
+    GUID unknown_shared = shared_iid;
+    unknown_shared.Data4[7] ^= 1;  // comparing Data1 alone must not grant an unknown interface
+    const IID refused[] = {unknown_shared, kQueueIid, kConsoleListIid,
+                            __uuidof(ID3D12GraphicsCommandList1), __uuidof(ID3D12GraphicsCommandList2),
+                            __uuidof(ID3D12GraphicsCommandList3), __uuidof(ID3D12GraphicsCommandList4),
+                            __uuidof(ID3D12GraphicsCommandList5), __uuidof(ID3D12GraphicsCommandList6),
+                            __uuidof(ID3D12GraphicsCommandList7), __uuidof(ID3D12GraphicsCommandList8)};
+    for (const IID& iid : refused) {
+        void* asked = reinterpret_cast<void*>(1);
+        EXPECT(hr_of(raw(list, 0, word(&iid), word(&asked))) == E_NOINTERFACE && !asked);
+    }
+    EXPECT(xs::list_proxy_ref_count(list) == 1 && real->refs == 1);
+    void* unknown = reinterpret_cast<void*>(1);
+    EXPECT(hr_of(raw(device, 73, word(desc), word(allocator), 0, word(&unknown_shared), word(&unknown))) == E_NOINTERFACE);
+    EXPECT(!unknown && mock->last_child->refs == 0 && xs::device_proxy_ref_count(device) == device_refs + 2);
+
+    raw(list, 32, 0, 0);  // console SetDescriptorHeaps is PC slot 28 even for the shared creation GUID
+    EXPECT(real->calls[28] == 1 && real->calls[32] == 0 && real->args[28][0] == 0);
+    EXPECT(hr_of(raw(list, 9)) == S_OK && real->calls[9] == 1);
+    EXPECT(xs::list_proxy_unsupported_slot(list) == 0);
+    EXPECT(release(list) == 0 && real->refs == 0);
+    EXPECT(release(allocator) == 0 && real_allocator->refs == 0);
+    EXPECT(xs::device_proxy_ref_count(device) == device_refs);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: shared base GUID at Xbox factory 73 preserves console slots, QI identity and references with a "
+                "base-only backend; revision and unknown IIDs refused\n", g_label);
     return 0;
 }
 
@@ -1691,7 +1750,7 @@ int main(int argc, char** argv) {
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_xbox_queue_descriptions() ||
-        check_lists() || check_experimental_flush() ||
+        check_lists() || check_shared_base_list() || check_experimental_flush() ||
         check_custom_heap_properties())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);

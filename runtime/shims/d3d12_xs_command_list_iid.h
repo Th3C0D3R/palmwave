@@ -6,8 +6,9 @@
 //     line 230, commit f89e4106fe of omonkeyz/xbox-emulator, GPL-3.0);
 //   - PC ID3D12GraphicsCommandList6, c3827890-e548-4cfa-96cf-5689a9370f80 (Windows SDK 10.0.26100.0 d3d12.h).
 // Matching is on the whole GUID. An IID that is not in the table is returned unchanged and logged once; the list
-// proxy answers only the known console IID and layout-identical base interfaces. PC graphics-command-list IIDs
-// and unknown console IIDs end in E_NOINTERFACE, never in a guessed or shifted PC interface.
+// proxy answers the known console IID and layout-identical base interfaces. The shared base graphics-list GUID
+// is admitted separately only on proxies created with that GUID at Xbox slot 73; it is not globally remapped here.
+// PC graphics-list revision IIDs and unknown console IIDs end in E_NOINTERFACE.
 //
 // Adapted from upstream PR #2490 (NolanCotter/Palmwave commit 084c8bd097d30541f32ff3c7f0968b8baef5fc95, GPL-3.0);
 // see UPSTREAM.md.

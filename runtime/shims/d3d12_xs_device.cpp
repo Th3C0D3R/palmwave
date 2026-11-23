@@ -1347,6 +1347,8 @@ struct ListProxy {
     std::atomic<unsigned> unsupported_slot{0};
     // PALMWAVE_EXPERIMENTAL_XBOX_FLUSH was exactly "1" when this list was created (see list_experimental_flush).
     bool experimental_flush = false;
+    // The base GUID is shared with PC, but denotes the console table only when requested at Xbox factory slot 73.
+    bool shared_console_base_iid = false;
 
     // The cursor and both limits point at +0x580, inside the body but past every measured field (the pipeline record
     // ends at +0x554), so even a writer that ignored the limit would not reach the header table or the record.
@@ -1542,11 +1544,12 @@ HRESULT list_query_interface(ListProxy* self, const IID* riid, void** out) {
     if (!out) return E_POINTER;
     *out = nullptr;
     if (!riid) return E_POINTER;
-    // A known console IID selects its required PC capability, not a PC vtable. Only layout-identical base
-    // interfaces may also return this same console proxy.
+    // A known console IID selects its required PC capability, not a PC vtable. A shared base GUID is accepted
+    // only on objects created with that GUID by Xbox slot 73, including QI for their own creation interface.
     bool mapped = false;
     const IID& pc_iid = command_list_iid_for_pc(*riid, &mapped);
-    if (!mapped && !is_list_base_iid(pc_iid)) {
+    const bool shared_base = self->shared_console_base_iid && IsEqualIID(*riid, __uuidof(ID3D12GraphicsCommandList));
+    if (!mapped && !shared_base && !is_list_base_iid(pc_iid)) {
         if (supports_iid(self->real, pc_iid)) log_refused_iid("list", *riid);
         return E_NOINTERFACE;
     }
@@ -1716,7 +1719,7 @@ unsigned list_unsupported_slot(const void* object) {
 
 // Wraps `created` (one reference, owned by the proxy on success, released on failure) and returns `riid` from the
 // proxy through `out`.
-HRESULT wrap_list(IUnknown* created, DeviceProxy* device, const IID* riid, void** out) {
+HRESULT wrap_list(IUnknown* created, DeviceProxy* device, const IID* riid, void** out, bool shared_console_base_iid) {
     if (!created) return E_FAIL;
     ListProxy* proxy = new (std::nothrow) ListProxy();
     if (!proxy) {
@@ -1730,6 +1733,7 @@ HRESULT wrap_list(IUnknown* created, DeviceProxy* device, const IID* riid, void*
     proxy->pin_cursor_at_limit();
     proxy->refs.store(1, std::memory_order_relaxed);
     proxy->pc_slot_count = detect_list_slot_count(created);
+    proxy->shared_console_base_iid = shared_console_base_iid;
     proxy->experimental_flush = experimental_xbox_flush_requested();
     if (proxy->experimental_flush) {
         static std::atomic<bool> announced{false};
@@ -1860,17 +1864,19 @@ HRESULT proxy_wait_frame_event_x(DeviceProxy* self, std::uint64_t event, std::ui
 // not the PC six-argument form: the type is the first word of D3D12XBOX_COMMAND_LIST_DESC and there is no node mask
 // (the HLE passes 0). The second desc word is logged, not interpreted: its public layout is not established. The real
 // list is created as ID3D12GraphicsCommandList and handed back behind the console list proxy; only the measured
-// console IID and layout-identical base interfaces are answered by the proxy. Only the direct, bundle and
+// console IID, the shared base GUID when requested here, and layout-identical base interfaces are answered by the
+// proxy. The shared GUID requires only the backend's base graphics-list interface. Only the direct, bundle and
 // compute types get the graphics-shaped console table. Any other type word is refused with E_NOTIMPL instead of being
 // coerced to DIRECT, as the HLE does: a sibling layer reports a separate console DMA-list vtable (Close 9, Reset 10,
 // copies at 11-13; its type is derived as 6, docs/d3d12_command_objects.md §5.3), which is not modelled, and the
 // graphics table would send those copies to ClearState/Draw*.
 HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, std::uint64_t allocator_word,
                                     std::uint64_t initial_state_word, const IID* riid, void** out) {
+    constexpr auto method = "XboxID3D12Device::CreateCommandListX";
     if (out) *out = nullptr;
-    if (!desc_word || !allocator_word) return E_INVALIDARG;
-    if (!riid) return E_POINTER;
-    if (!out) return E_POINTER;
+    if (!desc_word || !allocator_word) return d3d12_trace::result(method, E_INVALIDARG);
+    if (!riid) return d3d12_trace::result(method, E_POINTER);
+    if (!out) return d3d12_trace::result(method, E_POINTER);
 
     std::uint32_t words[2] = {};
     std::memcpy(words, reinterpret_cast<const void*>(desc_word), sizeof(words));
@@ -1889,7 +1895,7 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
                          "[rt] d3d12_xs: slot 73 CreateCommandListX of type %u refused (E_NOTIMPL): only the "
                          "direct/bundle/compute console list is modelled (desc words 0x%08x 0x%08x)\n",
                          words[0], words[0], words[1]);
-        return E_NOTIMPL;
+        return d3d12_trace::result(method, E_NOTIMPL);
     }
 
     // Palmwave wraps its Vulkan allocators; a PC allocator comes back unwrapped and is passed as it is. Pipeline states
@@ -1900,8 +1906,9 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
     void* created = nullptr;
     const HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state,
                                                      __uuidof(ID3D12GraphicsCommandList), &created);
-    if (FAILED(hr)) return hr;
-    return wrap_list(static_cast<IUnknown*>(created), self, riid, out);
+    if (FAILED(hr)) return d3d12_trace::result(method, hr);
+    const bool shared_base = IsEqualIID(*riid, __uuidof(ID3D12GraphicsCommandList));
+    return d3d12_trace::result(method, wrap_list(static_cast<IUnknown*>(created), self, riid, out, shared_base));
 }
 
 // Device slot 75: ID3D12Device9::CreateCommandQueue1(desc, creator_id, riid, out), called by slot index.

@@ -777,6 +777,14 @@ Queues and fences are wrapped the same way.
   the PC headers (the synthetic GPU tests and fixtures) keep the PC vtable, and `ExecuteCommandLists` passes them
   through. Lists from the console slot 73 (`CreateCommandListX`) come back behind a console-shaped list proxy
   (adapted from upstream PR #2490; see `UPSTREAM.md`):
+  - **Creation interface.** An offline probe also requests the shared base GUID
+    `5b160d0f-ac1b-4185-8ba8-b3ae42a5a455` through console slot 73, then calls console `Close` at slot 9.
+    Only an object created through this route with that exact GUID answers it again from `QueryInterface`;
+    its identity and console table stay unchanged. This requires only backend `ID3D12GraphicsCommandList`
+    capability. Proxies created with the distinct console IID do not expose the shared base GUID, and all
+    PC revision IIDs (`ID3D12GraphicsCommandList1` through `8`) remain refused. The layout-identical base
+    chain is still accepted. PC slot 12 stays unchanged. The outer factory reports its final result as
+    `XboxID3D12Device::CreateCommandListX`, including a proxy refusal after backend creation succeeds.
   - **Object.** The console body of §3.4/§3.5a starts at `+0x18`. The inline-record cursor (`+0x18`) and both
     limits (`+0x28`, `+0x30`) are pinned to one address past the measured fields, so the console SDK's inline
     writers always find the buffer full and call the vtable method. Flag bytes, the header table at `+0x344` and
@@ -823,10 +831,13 @@ Queues and fences are wrapped the same way.
     6, unknown values) is refused with `E_NOTIMPL` instead of being coerced to direct, because the DMA-list
     vtable is not modelled.
   - **Tests.** `xs_proxy_mock_test` checks the layout, ownership, forwarding, unwrapping and refusals over
-    synthetic objects. It also checks every off/mismatch/no-GCL7/poison/Close-failure case of the 131/132
+    synthetic objects, including shared-GUID creation against a base-only backend, QI identity/reference
+    counts, unknown/revision IID refusals, console slot 32 forwarding to PC slot 28, and unchanged PC creation.
+    It also checks every off/mismatch/no-GCL7/poison/Close-failure case of the 131/132
     experiment. The RTX 5080 Vulkan test executes four barriers between eight copies and reads back all
-    1024 bytes correctly with validation enabled. The offline experimental probe passes five list closures,
-    then refuses another creation interface. This tests the barrier path, not the Xbox ABI; see STATUS.md.
+    1024 bytes correctly with validation enabled. The offline experimental probe now passes the later
+    shared-GUID creation. This tests the barrier path and interface admission, not the unknown Xbox flush
+    semantics or a rendered frame; see STATUS.md.
 
 Command allocators get the same kind of proxy: device slot 9 (`CreateCommandAllocator`) returns one.
 

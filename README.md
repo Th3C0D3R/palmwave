@@ -50,6 +50,7 @@ Measured on **Ryzen 9 9950X3D / NVIDIA RTX 5080 16 GB / driver 621.14 / Windows 
 | GPU pipeline creation | In progress; full-pass result pending |
 | Retail dry-run / initialization | Both exit 0; four DLL initializations succeed |
 | Retail execution | Vulkan device, five queues, five fences, an allocator and the first Xbox command list created on RTX 5080; recording stops at methods 132 and 131 |
+| Opt-in synchronization diagnostic | 581 lists created and closed; stops at Xbox memory-backed resource creation; experimental ABI hypothesis |
 | First rendered frame | Not verified |
 
 These counts are preparation results, not gameplay or rendering results. Historical measurements in the inherited `docs/` remain attributed to their original authors and hardware.
