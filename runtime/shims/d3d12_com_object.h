@@ -25,6 +25,18 @@ template<class Derived, class Stubs, class... Interfaces>
 class Object : public Stubs {
 public:
     ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    // Adds a reference unless the count has already reached zero (the object is being destroyed). For a caller that
+    // found the object through a registry that holds no reference to it; that registry's lock must be held across the
+    // call, and the object's destructor must unregister under the same lock, so the memory is still valid here.
+    // Adapted from upstream PR #7066 (tedin7, 8e700080066d7bbc0528aeaae5c8fb6c9cfdc347, GPL-3.0).
+    bool try_add_ref() {
+        ULONG count = refs_.load(std::memory_order_acquire);
+        while (count) {
+            if (refs_.compare_exchange_weak(count, count + 1, std::memory_order_acq_rel, std::memory_order_acquire))
+                return true;
+        }
+        return false;
+    }
     ULONG STDMETHODCALLTYPE Release() override {
         const ULONG left = --refs_;
         if (!left) delete static_cast<Derived*>(this);

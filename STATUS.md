@@ -166,3 +166,30 @@ The bulk pipeline worker was running 16 compiler threads and occupied about 23 G
 and that worker were stopped; available RAM rose from about 6 GiB to 37.5 GiB, with no checker left running. Completed
 cache checkpoints remain outside the repository. The build example now uses two jobs. Future bulk runs must use bounded
 parallelism; this interruption is a resource-management decision, not evidence of a shader translation failure.
+
+## Address-based RAW buffer view
+
+The Xbox device slot-70 adapter resolves a live buffer by its console address, retains it for the call, checks the
+whole requested range and translates the registered destination handle. It creates a real RAW SRV through the
+backend. Unknown shapes, missing buffers, invalid destinations and out-of-range views are refused without changing
+the destination. The implementation does not create a null stand-in or shrink a requested view.
+
+The integrated runtime builds with MSVC 19.51 and all thirteen targeted CPU mock CTests pass in 0.35 seconds.
+A separate offline run on RTX 5080 / driver 621.14, with both existing diagnostic experiments enabled, passes the
+former slot-70 crash and creates the view of the real 174 MiB import. It records 23 startup events, four successful
+DLL initializations, no unimplemented import and 2,235 D3D12 events: 2,200 successful, 24 call records and eleven
+experimental records. The next first-chance access violation is the allocation-info call at device slot 25.
+Its entry probe confirms that the result buffer precedes the device argument, unlike the PC C++ calling form.
+Raw logs and disassembly remain private. No Draw, ExecuteCommandLists, Present or rendered game frame is observed.
+
+Creating an imported-buffer view does not prove that translated shaders can read it. The descriptor uses the console
+address, while the standard shader path adds the arena base. Imported-memory shader addressing and real shader
+read/write validation remain separate work; no successful imported-buffer shader dispatch is claimed here.
+
+The source-crafted GPU regression on RTX 5080 / 621.14 also passes with Vulkan and synchronization validation:
+strict host import in 0.41 s, experimental host import in 0.28 s and arena compute in 1.00 s, with zero validation
+errors. The compute shader reads the slot-70 arena view through the standard shader address path: all 32 values
+and 32 out-of-bounds zeros match, and all 32 shifted-control values differ. This exposed and corrected an overly
+strict resolver check: arena resources share their VkBuffer rather than owning an individual buffer handle.
+The host-import cases validate descriptor construction and existing copies; imported-buffer shader addressing
+remains unverified as described above.

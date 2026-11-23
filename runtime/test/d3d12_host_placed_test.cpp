@@ -19,7 +19,9 @@
 //     state other than COMMON (the retail 0xFFFFFFFF included), no address, overflowing widths, reserved, read-only,
 //     guarded and partly committed pages, uncached and write-combined pages;
 //   - through the Xbox-ABI proxy's slot 133: the implemented call shape makes a buffer; console flag bits, a clear value
-//     and the retail state word are refused without a resource (and, by default, the experimental tuple too).
+//     and the retail state word are refused without a resource (and, by default, the experimental tuple too);
+//   - raw device slot 70 over that import into a title-backed heap: the real slot gets PC slot 18's raw V# for the live
+//     buffer; refusals leave the slot untouched. A shader read through it is not run (see check_slot70).
 //
 // --experimental (CTest sets PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT=1 for the process; the test never sets it): the same
 // checks, which the experiment must not change, plus one DIAGNOSTIC case (experimental_host_import.h). xmem physical
@@ -34,6 +36,7 @@
 #include "../shims/experimental_host_import.h"
 #include "../shims/host_pins.h"
 #include "../shims/shims.h"
+#include "../src/gfx10_descriptors.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -787,6 +790,164 @@ int check_experimental(Gpu& gpu, void* proxy, const XMem& x, const Title& title)
     return 0;
 }
 
+// ---- Device slot 70 over a real host import ----
+//
+// A title-backed descriptor heap (slot 14 with a test allocator whose backing is real memory), a real import of title
+// pages through raw slot 133, then raw slot 70 with the measured raw-buffer shape at a smaller width. The descriptor the
+// layer writes into the real heap must be the one PC slot 18 writes for the same live buffer and byte range: a raw V#
+// whose base is the title VA and whose record count is the width. Refusals leave a canary in the slot.
+//
+// NOT covered here: a shader reading through this V#. The translated shader contract adds heap_base to a V#'s base
+// (docs/d3d12_vulkan.md 3.3), and a title-page buffer's base is the title's host VA, so such a read misses the import;
+// dispatching one would read an unrelated device address. d3d12_compute_test reads a slot-70 view of an arena buffer,
+// which that contract does reach.
+
+namespace xs = rt::d3d12_xs;
+
+xs::DescriptorBackingStatus host_backing_allocate(std::size_t size, std::uint64_t, xs::DescriptorHeapBacking* out) {
+    void* p = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!p) return xs::DescriptorBackingStatus::out_of_memory;
+    out->address = p;
+    out->token = 0;
+    out->release_hook = nullptr;
+    return xs::DescriptorBackingStatus::allocated;
+}
+void host_backing_release(const xs::DescriptorHeapBacking& backing, std::uint64_t) {
+    VirtualFree(backing.address, 0, MEM_RELEASE);
+}
+
+// The measured slot-70 shape (docs/d3d12_vulkan.md, "Device slot 70") at any width: the resource desc and the 64-byte
+// view desc as the title lays them out, with garbage in the padding and in the view's unread bytes 0x30..0x3F.
+struct Slot70Args {
+    alignas(8) std::uint8_t resource[sizeof(D3D12_RESOURCE_DESC)];
+    alignas(8) std::uint8_t view[64];
+};
+
+Slot70Args slot70_args(std::uint64_t va, std::uint64_t width) {
+    Slot70Args a{};
+    D3D12_RESOURCE_DESC r = buffer_desc(width);
+    std::memcpy(a.resource, &r, sizeof(r));
+    const std::uint32_t padding = 0xDEADBEEFu;
+    std::memcpy(a.resource + 4, &padding, 4);
+    D3D12_SHADER_RESOURCE_VIEW_DESC v{};
+    v.Format = DXGI_FORMAT_R32_TYPELESS;
+    v.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    v.Buffer.NumElements = static_cast<UINT>(width / 4);
+    v.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    std::memcpy(a.view, &v, sizeof(v));
+    std::memcpy(a.view + 0x24, &padding, 4);
+    std::memcpy(a.view + 0x28, &va, 8);
+    std::memset(a.view + 0x30, 0xA5, 0x10);
+    return a;
+}
+
+void call_slot70(void* proxy, const Slot70Args& args, std::uint64_t destination) {
+    using SlotFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t);
+    void* const* vtable = *static_cast<void* const* const*>(proxy);
+    reinterpret_cast<SlotFn>(vtable[70])(proxy, reinterpret_cast<std::uint64_t>(args.resource),
+                                         reinterpret_cast<std::uint64_t>(args.view), destination);
+}
+
+int check_slot70(Gpu& gpu, void* proxy, const Title& title) {
+    const char* who = "slot 70 raw SRV over a host import";
+    constexpr UINT64 kWidth = k64;
+    auto* const pages = static_cast<std::uint32_t*>(
+        title.alloc(nullptr, kWidth, MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN, PAGE_READWRITE));
+    auto* const elsewhere = title.alloc(nullptr, k64, MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN, PAGE_READWRITE);
+    EXPECT(pages && elsewhere);
+    for (UINT64 i = 0; i < kWidth / 4; ++i) pages[i] = 0x70000000u + static_cast<std::uint32_t>(i) * 3u;
+    const auto va = reinterpret_cast<std::uint64_t>(pages);
+
+    // The import, as the title makes it: raw slot 133, a row-major UAV buffer on its pages.
+    D3D12_RESOURCE_DESC xbox = buffer_desc(kWidth);
+    xbox.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ID3D12Resource* placed = nullptr;
+    EXPECT_HR(call_slot133(proxy, pages, &xbox, kCommon, nullptr, &placed), S_OK);
+    EXPECT(placed && placed->GetGPUVirtualAddress() == va);
+
+    // A title-backed shader-visible heap: slot 9 answers the title's address, the real heap is behind it.
+    const xs::DescriptorHeapAllocator allocator{&host_backing_allocate, &host_backing_release};
+    xs::set_descriptor_heap_allocator(&allocator);
+    const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
+                                               D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    Ref<ID3D12DescriptorHeap> heap;
+    const HRESULT heap_hr = gpu.device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap.p));
+    xs::set_descriptor_heap_allocator(nullptr);
+    EXPECT_HR(heap_hr, S_OK);
+    using HeapHandleFn = std::uint64_t(WINAPI*)(void*);  // heap slot 9, the Xbox form: the handle in RAX
+    const std::uint64_t title_cpu = reinterpret_cast<HeapHandleFn>((*reinterpret_cast<void***>(heap.p))[9])(heap.p);
+    ID3D12DescriptorHeap* const real_heap = xs::heap_proxy_real_heap(heap.p);
+    EXPECT(real_heap && title_cpu && xs::title_descriptor_range_count() >= 1);
+    const std::uint64_t real_cpu = real_heap->GetCPUDescriptorHandleForHeapStart().ptr;
+    const UINT inc = gpu.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    EXPECT(real_cpu && real_cpu != title_cpu && inc >= 32);
+    const auto real_slot = [&](UINT i) { return reinterpret_cast<std::uint8_t*>(real_cpu + i * inc); };
+    std::vector<std::uint8_t> title_before(4 * inc, 0xC5);
+    std::memcpy(reinterpret_cast<void*>(title_cpu), title_before.data(), title_before.size());
+    for (UINT i = 0; i < 4; ++i) std::memset(real_slot(i), 0x5A, inc);
+
+    // The measured shape, scaled to this buffer: the whole import by its base VA, into title slot 1.
+    xs::reset_srv_at_va_stats();
+    const Slot70Args args = slot70_args(va, kWidth);
+    Slot70Args call = args;
+    call_slot70(proxy, call, title_cpu + 1 * inc);
+    EXPECT(std::memcmp(&call, &args, sizeof(args)) == 0);
+    EXPECT(xs::last_srv_at_va_outcome() == xs::SrvAtVaOutcome::created && xs::srv_at_va_created_calls() == 1);
+    // The real slot holds a raw V# of exactly the title VA and width; the title's backing bytes are not written.
+    palmwave::gfx10::BufferWords words{};
+    std::memcpy(words.data(), real_slot(1), sizeof(words));
+    palmwave::gfx10::Buffer decoded{};
+    EXPECT(palmwave::gfx10::decode(words, decoded));
+    EXPECT(decoded.address == va && decoded.num_records == kWidth && decoded.stride == 0 &&
+           decoded.oob_select == palmwave::gfx10::OobSelect::raw &&
+           decoded.format == palmwave::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT));
+    EXPECT(std::memcmp(reinterpret_cast<const void*>(title_cpu), title_before.data(), title_before.size()) == 0);
+    // The oracle: PC slot 18 (CreateShaderResourceView) for the same live buffer and range writes the same bytes.
+    D3D12_SHADER_RESOURCE_VIEW_DESC pc{};
+    pc.Format = DXGI_FORMAT_R32_TYPELESS;
+    pc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    pc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    pc.Buffer = {0, static_cast<UINT>(kWidth / 4), 0, D3D12_BUFFER_SRV_FLAG_RAW};
+    gpu.device->CreateShaderResourceView(placed, &pc, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(title_cpu + 2 * inc)});
+    EXPECT(std::memcmp(real_slot(1), real_slot(2), inc) == 0);
+    // The resolver's reference was released: only ours is left.
+    placed->AddRef();
+    EXPECT(placed->Release() == 1);
+
+    // Refusals leave the real slot's canary: a range one element past the import (never cut to fit), title memory
+    // with no import, a misaligned VA. Nothing is held for them.
+    std::vector<std::uint8_t> canary(inc, 0x5A);
+    const auto intact = [&](const Slot70Args& a, xs::SrvAtVaOutcome want) {
+        call_slot70(proxy, a, title_cpu + 3 * inc);
+        return xs::last_srv_at_va_outcome() == want && std::memcmp(real_slot(3), canary.data(), inc) == 0;
+    };
+    EXPECT(intact(slot70_args(va, kWidth + 16), xs::SrvAtVaOutcome::unknown_va));
+    EXPECT(intact(slot70_args(reinterpret_cast<std::uint64_t>(elsewhere), 0x100), xs::SrvAtVaOutcome::unknown_va));
+    EXPECT(intact(slot70_args(va + 4, 0x100), xs::SrvAtVaOutcome::invalid_range));
+
+    // CPU writes to the pages do not change the descriptor (it still names the title VA). This rereads the descriptor
+    // only: it is not evidence that a shader sees those bytes (see NOT covered above).
+    for (UINT64 i = 0; i < kWidth / 4; ++i) pages[i] = ~(0x70000000u + static_cast<std::uint32_t>(i) * 3u);
+    std::memcpy(words.data(), real_slot(1), sizeof(words));
+    EXPECT(palmwave::gfx10::decode(words, decoded) && decoded.address == va);
+
+    // After the last Release the VA names nothing: refused, canary intact, nothing imported or pinned.
+    placed->Release();
+    placed = nullptr;
+    EXPECT(nothing_held(gpu.device));
+    EXPECT(intact(args, xs::SrvAtVaOutcome::unknown_va));
+    heap.reset();
+    title.free(elsewhere, 0, MEM_RELEASE);
+    title.free(pages, 0, MEM_RELEASE);
+    std::printf("%s: the title-backed slot holds PC slot 18's raw V# for the live import (VA 0x%llx, %llu bytes), the "
+                "title backing is not written, the reference is balanced; past-the-end, unimported, misaligned and "
+                "released VAs leave the slot untouched. NOT RUN: a shader read through this V# (heap_base + title VA, "
+                "docs/d3d12_vulkan.md 3.3)\n",
+                who, static_cast<unsigned long long>(va), static_cast<unsigned long long>(kWidth));
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -864,6 +1025,7 @@ int main(int argc, char** argv) {
             failures += check_xmem_lifecycle(gpu, xmem, title);
             failures += check_refusals(gpu, title);
             failures += check_proxy(gpu, device.p, title);
+            failures += check_slot70(gpu, device.p, title);
             if (experimental) failures += check_experimental(gpu, device.p, xmem, title);
         }
     }

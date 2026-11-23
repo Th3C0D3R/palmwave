@@ -5583,6 +5583,51 @@ public:
     void own(const OwnedRuntime& owned) { owned_ = owned; }
     void set_outer(IUnknown* outer) { outer_ = outer; }
 
+    // Xbox device slot 70's resolver (rt::d3d12_xs::BufferAtVaResolver): this device's live buffer that holds all of
+    // [va, va + bytes), with a reference added for the caller. Only this device's own context is searched, so a VA of
+    // another device, a released buffer or an unregistered address is not_found. Every addressable entry in the
+    // context's VA index is one of this device's Resources, keyed by resource_id (images, swapchain back buffers and
+    // WriteToSubresource's staging binding have no VA there), so the ID found is the resource's pointer. The reference
+    // is taken under the index lock with try_add_ref: a resource whose last Release is in progress is skipped, and its
+    // destructor cannot finish removing its entry (and free the object) while the lock is held. Adapted from upstream
+    // PR #7066 (tedin7, 8e700080066d7bbc0528aeaae5c8fb6c9cfdc347, GPL-3.0): add_ref_buffer_at.
+    rt::d3d12_xs::BufferAtVaStatus buffer_at_va(std::uint64_t va, std::uint64_t bytes, rt::d3d12_xs::BufferAtVa& out) {
+        using Status = rt::d3d12_xs::BufferAtVaStatus;
+        out = {};
+        if (!state_.context) return Status::failed;
+        if (!va || !bytes || va > (std::numeric_limits<std::uint64_t>::max)() - bytes) return Status::not_found;
+        Resource* found = nullptr;
+        palmwave::ResourceId id = 0;
+        std::uint64_t start = 0, size = 0;
+        const bool held = state_.context->buffer_resource_at(va, bytes, id, start, size, [&](palmwave::ResourceId candidate) {
+            auto* resource = static_cast<Resource*>(reinterpret_cast<ID3D12Resource*>(candidate));
+            if (!resource->try_add_ref()) return false;
+            found = resource;
+            return true;
+        });
+        if (!held || !found) return Status::not_found;
+        const auto refuse = [&](Status status) {
+            found->Release();
+            return status;
+        };
+        // A caller may construct two devices on the same context; the VA index alone is not device ownership.
+        if (&found->device_state() != &state_) return refuse(Status::not_found);
+        // The closest range holding `va` may not hold every byte; nothing is cut to fit.
+        if (va < start || va - start > size || bytes > size - (va - start)) return refuse(Status::not_found);
+        const D3D12_RESOURCE_DESC& desc = found->desc();
+        // A plain buffer whose GetGPUVirtualAddress is the indexed start (an acceleration-structure buffer answers
+        // its device address instead), so the view's FirstElement is measured from the same base the SRV encodes.
+        // Arena-backed resources share the arena VkBuffer; an individually owned buffer handle is not required.
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || found->image() ||
+            found->GetGPUVirtualAddress() != start || desc.Width < size)
+            return refuse(Status::not_shader_readable);
+        if (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) return refuse(Status::not_shader_readable);
+        out.resource = found;
+        out.start = start;
+        out.size = size;
+        return Status::found;
+    }
+
     UINT STDMETHODCALLTYPE GetNodeCount() override { return 1; }
 
     // The Vulkan physical device's LUID, which is the DXGI adapter's on Windows. Zero (logged) when the driver has
@@ -8718,6 +8763,15 @@ void set_device_outer(ID3D12Device* device, IUnknown* outer) {
     // out this layer's adapter, the one create_dxgi_factory enumerates, so a title on the Vulkan device never gets
     // a host DXGI object from it.
     if (!rt::d3d12_xs::is_device_proxy(outer)) return;
+    // Device slot 70 names a buffer by console VA only; this device's resolver finds it in its own context.
+    rt::d3d12_xs::set_device_buffer_at_va_resolver(
+        outer, [](ID3D12Device* real, std::uint64_t va, std::uint64_t bytes,
+                  rt::d3d12_xs::BufferAtVa* out) -> rt::d3d12_xs::BufferAtVaStatus {
+            if (!out) return rt::d3d12_xs::BufferAtVaStatus::failed;
+            *out = {};
+            Device* device = Device::from<Device>(real);
+            return device ? device->buffer_at_va(va, bytes, *out) : rt::d3d12_xs::BufferAtVaStatus::failed;
+        });
     rt::d3d12_xs::set_device_adapter_provider(outer, [](ID3D12Device* real, REFIID riid, void** out) {
         IDXGIFactory1* factory = nullptr;
         HRESULT hr = create_dxgi_factory(real, __uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory));

@@ -6,7 +6,8 @@
 // arguments only, so the x64 registers and stack words line up exactly; methods that return a struct keep their
 // hidden return pointer in RDX, which is passed through as the first argument unchanged. The measured exceptions
 // are IUnknown (0-2), slot 14 (which wraps the heap), 26 (the title passes the return buffer in RCX and the device in
-// RDX), 62, 76 and 133 (CreatePlacedResourceX, handed to the device's registered handler), plus the heap proxy's 9/10 conversion from the PC hidden-pointer form to the Xbox RAX form. Slots
+// RDX), 62, 70 (a raw buffer SRV named by GPU VA, never the PC CreatePlacedResource1), 76 and 133
+// (CreatePlacedResourceX, handed to the device's registered handler), plus the heap proxy's 9/10 conversion from the PC hidden-pointer form to the Xbox RAX form. Slots
 // 8/75 (command queues), 36 (fences) and 32 (a shared fence) wrap what they create in queue and fence proxies built
 // the same way, and slots 31/34/35/45/46/50 hand the real objects behind heap, queue and fence proxies to the real
 // device (see the command queue and fence section). Slots 17..24 translate title-backed CPU descriptor handles
@@ -69,6 +70,8 @@ struct DeviceProxy {
     // The device's IDXGIDevice1 (see "IDXGIDevice1 on the device" below): a title's IDXGIDevice1* points here.
     void** dxgi_vtable;
     DxgiAdapterProvider adapter_provider;
+    // Slot 70: finds the live buffer at a console VA on `real` (set_device_buffer_at_va_resolver); null refuses slot 70.
+    std::atomic<BufferAtVaResolver> buffer_resolver{nullptr};
     std::atomic<int> gpu_thread_priority;
     std::atomic<unsigned> max_frame_latency;
     // The first-frame subset of SetFrameIntervalX/ScheduleFrameEventX/WaitFrameEventX. Tokens were never measured;
@@ -173,6 +176,7 @@ const char* slot_name(unsigned slot) {
         case 50: return "EnqueueMakeResident (proxies unwrapped)";
         case 62: return "Xbox CreateComputePipelineState";
         case 67: return "Xbox DeserializeComputePipelineStateX";
+        case 70: return "Xbox CreateShaderResourceView at a GPU VA (device slot 70)";
         case 73: return "Xbox CreateCommandListX -> console list proxy";
         case 75: return "CreateCommandQueue1 -> queue proxy";
         case 76: return "Xbox resource creation";
@@ -614,6 +618,34 @@ DescriptorHandleTranslation translate_handle(const DeviceProxy* device, SIZE_T p
     if (g_title_range_count.load(std::memory_order_acquire) == 0) return DescriptorHandleTranslation::unchanged;
     std::lock_guard lock(descriptor_range_mutex());
     return translate_locked(device, ptr, count, type, out);
+}
+
+// Device slot 70's destination: one descriptor of `type` in a heap slot 14 registered for `device`, either inside its
+// title range (translated to the real heap) or inside its real range (a plain heap, unchanged). Unlike slots 17..24,
+// an untracked handle is not passed on: slot 70 has no PC counterpart that could validate it, so a handle with no
+// registry entry, on another device's heap, of another heap type or off a descriptor boundary is invalid. A heap whose
+// real start is unknown (real_start 0) cannot be written either. `out` is the real CPU handle.
+bool registered_descriptor(const DeviceProxy* device, SIZE_T ptr, D3D12_DESCRIPTOR_HEAP_TYPE type, SIZE_T& out) {
+    out = 0;
+    if (!ptr) return false;
+    std::lock_guard lock(descriptor_range_mutex());
+    for (const DescriptorRange& r : descriptor_ranges()) {
+        SIZE_T base = 0;
+        if (r.custom_start && ptr >= r.custom_start && ptr - r.custom_start < r.byte_size)
+            base = r.custom_start;
+        else if (r.real_start && ptr >= r.real_start && ptr - r.real_start < r.byte_size)
+            base = r.real_start;
+        else
+            continue;
+        // Ranges never alias (register_descriptor_range), so the first range that holds `ptr` is its only meaning.
+        const SIZE_T offset = ptr - base;
+        if (r.device != device || r.type != type || !r.increment || !r.real_start || offset % r.increment != 0 ||
+            r.byte_size - offset < r.increment)
+            return false;
+        out = r.real_start + offset;
+        return true;
+    }
+    return false;
 }
 
 // A copy of a CPU-handle array with each range translated, for CopyDescriptors. Nothing throws (a thunk must not
@@ -2805,6 +2837,244 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
     return refusal ? d3d12_trace::result("Xbox CreatePlacedResourceX (device slot 133)", hr) : hr;
 }
 
+// ---- Device slot 70: a raw buffer SRV named by console GPU VA (contract in d3d12_xs_device.h) ----
+//
+// Adapted from upstream PR #7066 (tedin7, 8e700080066d7bbc0528aeaae5c8fb6c9cfdc347, GPL-3.0): the slot is handled by the
+// proxy, the buffer is found by VA through a per-proxy resolver that takes a reference safely, and the view goes to the
+// PC slot 18. Palmwave departs from it: no null-view fallback (every refusal leaves the destination untouched), no
+// clamping of the requested width to the buffer, exact shape and flag checks instead of a RAW-bit test, a destination
+// validated and translated through the descriptor-range registry, unreadable descriptions refused before any copy, and
+// only bytes 0x00..0x2F of the view read.
+constexpr std::size_t kSrvAtVaViewBytes = 0x30;     // the desktop view desc (0x28) and the VA at +0x28
+constexpr std::size_t kSrvAtVaVaOffset = 0x28;
+constexpr std::uint64_t kSrvAtVaMaxWidth = 0xFFFFFFFCull;  // a raw V#'s 32-bit byte count, in whole elements
+static_assert(sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) == kSrvAtVaVaOffset, "the desktop SRV desc is 40 bytes");
+static_assert(offsetof(D3D12_SHADER_RESOURCE_VIEW_DESC, Buffer) == 0x10, "Buffer view fields start at +0x10");
+static_assert(offsetof(D3D12_RESOURCE_DESC, Alignment) == 8, "the DWORD at +4 of the resource desc is padding");
+static_assert(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT == 16, "raw views are 16-byte aligned");
+
+std::atomic<SrvAtVaOutcome> g_srv_at_va_last{SrvAtVaOutcome::none};
+std::atomic<std::uint64_t> g_srv_at_va_created{0};
+std::atomic<std::uint64_t> g_srv_at_va_refused{0};
+
+// True when every byte of [address, address + bytes) is committed, readable and not a guard page right now.
+bool readable_range(std::uint64_t address, std::size_t bytes) {
+    if (!address || !bytes || address > (std::numeric_limits<std::uint64_t>::max)() - bytes) return false;
+    constexpr DWORD kReadable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                                PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    const std::uint64_t end = address + bytes;
+    std::uint64_t at = address;
+    while (at < end) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) != sizeof(info)) return false;
+        if (info.State != MEM_COMMIT || !(info.Protect & kReadable) || (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
+            return false;
+        const std::uint64_t region_end = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+        if (region_end <= at) return false;
+        at = region_end;
+    }
+    return true;
+}
+
+// memcpy that turns an access violation (the title unmapping the bytes after readable_range) into a refusal. No C++
+// objects here: a function with __try cannot have any that need unwinding.
+bool guarded_copy(void* destination, const void* source, std::size_t size) {
+    __try {
+        std::memcpy(destination, source, size);
+        return true;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
+                                                                  : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+}
+
+template <class T>
+T field_at(const std::uint8_t* bytes, std::size_t offset) {
+    T value{};
+    std::memcpy(&value, bytes + offset, sizeof(T));
+    return value;
+}
+
+const char* srv_at_va_reason(SrvAtVaOutcome outcome) {
+    switch (outcome) {
+        case SrvAtVaOutcome::unreadable: return "a description pointer is null or not committed readable memory";
+        case SrvAtVaOutcome::unsupported_shape: return "not the supported raw-buffer shape";
+        case SrvAtVaOutcome::invalid_range: return "zero, misaligned or overflowing VA or width";
+        case SrvAtVaOutcome::invalid_destination:
+            return "the destination is not a CBV_SRV_UAV slot of a heap this device created";
+        case SrvAtVaOutcome::no_resolver: return "no buffer resolver on this device";
+        case SrvAtVaOutcome::unknown_va: return "no live buffer of this device holds the whole range";
+        case SrvAtVaOutcome::not_shader_readable: return "the buffer denies shader-resource access";
+        case SrvAtVaOutcome::resolver_failed: return "the resolver failed or answered an inconsistent range";
+        default: return "unknown";
+    }
+}
+
+// Not forwarded: counted, logged (first time per reason, every time with XS_TRACE) and traced.
+void refuse_srv_at_va(SrvAtVaOutcome outcome, const char* detail, std::uint64_t resource_desc, std::uint64_t view_desc,
+                      std::uint64_t destination, std::uint64_t va, std::uint64_t width) {
+    g_srv_at_va_refused.fetch_add(1, std::memory_order_relaxed);
+    g_srv_at_va_last.store(outcome, std::memory_order_relaxed);
+    static std::atomic<bool> warned[16];
+    const auto index = static_cast<unsigned>(outcome);
+    if ((index < std::size(warned) && first_call(warned[index])) || trace_enabled())
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: device slot 70 refused (%s%s%s): args 0x%llx 0x%llx 0x%llx, va 0x%llx width %llu; "
+                     "nothing written, the destination is unchanged\n",
+                     srv_at_va_reason(outcome), detail ? ": " : "", detail ? detail : "",
+                     static_cast<unsigned long long>(resource_desc), static_cast<unsigned long long>(view_desc),
+                     static_cast<unsigned long long>(destination), static_cast<unsigned long long>(va),
+                     static_cast<unsigned long long>(width));
+    const bool unsupported = outcome == SrvAtVaOutcome::unsupported_shape;
+    d3d12_trace::record(slot_name(70), unsupported ? "unsupported" : "refused");
+}
+
+// The supported shape, read field by field (padding is never read). Null when it matches, else what differs.
+const char* srv_at_va_shape_mismatch(const std::uint8_t* resource, const std::uint8_t* view) {
+    const auto dimension = field_at<std::uint32_t>(resource, offsetof(D3D12_RESOURCE_DESC, Dimension));
+    const auto alignment = field_at<std::uint64_t>(resource, offsetof(D3D12_RESOURCE_DESC, Alignment));
+    const auto height = field_at<std::uint32_t>(resource, offsetof(D3D12_RESOURCE_DESC, Height));
+    const auto depth = field_at<std::uint16_t>(resource, offsetof(D3D12_RESOURCE_DESC, DepthOrArraySize));
+    const auto mips = field_at<std::uint16_t>(resource, offsetof(D3D12_RESOURCE_DESC, MipLevels));
+    const auto format = field_at<std::uint32_t>(resource, offsetof(D3D12_RESOURCE_DESC, Format));
+    const auto samples = field_at<std::uint32_t>(resource, offsetof(D3D12_RESOURCE_DESC, SampleDesc));
+    const auto quality = field_at<std::uint32_t>(resource, offsetof(D3D12_RESOURCE_DESC, SampleDesc) + 4);
+    const auto layout = field_at<std::uint32_t>(resource, offsetof(D3D12_RESOURCE_DESC, Layout));
+    const auto flags = field_at<std::uint32_t>(resource, offsetof(D3D12_RESOURCE_DESC, Flags));
+    if (dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return "resource Dimension is not BUFFER";
+    if (alignment != 0) return "resource Alignment is not 0";
+    if (height != 1 || depth != 1 || mips != 1) return "resource Height/DepthOrArraySize/MipLevels are not 1";
+    if (format != DXGI_FORMAT_UNKNOWN) return "resource Format is not UNKNOWN";
+    if (samples != 1 || quality != 0) return "resource SampleDesc is not {1, 0}";
+    if (layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR) return "resource Layout is not ROW_MAJOR";
+    if (flags != D3D12_RESOURCE_FLAG_NONE) return "resource Flags are not NONE";
+
+    const auto view_format = field_at<std::uint32_t>(view, offsetof(D3D12_SHADER_RESOURCE_VIEW_DESC, Format));
+    const auto view_dimension =
+        field_at<std::uint32_t>(view, offsetof(D3D12_SHADER_RESOURCE_VIEW_DESC, ViewDimension));
+    const auto mapping =
+        field_at<std::uint32_t>(view, offsetof(D3D12_SHADER_RESOURCE_VIEW_DESC, Shader4ComponentMapping));
+    constexpr std::size_t kBuffer = offsetof(D3D12_SHADER_RESOURCE_VIEW_DESC, Buffer);
+    const auto first = field_at<std::uint64_t>(view, kBuffer + offsetof(D3D12_BUFFER_SRV, FirstElement));
+    const auto stride = field_at<std::uint32_t>(view, kBuffer + offsetof(D3D12_BUFFER_SRV, StructureByteStride));
+    const auto view_flags = field_at<std::uint32_t>(view, kBuffer + offsetof(D3D12_BUFFER_SRV, Flags));
+    if (view_format != DXGI_FORMAT_R32_TYPELESS) return "view Format is not R32_TYPELESS";
+    if (view_dimension != D3D12_SRV_DIMENSION_BUFFER) return "view ViewDimension is not BUFFER";
+    if (mapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING) return "view Shader4ComponentMapping is not the default";
+    if (first != 0) return "view FirstElement is not 0 (an offset into the VA has no established meaning)";
+    if (stride != 0) return "view StructureByteStride is not 0";
+    if (view_flags != D3D12_BUFFER_SRV_FLAG_RAW) return "view Flags are not exactly RAW";
+    return nullptr;
+}
+
+// Device slot 70. Every word keeps its thunk position (see "A thunk declares 14 argument words" at the top).
+void proxy_create_srv_at_va_x(DeviceProxy* self, std::uint64_t resource_desc, std::uint64_t view_desc,
+                              std::uint64_t destination) {
+    // Copies of exactly the bytes the contract names: the resource desc (56) and the first 0x30 bytes of the view.
+    std::uint8_t resource[sizeof(D3D12_RESOURCE_DESC)];
+    std::uint8_t view[kSrvAtVaViewBytes];
+    const auto refuse = [&](SrvAtVaOutcome outcome, const char* detail, std::uint64_t va, std::uint64_t width) {
+        refuse_srv_at_va(outcome, detail, resource_desc, view_desc, destination, va, width);
+    };
+    if (!readable_range(resource_desc, sizeof(resource)) || !readable_range(view_desc, sizeof(view)) ||
+        !guarded_copy(resource, reinterpret_cast<const void*>(resource_desc), sizeof(resource)) ||
+        !guarded_copy(view, reinterpret_cast<const void*>(view_desc), sizeof(view)))
+        return refuse(SrvAtVaOutcome::unreadable, nullptr, 0, 0);
+
+    const auto width = field_at<std::uint64_t>(resource, offsetof(D3D12_RESOURCE_DESC, Width));
+    const auto va = field_at<std::uint64_t>(view, kSrvAtVaVaOffset);
+    if (const char* mismatch = srv_at_va_shape_mismatch(resource, view))
+        return refuse(SrvAtVaOutcome::unsupported_shape, mismatch, va, width);
+    const auto elements = field_at<std::uint32_t>(
+        view, offsetof(D3D12_SHADER_RESOURCE_VIEW_DESC, Buffer) + offsetof(D3D12_BUFFER_SRV, NumElements));
+    if (!width || width % 4 != 0 || width > kSrvAtVaMaxWidth)
+        return refuse(SrvAtVaOutcome::invalid_range, "Width is 0, not a multiple of 4 or above 0xFFFFFFFC", va, width);
+    if (elements != width / 4)
+        return refuse(SrvAtVaOutcome::unsupported_shape, "view NumElements is not Width / 4", va, width);
+    if (!va || va % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT != 0 || va > (std::numeric_limits<std::uint64_t>::max)() - width)
+        return refuse(SrvAtVaOutcome::invalid_range, "VA is 0, not 16-byte aligned or VA + Width overflows", va, width);
+
+    SIZE_T real_destination = 0;
+    if (!registered_descriptor(self, static_cast<SIZE_T>(destination), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                               real_destination))
+        return refuse(SrvAtVaOutcome::invalid_destination, nullptr, va, width);
+
+    const BufferAtVaResolver resolver = self->buffer_resolver.load(std::memory_order_acquire);
+    if (!resolver) return refuse(SrvAtVaOutcome::no_resolver, nullptr, va, width);
+    BufferAtVa hit{};
+    const BufferAtVaStatus status = resolver(self->real, va, width, &hit);
+    // Whatever the status, a reference handed back is released exactly once.
+    ID3D12Resource* const buffer = hit.resource;
+    const auto drop = [&] {
+        if (buffer) buffer->Release();
+    };
+    if (status != BufferAtVaStatus::found) {
+        drop();
+        if (status == BufferAtVaStatus::not_found) return refuse(SrvAtVaOutcome::unknown_va, nullptr, va, width);
+        if (status == BufferAtVaStatus::not_shader_readable)
+            return refuse(SrvAtVaOutcome::not_shader_readable, nullptr, va, width);
+        return refuse(SrvAtVaOutcome::resolver_failed, "the resolver reported a failure", va, width);
+    }
+    // The answer must hold the whole request; nothing is cut to fit. The resolver's checks are repeated here.
+    if (!buffer || va < hit.start || va - hit.start > hit.size || width > hit.size - (va - hit.start) ||
+        (va - hit.start) % 4 != 0) {
+        drop();
+        return refuse(SrvAtVaOutcome::resolver_failed, "the answered range does not hold the request", va, width);
+    }
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC host{};
+    host.Format = DXGI_FORMAT_R32_TYPELESS;
+    host.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    host.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    host.Buffer.FirstElement = (va - hit.start) / 4;
+    host.Buffer.NumElements = elements;
+    host.Buffer.StructureByteStride = 0;
+    host.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    self->real->CreateShaderResourceView(buffer, &host, D3D12_CPU_DESCRIPTOR_HANDLE{real_destination});
+    drop();
+    g_srv_at_va_created.fetch_add(1, std::memory_order_relaxed);
+    g_srv_at_va_last.store(SrvAtVaOutcome::created, std::memory_order_relaxed);
+    static std::atomic<bool> logged{false};
+    if (first_call(logged) || trace_enabled())
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: device slot 70 wrote a raw buffer view: va 0x%llx, %llu bytes, buffer start 0x%llx "
+                     "(first element %llu), destination 0x%llx -> 0x%llx\n",
+                     static_cast<unsigned long long>(va), static_cast<unsigned long long>(width),
+                     static_cast<unsigned long long>(hit.start),
+                     static_cast<unsigned long long>(host.Buffer.FirstElement),
+                     static_cast<unsigned long long>(destination), static_cast<unsigned long long>(real_destination));
+    d3d12_trace::record(slot_name(70), "ok");
+}
+
+// The Xbox routes at their configured indices (PALMWAVE_XS_*_SLOT). False when `slot` is none of them. Slot 70 asks
+// first too, so a route moved onto 70 keeps the existing environment-override priority over the built-in handler.
+// The route dispatch is adapted from upstream PR #7066 (tedin7, 8e700080, GPL-3.0).
+bool route_xbox_device_slot(DeviceProxy* self, unsigned slot, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
+                            std::uint64_t a4, std::uint64_t a5, std::uint64_t& result) {
+    const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
+    if (slot == routes.frame_interval) {
+        log_xbox_route_once(slot, "SetFrameIntervalX", a1, a2, a3, a4, a5);
+        result = hr_to_u64(proxy_set_frame_interval_x(self, a1, a2, a3, a4));
+    } else if (slot == routes.schedule_event) {
+        log_xbox_route_once(slot, "ScheduleFrameEventX", a1, a2, a3, a4, a5);
+        result = hr_to_u64(proxy_schedule_frame_event_x(self, a1, a2, a4));
+    } else if (slot == routes.wait_event) {
+        log_xbox_route_once(slot, "WaitFrameEventX", a1, a2, a3, a4, a5);
+        result = hr_to_u64(proxy_wait_frame_event_x(self, a1, a2, a4, a5));
+    } else if (slot == routes.queue_x) {
+        log_xbox_route_once(slot, "CreateCommandQueueX", a1, a2, a3, a4, a5);
+        result = hr_to_u64(proxy_create_command_queue_x(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
+                                                        reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3)));
+    } else if (slot == routes.list_x) {
+        log_xbox_route_once(slot, "CreateCommandListX", a1, a2, a3, a4, a5);
+        result = hr_to_u64(proxy_create_command_list_x(self, a1, a2, a3, reinterpret_cast<const IID*>(a4),
+                                                       reinterpret_cast<void**>(a5)));
+    } else {
+        return false;
+    }
+    return true;
+}
+
 template <unsigned Slot>
 std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -2870,6 +3140,13 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return hr_to_u64(proxy_create_compute_pipeline_from_native_code(
             self, reinterpret_cast<const void*>(a1), reinterpret_cast<const IID*>(a2),
             reinterpret_cast<void**>(a3)));
+    } else if constexpr (Slot == 70) {
+        note_slot(70);
+        // A configured Xbox route moved onto 70 keeps its priority over the built-in view.
+        std::uint64_t routed = 0;
+        if (route_xbox_device_slot(self, Slot, a1, a2, a3, a4, a5, routed)) return routed;
+        proxy_create_srv_at_va_x(self, a1, a2, a3);
+        return 0;  // void method: the return register carries nothing
     } else if constexpr (Slot == 76) {
         return hr_to_u64(proxy_create_resource(
             self, reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(a1),
@@ -2896,30 +3173,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         // Xbox device slots, before the PC vtable is indexed: the public HLE's 78/79/80 would otherwise reach
         // CreateReservedResource2/CreateSampler2 or fall past an 80-slot table, and 48/73 would reach unrelated PC
         // methods. The check is before the slot-count refusal because slot 80 is outside a PC ID3D12Device11 table.
-        const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
-        if (Slot == routes.frame_interval) {
-            log_xbox_route_once(Slot, "SetFrameIntervalX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_set_frame_interval_x(self, a1, a2, a3, a4));
-        }
-        if (Slot == routes.schedule_event) {
-            log_xbox_route_once(Slot, "ScheduleFrameEventX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_schedule_frame_event_x(self, a1, a2, a4));
-        }
-        if (Slot == routes.wait_event) {
-            log_xbox_route_once(Slot, "WaitFrameEventX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_wait_frame_event_x(self, a1, a2, a4, a5));
-        }
-        if (Slot == routes.queue_x) {
-            log_xbox_route_once(Slot, "CreateCommandQueueX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_create_command_queue_x(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
-                                                          reinterpret_cast<const IID*>(a2),
-                                                          reinterpret_cast<void**>(a3)));
-        }
-        if (Slot == routes.list_x) {
-            log_xbox_route_once(Slot, "CreateCommandListX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_create_command_list_x(self, a1, a2, a3, reinterpret_cast<const IID*>(a4),
-                                                         reinterpret_cast<void**>(a5)));
-        }
+        std::uint64_t routed = 0;
+        if (route_xbox_device_slot(self, Slot, a1, a2, a3, a4, a5, routed)) return routed;
         if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
 
         // The PC vtable entry, called with the PC device as `this`. Integer/pointer arguments, the hidden
@@ -3003,6 +3258,7 @@ HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out) {
     proxy->refs.store(1, std::memory_order_relaxed);
     proxy->dxgi_vtable = get_dxgi_vtable();
     proxy->adapter_provider = nullptr;
+    proxy->buffer_resolver.store(nullptr, std::memory_order_relaxed);
     proxy->gpu_thread_priority.store(0, std::memory_order_relaxed);
     proxy->max_frame_latency.store(3, std::memory_order_relaxed);
 
@@ -3044,6 +3300,27 @@ bool set_device_adapter_provider(void* device, DxgiAdapterProvider provider) {
     }
     proxy->adapter_provider = provider;
     return true;
+}
+
+bool set_device_buffer_at_va_resolver(void* device, BufferAtVaResolver resolver) {
+    auto* proxy = static_cast<DeviceProxy*>(device_proxy_primary(device));
+    if (!proxy) {
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: set_device_buffer_at_va_resolver: %p is not a device proxy; no resolver set\n",
+                     device);
+        return false;
+    }
+    proxy->buffer_resolver.store(resolver, std::memory_order_release);
+    return true;
+}
+
+SrvAtVaOutcome last_srv_at_va_outcome() { return g_srv_at_va_last.load(std::memory_order_relaxed); }
+std::uint64_t srv_at_va_created_calls() { return g_srv_at_va_created.load(std::memory_order_relaxed); }
+std::uint64_t srv_at_va_refused_calls() { return g_srv_at_va_refused.load(std::memory_order_relaxed); }
+void reset_srv_at_va_stats() {
+    g_srv_at_va_last.store(SrvAtVaOutcome::none, std::memory_order_relaxed);
+    g_srv_at_va_created.store(0, std::memory_order_relaxed);
+    g_srv_at_va_refused.store(0, std::memory_order_relaxed);
 }
 
 bool is_heap_proxy(const void* heap) {
@@ -3103,7 +3380,7 @@ bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || (slot >= 17 && slot <= 24) || slot == 26 ||
         slot == 31 || slot == 32 || slot == 34 ||
         slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
-        slot == 75 || slot == 76 || slot == 133)
+        slot == 70 || slot == 75 || slot == 76 || slot == 133)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||

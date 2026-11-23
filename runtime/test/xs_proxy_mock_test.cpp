@@ -13,6 +13,10 @@
 //     submission until Reset, AllocateUploadMemory over a mapped mock buffer, and the unwrapped PC path of slot 12;
 //   - --fail-virtualalloc / --fail-virtualprotect / --fail-veh: the guard region's setup failing, injected by
 //     patching this executable's own import table before the first proxy table is built (one process each);
+//   - device slot 70 as the console calls it (resource desc, 64-byte view desc with the GPU VA at +0x28, CPU handle):
+//     a raw view of the live buffer through PC slot 18 with the translated handle, never PC slot 70; every refusal
+//     (shape, range, destination, VA, resolver, unreadable bytes) writes nothing and leaves no reference. --slot70 runs
+//     it with the D3D12 trace on; --env-slots-70 moves a configured route onto 70, which must win;
 //   - --host-import-experiment on|off: device slot 133's opt-in experiment (PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT, set
 //     by CTest for the process, never by the test): the one experimental tuple reaches the handler as UAV / COMMON
 //     only when the variable is "1"; every near miss is refused before the handler either way.
@@ -134,6 +138,8 @@ struct Mock {
     unsigned calls[kMockSlots];
     std::uint64_t args[kMockSlots][5];
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
+    // device slot 18 (CreateShaderResourceView): the description as it arrived (the caller's copy is temporary).
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv;
 };
 
 Mock g_pool[512];
@@ -263,6 +269,11 @@ void copy_array(Mock* m, unsigned slot, std::uint64_t objects, std::uint64_t cou
 std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
     const std::uint64_t a1 = words[0], a2 = words[1], a3 = words[2], a4 = words[3];
     if (m->kind == Kind::device) {
+        // CreateShaderResourceView(resource, desc, handle): small test words in a2 are markers, not descriptions.
+        if (slot == 18) {
+            std::memset(&m->srv, 0, sizeof(m->srv));
+            if (a2 > 0xFFFF) std::memcpy(&m->srv, reinterpret_cast<const void*>(a2), sizeof(m->srv));
+        }
         switch (slot) {
             case 8: {  // CreateCommandQueue: capture values, never retain a temporary description.
                 m->has_queue_desc = a1 != 0;
@@ -1686,8 +1697,8 @@ int check_experimental_flush() {
 
 // ---- 8. Environment overrides for the Xbox device slots (one process each, read once) ----
 
-int run_env_slots(bool valid) {
-    const char* frame_interval = valid ? "96" : "2";
+int run_env_slots(bool valid, bool on_slot70 = false) {
+    const char* frame_interval = on_slot70 ? "70" : valid ? "96" : "2";
     const char* schedule_event = valid ? "97" : "2";
     const char* wait_event = valid ? "98" : "2";
     const char* queue_x = valid ? "99" : "2";
@@ -1702,7 +1713,21 @@ int run_env_slots(bool valid) {
     void* device = make_device(mock, 11, true, true, true);  // full-chain lists: the console IID needs GCL6
     EXPECT(device);
     xs::reset_device_proxy_stats();
+    xs::reset_srv_at_va_stats();
     std::uint64_t token = 0;
+    if (on_slot70) {
+        // SetFrameIntervalX moved onto 70, which also has a built-in handler: the configured route wins, so (output,
+        // interval, latency, flags) is a frame-interval call, never a view whose destination is the latency word; the
+        // view handler is not entered at all (no outcome recorded) and neither PC slot 70 nor 18 is reached.
+        EXPECT(hr_of(raw(device, 70, 0, 16667, 1, 0)) == S_OK && mock->calls[70] == 0 && mock->calls[18] == 0);
+        EXPECT(xs::last_srv_at_va_outcome() == xs::SrvAtVaOutcome::none && xs::srv_at_va_refused_calls() == 0 &&
+               xs::srv_at_va_created_calls() == 0 && xs::device_slot_hits(70) == 1);
+        // The old default is a PC slot again and is forwarded.
+        EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK && mock->calls[78] == 1);
+        EXPECT(release(device) == 0 && mock->refs == 0);
+        std::printf("%s: a route moved onto device slot 70 takes precedence over the built-in view\n", g_label);
+        return 0;
+    }
     if (valid) {
         // Every route moved: the new slot is handled, the default slot is forwarded to the mock.
         EXPECT(hr_of(raw(device, 96, 0, 16667, 1, 0)) == S_OK && mock->calls[96] == 0);
@@ -1731,7 +1756,7 @@ int run_env_slots(bool valid) {
         EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK && mock->calls[78] == 0);
         EXPECT(hr_of(raw(device, 79, 0, 0, 0, 0)) == S_OK && mock->calls[79] == 0);
         EXPECT(hr_of(raw(device, 80, 0, 0, 0, 0, word(&token))) == S_OK && token && mock->calls[80] == 0);
-        EXPECT(hr_of(raw(device, 70)) == S_OK && mock->calls[70] == 1);  // not an Xbox slot: forwarded
+        EXPECT(hr_of(raw(device, 71)) == S_OK && mock->calls[71] == 1);  // not an Xbox slot: forwarded
     }
     EXPECT(release(device) == 0 && mock->refs == 0);
     std::printf("%s: environment slot overrides %s\n", g_label,
@@ -2491,6 +2516,382 @@ int check_list_descriptor_handles() {
     return 0;
 }
 
+// ---- Device slot 70: a raw buffer SRV named by GPU VA, never the PC CreatePlacedResource1 ----
+//
+// The raw console call void(this, resource desc*, 64-byte view*, CPU handle) through the proxy's vtable. The mock
+// device stands in for the backend: its slot 18 (CreateShaderResourceView) records the resource, the description and
+// the handle it receives; its slot 70 (the PC CreatePlacedResource1) must never be reached. The buffers are mock
+// resources found by a resolver that, like the Vulkan layer's, only answers buffers of the device it is asked about
+// that are still alive, and hands one reference to the caller.
+
+struct FakeBuffer {
+    Mock* resource;      // refs 0 = released (what a failed try_add_ref sees)
+    const Mock* owner;   // the PC device it belongs to
+    std::uint64_t start;
+    std::uint64_t size;
+    bool deny;           // DENY_SHADER_RESOURCE
+};
+enum class ResolverMode { normal, fail, short_range, ref_with_not_found };
+struct ResolverState {
+    FakeBuffer buffers[4];
+    unsigned count;
+    ResolverMode mode;
+    unsigned calls;
+    const void* last_real;
+    std::uint64_t last_va;
+    std::uint64_t last_bytes;
+} g_resolver;
+
+xs::BufferAtVaStatus fake_buffer_resolver(ID3D12Device* real, std::uint64_t va, std::uint64_t bytes,
+                                          xs::BufferAtVa* out) {
+    ++g_resolver.calls;
+    g_resolver.last_real = real;
+    g_resolver.last_va = va;
+    g_resolver.last_bytes = bytes;
+    *out = {};
+    if (g_resolver.mode == ResolverMode::fail) return xs::BufferAtVaStatus::failed;
+    for (unsigned i = 0; i < g_resolver.count; ++i) {
+        const FakeBuffer& b = g_resolver.buffers[i];
+        if (b.owner != reinterpret_cast<const Mock*>(real) || !b.resource || b.resource->refs <= 0) continue;
+        if (va < b.start || va - b.start >= b.size || bytes > b.size - (va - b.start)) continue;
+        if (b.deny) return xs::BufferAtVaStatus::not_shader_readable;
+        ++b.resource->refs;  // the caller's reference
+        out->resource = reinterpret_cast<ID3D12Resource*>(b.resource);
+        out->start = b.start;
+        out->size = b.size;
+        // A broken resolver: an answer that does not hold the request, or a reference with a non-found status.
+        if (g_resolver.mode == ResolverMode::short_range) out->size = (va - b.start) + bytes - 4;
+        if (g_resolver.mode == ResolverMode::ref_with_not_found) return xs::BufferAtVaStatus::not_found;
+        return xs::BufferAtVaStatus::found;
+    }
+    return xs::BufferAtVaStatus::not_found;
+}
+
+// The two descriptions as raw bytes, the way the title lays them out, with garbage in every padding field and in the
+// view's bytes 0x30..0x3F (no established meaning for a buffer view): the proxy must not read or reject them.
+struct Slot70Args {
+    alignas(8) std::uint8_t resource[sizeof(D3D12_RESOURCE_DESC)];
+    alignas(8) std::uint8_t view[64];
+};
+
+void put32(std::uint8_t* at, std::size_t offset, std::uint32_t value) { std::memcpy(at + offset, &value, 4); }
+void put64(std::uint8_t* at, std::size_t offset, std::uint64_t value) { std::memcpy(at + offset, &value, 8); }
+
+// The measured shape (docs/d3d12_vulkan.md, "Device slot 70"), for any width.
+Slot70Args slot70_args(std::uint64_t va, std::uint64_t width) {
+    Slot70Args a{};
+    D3D12_RESOURCE_DESC r{};
+    r.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    r.Alignment = 0;
+    r.Width = width;
+    r.Height = 1;
+    r.DepthOrArraySize = 1;
+    r.MipLevels = 1;
+    r.Format = DXGI_FORMAT_UNKNOWN;
+    r.SampleDesc = {1, 0};
+    r.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    r.Flags = D3D12_RESOURCE_FLAG_NONE;
+    std::memcpy(a.resource, &r, sizeof(r));
+    put32(a.resource, 4, 0xDEADBEEFu);  // padding after Dimension: uninitialized in the title
+    D3D12_SHADER_RESOURCE_VIEW_DESC v{};
+    v.Format = DXGI_FORMAT_R32_TYPELESS;
+    v.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    v.Buffer.FirstElement = 0;
+    v.Buffer.NumElements = static_cast<UINT>(width / 4);
+    v.Buffer.StructureByteStride = 0;
+    v.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    std::memcpy(a.view, &v, sizeof(v));
+    put32(a.view, 0x0C, 0xCAFEF00Du);  // padding before the union
+    put32(a.view, 0x24, 0x5EC0DE11u);  // padding after Buffer.Flags: uninitialized in the title
+    put64(a.view, 0x28, va);
+    std::memset(a.view + 0x30, 0xA5, 0x10);
+    return a;
+}
+
+std::uint64_t call70(void* device, const void* resource, const void* view, std::uint64_t destination) {
+    return raw(device, 70, word(resource), word(view), destination);
+}
+
+int check_srv_at_va() {
+    using O = xs::SrvAtVaOutcome;
+    constexpr auto kCbv = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    constexpr std::uint64_t kInc = 32;                         // the mock's CBV_SRV_UAV increment
+    constexpr std::uint64_t kCustom = 0x0000630000000000ull;   // the title backing of the heap below
+    constexpr std::uint64_t kMeasuredWidth = 182452224;        // 174 MiB, the measured buffer
+    constexpr std::uint64_t kStart = 0x0000020000000000ull;    // a title VA, 64 KiB aligned
+    g_backing = {};
+    g_resolver = {};
+    xs::set_default_descriptor_heap_allocator(nullptr);
+    xs::set_descriptor_heap_allocator(nullptr);
+
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);  // level 9: the PC slot 70 (CreatePlacedResource1) exists
+    EXPECT(device && xs::device_slot_overridden(70));
+    Mock* other_mock = nullptr;
+    void* other = make_device(other_mock, 9, true);
+    EXPECT(other);
+
+    // Heaps: a plain one, a title-backed one, a sampler heap; another device's heap; one released before use.
+    void* plain = nullptr;
+    EXPECT(make_heap(device, kCbv, 4, &plain) == S_OK);
+    void* sampler = nullptr;
+    EXPECT(make_heap(device, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 4, &sampler) == S_OK);
+    void* foreign_heap = nullptr;
+    EXPECT(make_heap(other, kCbv, 4, &foreign_heap) == S_OK);
+    void* gone = nullptr;
+    EXPECT(make_heap(device, kCbv, 4, &gone) == S_OK);
+    const std::uint64_t gone_cpu = real_heap_of(gone)->heap_cpu;
+    EXPECT(release(gone) == 0);
+    xs::set_descriptor_heap_allocator(&kMockBackingAllocator);
+    g_backing.next = kCustom;
+    void* heap = nullptr;
+    EXPECT(make_heap(device, kCbv, 8, &heap) == S_OK && raw(heap, 9) == kCustom);
+    xs::set_descriptor_heap_allocator(nullptr);
+    const std::uint64_t real0 = real_heap_of(heap)->heap_cpu;
+    const std::uint64_t plain0 = real_heap_of(plain)->heap_cpu;
+
+    // The live buffers: the measured 174 MiB import, a small one with DENY_SHADER_RESOURCE, one of the other device.
+    Mock* buffer = new_mock(Kind::resource);
+    buffer->refs = 1;
+    Mock* denied = new_mock(Kind::resource);
+    denied->refs = 1;
+    Mock* foreign = new_mock(Kind::resource);
+    foreign->refs = 1;
+    constexpr std::uint64_t kDeniedStart = 0x0000030000000000ull, kForeignStart = 0x0000040000000000ull;
+    g_resolver.buffers[0] = {buffer, mock, kStart, kMeasuredWidth, false};
+    g_resolver.buffers[1] = {denied, mock, kDeniedStart, 0x10000, true};
+    g_resolver.buffers[2] = {foreign, other_mock, kForeignStart, 0x10000, false};
+    g_resolver.count = 3;
+    EXPECT(xs::set_device_buffer_at_va_resolver(device, &fake_buffer_resolver));
+    EXPECT(xs::set_device_buffer_at_va_resolver(other, &fake_buffer_resolver));
+    EXPECT(!xs::set_device_buffer_at_va_resolver(mock, &fake_buffer_resolver));  // not a proxy: nothing set
+    xs::reset_device_proxy_stats();
+    xs::reset_srv_at_va_stats();
+
+    // The measured call: the whole 174 MiB buffer by its base VA into a title-backed slot. The PC slot 18 receives the
+    // live buffer, the translated handle and a raw view of exactly the bytes asked for; the reference is balanced; the
+    // descriptions are not written; PC slot 70 is never reached.
+    {
+        const Slot70Args args = slot70_args(kStart, kMeasuredWidth);
+        Slot70Args call = args;
+        EXPECT(call70(device, call.resource, call.view, kCustom + 2 * kInc) == 0);
+        EXPECT(std::memcmp(&call, &args, sizeof(args)) == 0);
+        EXPECT(mock->calls[70] == 0 && xs::device_slot_hits(70) == 1);
+        EXPECT(mock->calls[18] == 1 && mock->args[18][0] == word(buffer) && mock->args[18][2] == real0 + 2 * kInc);
+        const D3D12_SHADER_RESOURCE_VIEW_DESC& srv = mock->srv;
+        EXPECT(srv.Format == DXGI_FORMAT_R32_TYPELESS && srv.ViewDimension == D3D12_SRV_DIMENSION_BUFFER &&
+               srv.Shader4ComponentMapping == D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+        EXPECT(srv.Buffer.FirstElement == 0 && srv.Buffer.NumElements == kMeasuredWidth / 4 &&
+               srv.Buffer.StructureByteStride == 0 && srv.Buffer.Flags == D3D12_BUFFER_SRV_FLAG_RAW);
+        EXPECT(buffer->refs == 1);  // the resolver's reference was released after the call
+        EXPECT(g_resolver.calls == 1 && g_resolver.last_real == mock && g_resolver.last_va == kStart &&
+               g_resolver.last_bytes == kMeasuredWidth);
+        EXPECT(xs::last_srv_at_va_outcome() == O::created && xs::srv_at_va_created_calls() == 1 &&
+               xs::srv_at_va_refused_calls() == 0);
+    }
+    // Size-independent: a 512-byte view 256 bytes into the buffer, into a plain heap's real slot (unchanged handle).
+    {
+        const Slot70Args args = slot70_args(kStart + 0x100, 0x200);
+        call70(device, args.resource, args.view, plain0 + 3 * kInc);
+        EXPECT(mock->calls[18] == 2 && mock->args[18][0] == word(buffer) && mock->args[18][2] == plain0 + 3 * kInc);
+        EXPECT(mock->srv.Buffer.FirstElement == 0x40 && mock->srv.Buffer.NumElements == 0x80 &&
+               mock->srv.Buffer.Flags == D3D12_BUFFER_SRV_FLAG_RAW && buffer->refs == 1);
+        // The last 16 bytes of the buffer exactly.
+        const Slot70Args tail = slot70_args(kStart + kMeasuredWidth - 16, 16);
+        call70(device, tail.resource, tail.view, kCustom + 7 * kInc);
+        EXPECT(mock->calls[18] == 3 && mock->srv.Buffer.FirstElement == (kMeasuredWidth - 16) / 4 &&
+               mock->srv.Buffer.NumElements == 4 && mock->args[18][2] == real0 + 7 * kInc && buffer->refs == 1);
+    }
+    // The PC slot 18 itself is unchanged: forwarded with the caller's own description and the translated handle.
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC pc{};
+        pc.Format = DXGI_FORMAT_R32_FLOAT;
+        pc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        pc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        pc.Buffer.FirstElement = 5;
+        pc.Buffer.NumElements = 7;
+        raw(device, 18, word(buffer), word(&pc), kCustom + kInc);
+        EXPECT(mock->calls[18] == 4 && mock->args[18][0] == word(buffer) && mock->args[18][1] == word(&pc) &&
+               mock->args[18][2] == real0 + kInc && mock->srv.Format == DXGI_FORMAT_R32_FLOAT &&
+               mock->srv.Buffer.FirstElement == 5 && mock->srv.Buffer.NumElements == 7);
+        EXPECT(mock->calls[70] == 0 && xs::srv_at_va_created_calls() == 3);
+    }
+
+    // Every refusal: no descriptor (slot 18 not called), PC slot 70 not called, the descriptions unchanged, no
+    // reference left behind, the refusal counted with its reason.
+    const std::uint64_t good_dest = kCustom + kInc;
+    const auto refused = [&](const Slot70Args& args, std::uint64_t destination, O want) {
+        Slot70Args call = args;
+        const unsigned srv_calls = mock->calls[18] + other_mock->calls[18];
+        const long refs[] = {buffer->refs, denied->refs, foreign->refs};
+        const std::uint64_t before = xs::srv_at_va_refused_calls();
+        const std::uint64_t created = xs::srv_at_va_created_calls();
+        call70(device, call.resource, call.view, destination);
+        const bool ok = mock->calls[18] + other_mock->calls[18] == srv_calls && mock->calls[70] == 0 &&
+                        other_mock->calls[70] == 0 && buffer->refs == refs[0] && denied->refs == refs[1] &&
+                        foreign->refs == refs[2] && std::memcmp(&call, &args, sizeof(args)) == 0 &&
+                        xs::last_srv_at_va_outcome() == want && xs::srv_at_va_refused_calls() == before + 1 &&
+                        xs::srv_at_va_created_calls() == created;
+        if (!ok)
+            std::fprintf(stderr, "%s: slot 70 refusal: outcome %d (want %d), slot 18 calls %u -> %u\n", g_label,
+                         static_cast<int>(xs::last_srv_at_va_outcome()), static_cast<int>(want), srv_calls,
+                         mock->calls[18] + other_mock->calls[18]);
+        return ok;
+    };
+    // The base every refusal below changes in one way only; it succeeds as it is.
+    const Slot70Args good = slot70_args(kStart, 0x1000);
+    call70(device, good.resource, good.view, good_dest);
+    EXPECT(mock->calls[18] == 5 && mock->args[18][2] == real0 + kInc && buffer->refs == 1 &&
+           xs::last_srv_at_va_outcome() == O::created);
+
+    // Every field of the shape (padding is never examined; see slot70_args).
+    {
+        const auto mutate = [&](bool in_view, std::size_t offset, std::size_t bytes, std::uint64_t value) {
+            Slot70Args a = good;
+            std::uint8_t* at = (in_view ? a.view : a.resource) + offset;
+            std::memcpy(at, &value, bytes);
+            return a;
+        };
+        struct Field {
+            bool view;
+            std::size_t offset, bytes;
+            std::uint64_t value;
+        };
+        constexpr std::size_t kBuf = offsetof(D3D12_SHADER_RESOURCE_VIEW_DESC, Buffer);
+        const Field fields[] = {
+            {false, offsetof(D3D12_RESOURCE_DESC, Dimension), 4, D3D12_RESOURCE_DIMENSION_TEXTURE2D},
+            {false, offsetof(D3D12_RESOURCE_DESC, Alignment), 8, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT},
+            {false, offsetof(D3D12_RESOURCE_DESC, Height), 4, 2},
+            {false, offsetof(D3D12_RESOURCE_DESC, DepthOrArraySize), 2, 2},
+            {false, offsetof(D3D12_RESOURCE_DESC, MipLevels), 2, 0},
+            {false, offsetof(D3D12_RESOURCE_DESC, Format), 4, DXGI_FORMAT_R32_TYPELESS},
+            {false, offsetof(D3D12_RESOURCE_DESC, SampleDesc), 4, 2},
+            {false, offsetof(D3D12_RESOURCE_DESC, SampleDesc) + 4, 4, 1},
+            {false, offsetof(D3D12_RESOURCE_DESC, Layout), 4, D3D12_TEXTURE_LAYOUT_UNKNOWN},
+            {false, offsetof(D3D12_RESOURCE_DESC, Flags), 4, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS},
+            {false, offsetof(D3D12_RESOURCE_DESC, Flags), 4, 0x20004},
+            {true, offsetof(D3D12_SHADER_RESOURCE_VIEW_DESC, Format), 4, DXGI_FORMAT_R32_UINT},
+            {true, offsetof(D3D12_SHADER_RESOURCE_VIEW_DESC, ViewDimension), 4, D3D12_SRV_DIMENSION_TEXTURE2D},
+            {true, offsetof(D3D12_SHADER_RESOURCE_VIEW_DESC, Shader4ComponentMapping), 4,
+             D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(2, 1, 0, 3)},
+            {true, kBuf + offsetof(D3D12_BUFFER_SRV, FirstElement), 8, 1},          // no established offset meaning
+            {true, kBuf + offsetof(D3D12_BUFFER_SRV, NumElements), 4, 0x1000 / 4 - 1},  // not Width / 4
+            {true, kBuf + offsetof(D3D12_BUFFER_SRV, NumElements), 4, 0x1000 / 4 + 1},
+            {true, kBuf + offsetof(D3D12_BUFFER_SRV, StructureByteStride), 4, 4},
+            {true, kBuf + offsetof(D3D12_BUFFER_SRV, Flags), 4, D3D12_BUFFER_SRV_FLAG_NONE},
+            {true, kBuf + offsetof(D3D12_BUFFER_SRV, Flags), 4, 3},
+        };
+        for (const Field& f : fields) EXPECT(refused(mutate(f.view, f.offset, f.bytes, f.value), good_dest, O::unsupported_shape));
+    }
+    // Widths and VAs: zero, unaligned, too wide for a raw V#, overflowing, unaligned VA, null VA.
+    EXPECT(refused(slot70_args(kStart, 0), good_dest, O::invalid_range));
+    EXPECT(refused(slot70_args(kStart, 6), good_dest, O::invalid_range));
+    EXPECT(refused(slot70_args(kStart, 0x100000000ull), good_dest, O::invalid_range));
+    EXPECT(refused(slot70_args(0xFFFFFFFFFFFFFF00ull, 0x200), good_dest, O::invalid_range));
+    EXPECT(refused(slot70_args(kStart + 4, 0x100), good_dest, O::invalid_range));
+    EXPECT(refused(slot70_args(kStart + 8, 0x100), good_dest, O::invalid_range));
+    EXPECT(refused(slot70_args(0, 0x100), good_dest, O::invalid_range));
+
+    // Destinations: null, off a descriptor boundary, past the title range, a native handle the proxy never saw, a
+    // sampler heap's slot, another device's heap, a released heap's slot.
+    EXPECT(refused(good, 0, O::invalid_destination));
+    EXPECT(refused(good, kCustom + kInc / 2, O::invalid_destination));
+    EXPECT(refused(good, kCustom + 8 * kInc, O::invalid_destination));
+    EXPECT(refused(good, 0x4242000, O::invalid_destination));
+    EXPECT(refused(good, real_heap_of(sampler)->heap_cpu, O::invalid_destination));
+    EXPECT(refused(good, real_heap_of(foreign_heap)->heap_cpu, O::invalid_destination));
+    EXPECT(refused(good, gone_cpu, O::invalid_destination));
+
+    // VAs: none of this device's buffers, a range that runs past the buffer (never cut to fit), a buffer of another
+    // device (whose own proxy does find it), a released buffer, a buffer that denies shader-resource access.
+    EXPECT(refused(slot70_args(kStart + kMeasuredWidth, 0x100), good_dest, O::unknown_va));
+    EXPECT(refused(slot70_args(kStart + kMeasuredWidth - 0x100, 0x200), good_dest, O::unknown_va));
+    EXPECT(refused(slot70_args(kStart - 0x100, 0x200), good_dest, O::unknown_va));
+    EXPECT(refused(slot70_args(kForeignStart, 0x100), good_dest, O::unknown_va));
+    {
+        void* foreign_dest = reinterpret_cast<void*>(real_heap_of(foreign_heap)->heap_cpu);
+        const Slot70Args theirs = slot70_args(kForeignStart, 0x100);
+        call70(other, theirs.resource, theirs.view, reinterpret_cast<std::uint64_t>(foreign_dest));
+        EXPECT(other_mock->calls[18] == 1 && other_mock->args[18][0] == word(foreign) && foreign->refs == 1 &&
+               mock->calls[70] == 0 && other_mock->calls[70] == 0);
+    }
+    buffer->refs = 0;  // as a buffer whose last Release is in progress: the resolver cannot take a reference
+    EXPECT(refused(good, good_dest, O::unknown_va));
+    buffer->refs = 1;
+    EXPECT(refused(slot70_args(kDeniedStart, 0x100), good_dest, O::not_shader_readable));
+
+    // A broken or absent resolver.
+    g_resolver.mode = ResolverMode::fail;
+    EXPECT(refused(good, good_dest, O::resolver_failed));
+    g_resolver.mode = ResolverMode::short_range;
+    EXPECT(refused(good, good_dest, O::resolver_failed));          // its reference is released all the same
+    g_resolver.mode = ResolverMode::ref_with_not_found;
+    EXPECT(refused(good, good_dest, O::unknown_va));
+    g_resolver.mode = ResolverMode::normal;
+    EXPECT(xs::set_device_buffer_at_va_resolver(device, nullptr));
+    EXPECT(refused(good, good_dest, O::no_resolver));
+    EXPECT(xs::set_device_buffer_at_va_resolver(device, &fake_buffer_resolver));
+
+    // Descriptions that cannot be read: null, a no-access page, a guard page, and both kinds running off the end of a
+    // committed page into a reserved one. Nothing is copied from them and nothing is written.
+    {
+        const auto unreadable = [&](std::uint64_t resource_word, std::uint64_t view_word) {
+            const unsigned srv_calls = mock->calls[18];
+            const std::uint64_t before = xs::srv_at_va_refused_calls();
+            raw(device, 70, resource_word, view_word, good_dest);
+            return mock->calls[18] == srv_calls && mock->calls[70] == 0 &&
+                   xs::last_srv_at_va_outcome() == O::unreadable && xs::srv_at_va_refused_calls() == before + 1 &&
+                   buffer->refs == 1;
+        };
+        Slot70Args args = good;
+        EXPECT(unreadable(0, word(args.view)));
+        EXPECT(unreadable(word(args.resource), 0));
+        auto* const pages = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 0x3000, MEM_RESERVE, PAGE_NOACCESS));
+        EXPECT(pages != nullptr);
+        EXPECT(VirtualAlloc(pages, 0x1000, MEM_COMMIT, PAGE_READWRITE) == pages);
+        EXPECT(VirtualAlloc(pages + 0x2000, 0x1000, MEM_COMMIT, PAGE_READWRITE | PAGE_GUARD) == pages + 0x2000);
+        // Straddling into the reserved page at +0x1000: the view needs 0x30 bytes, the resource 0x38.
+        std::uint8_t* const view_end = pages + 0x1000 - 0x20;
+        std::memcpy(view_end, args.view, 0x20);
+        std::uint8_t* const resource_end = pages + 0x1000 - 0x30;
+        EXPECT(unreadable(word(args.resource), word(view_end)));
+        std::memcpy(resource_end, args.resource, 0x30);
+        EXPECT(unreadable(word(resource_end), word(args.view)));
+        EXPECT(unreadable(word(pages + 0x1000), word(args.view)));  // reserved, not committed
+        EXPECT(unreadable(word(args.resource), word(pages + 0x2000)));  // guard page: not touched
+        DWORD old = 0;
+        EXPECT(VirtualProtect(pages, 0x1000, PAGE_NOACCESS, &old) != FALSE);
+        EXPECT(unreadable(word(pages), word(args.view)));
+        // The guard page is still armed: the proxy never touched it.
+        MEMORY_BASIC_INFORMATION info{};
+        EXPECT(VirtualQuery(pages + 0x2000, &info, sizeof(info)) == sizeof(info) && (info.Protect & PAGE_GUARD));
+        EXPECT(VirtualFree(pages, 0, MEM_RELEASE) != FALSE);
+    }
+
+    // A base PC device (44 slots, no PC slot 70): still the console view, never a refusal past the PC table.
+    {
+        Mock* base = nullptr;
+        void* base_device = make_device(base, 0, false);
+        EXPECT(base_device);
+        call70(base_device, good.resource, good.view, good_dest);  // no resolver, no heap of its own
+        EXPECT(base->calls[70] == 0 && base->calls[18] == 0 && xs::last_srv_at_va_outcome() == O::invalid_destination);
+        EXPECT(release(base_device) == 0 && base->refs == 0);
+    }
+
+    EXPECT(xs::srv_at_va_created_calls() == 5 && mock->calls[70] == 0);
+    EXPECT(release(heap) == 0 && release(plain) == 0 && release(sampler) == 0 && release(foreign_heap) == 0);
+    EXPECT(buffer->refs == 1 && denied->refs == 1 && foreign->refs == 1);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    EXPECT(release(other) == 0 && other_mock->refs == 0);
+    g_resolver = {};
+    std::printf("%s: device slot 70 writes a raw view of the live buffer at the GPU VA through PC slot 18 with the "
+                "translated handle (measured 174 MiB shape and smaller ones), never PC slot 70; every shape, range, "
+                "destination, VA, resolver and unreadable-description refusal writes nothing and leaves no reference\n",
+                g_label);
+    return 0;
+}
+
 // ---- 10. The refused tail and the guard region ----
 
 int check_tail(bool want_guarded) {
@@ -2612,6 +3013,11 @@ int main(int argc, char** argv) {
     no_dialogs();
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc == 2 && std::strcmp(argv[1], "--slot133") == 0) return check_placed_resource_refusal();
+    if (argc == 2 && std::strcmp(argv[1], "--slot70") == 0) {
+        // The same checks with the D3D12 trace on (as palmwave --trace-d3d12): every refusal is a traced line.
+        rt::d3d12_trace::set_enabled(true);
+        return check_srv_at_va();
+    }
     if (argc == 3 && std::strcmp(argv[1], "--host-import-experiment") == 0) {
         if (std::strcmp(argv[2], "on") == 0) return run_host_import_experiment(true);
         if (std::strcmp(argv[2], "off") == 0) return run_host_import_experiment(false);
@@ -2620,13 +3026,15 @@ int main(int argc, char** argv) {
     if (argc == 2) {
         if (std::strcmp(argv[1], "--env-slots") == 0) return run_env_slots(true);
         if (std::strcmp(argv[1], "--env-slots-invalid") == 0) return run_env_slots(false);
+        if (std::strcmp(argv[1], "--env-slots-70") == 0) return run_env_slots(true, true);
         return run_fault_mode(argv[1]);
     }
     if (argc != 1) return 2;
     if (check_placed_resource_refusal() || check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_xbox_queue_descriptions() ||
         check_lists() || check_shared_base_list() || check_experimental_flush() ||
-        check_custom_heap_properties() || check_descriptor_heaps() || check_list_descriptor_handles())
+        check_custom_heap_properties() || check_descriptor_heaps() || check_list_descriptor_handles() ||
+        check_srv_at_va())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;

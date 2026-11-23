@@ -945,6 +945,13 @@ if(BUILD_TESTING)
     # The routes are read once per process, so each override case is its own test.
     add_test(NAME xs_proxy_mock_env_slots COMMAND xs_proxy_mock_test --env-slots)
     add_test(NAME xs_proxy_mock_env_slots_invalid COMMAND xs_proxy_mock_test --env-slots-invalid)
+    # A configured route moved onto device slot 70 keeps priority over the built-in slot-70 view.
+    add_test(NAME xs_proxy_mock_env_slots_70 COMMAND xs_proxy_mock_test --env-slots-70)
+    # Device slot 70 (a raw buffer SRV named by GPU VA) with the D3D12 trace on: its refusals are traced explicitly.
+    add_test(NAME xs_proxy_mock_slot70_trace COMMAND xs_proxy_mock_test --slot70)
+    set_tests_properties(xs_proxy_mock_slot70_trace PROPERTIES
+                         PASS_REGULAR_EXPRESSION "[(]device slot 70[)] unsupported"
+                         FAIL_REGULAR_EXPRESSION "xs_proxy_mock line [0-9]+:")
     # Slot 133's opt-in experiment (shims/experimental_host_import.h), read once per process: strict by default (the
     # variable unset, "0" or another value), the experimental tuple only with exactly "1". The default run asserts the
     # variable is not "1", so it is unset for it.

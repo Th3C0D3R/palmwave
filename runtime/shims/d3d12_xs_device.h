@@ -12,6 +12,11 @@
 //   slot 67   CreateComputePipelineState from native code (desc, iid, out): converts the Xbox native-code desc
 //             (+0x00 root signature, +0x28 code, +0x30 size) to D3D12_COMPUTE_PIPELINE_STATE_DESC and forwards
 //             to PC CreateComputePipelineState (slot 11). The PC slot 67 is CreateProtectedResourceSession1.
+//   slot 70   void (resource desc, extended view desc, CPU destination): a raw buffer shader-resource view of the
+//             buffer at a console GPU VA, written by the PC CreateShaderResourceView (slot 18) for the live buffer the
+//             device's resolver finds there. Never forwarded: the PC slot 70 is ID3D12Device8::CreatePlacedResource1.
+//             Only the bounded raw-buffer shape below is supported; anything else is refused with the destination
+//             untouched (see "Device slot 70" further down).
 //   slot 76   resource creation -> PC CreateCommittedResource (PC slot 27), with the Xbox layout word ignored.
 //   slot 133  CreatePlacedResourceX(va, desc, state, clear, riid, out) -> the registered host-page handler, only for
 //             a plain row-major buffer, supported flags and no clear value. Unknown flags/layouts are refused without
@@ -46,7 +51,7 @@
 // wrapper and compares it with a hidden-pointer call against the real heap.
 //
 // Every other PC device slot is forwarded by a generated thunk that swaps `this` to the PC device. The proxy's
-// vtable therefore follows the PC device order, with slots 62 and 76 and the public HLE's 48/73/78/79/80 deliberately
+// vtable therefore follows the PC device order, with slots 62, 70 and 76 and the public HLE's 48/73/78/79/80 deliberately
 // shadowed. The full Xbox vtable order is not known from the spec; slots beyond the PC device's own vtable return
 // E_NOTIMPL and log once.
 //
@@ -197,10 +202,80 @@ using PlacedAtVaHandler = HRESULT (*)(ID3D12Device* real, void* va, const D3D12_
                                       std::uint32_t initial_state, REFIID riid, void** out);
 void set_placed_at_va_handler(PlacedAtVaHandler handler);
 
+// ---- Device slot 70: a raw buffer SRV named by console GPU VA ----
+//
+// The console call is void(this, const D3D12_RESOURCE_DESC* resource, const view* view, D3D12_CPU_DESCRIPTOR_HANDLE
+// destination). `view` is 64 bytes: a desktop D3D12_SHADER_RESOURCE_VIEW_DESC (40 bytes) and, at +0x28, the uint64
+// console GPU VA of the buffer. No resource object is passed; the VA names it. The PC slot 70 is
+// ID3D12Device8::CreatePlacedResource1, which would read the destination as a description, so it is never reached.
+// Call shape measured on a local offline Xbox Series executable probe; PR #7066 (tedin7, 8e700080, GPL-3.0) and
+// FiveStar (18e225d2, GPL-3.0-or-later) describe the same 0x28 + VA layout. Bytes 0x30..0x3F have no established
+// meaning for a buffer view and are not read.
+//
+// The one supported shape (any other is refused; nothing is masked, clamped or guessed):
+//   resource  Dimension BUFFER, Alignment 0, Width > 0 and a multiple of 4 and at most 0xFFFFFFFC, Height 1,
+//             DepthOrArraySize 1, MipLevels 1, Format UNKNOWN, SampleDesc {1, 0}, Layout ROW_MAJOR, Flags NONE.
+//             The DWORD at +4 is padding and is not read. Flags describe the view, not the resource's creation flags
+//             (the measured buffer was created with ALLOW_UNORDERED_ACCESS), so they are not compared with them.
+//   view      Format R32_TYPELESS, ViewDimension BUFFER, Shader4ComponentMapping D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+//             Buffer.FirstElement 0, Buffer.NumElements Width / 4, Buffer.StructureByteStride 0, Buffer.Flags RAW
+//             exactly. The padding at +0x0C and +0x24 is not read.
+//   VA        non-zero, a multiple of D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT (16), VA + Width without overflow, and
+//             [VA, VA + Width) wholly inside ONE live buffer of this device that allows shader-resource access.
+//   dest      a CBV_SRV_UAV descriptor slot of a heap this device proxy created (slot 14), on a descriptor boundary:
+//             inside a title-backed range (translated to the real heap) or inside the real range of a plain heap.
+//             Any other handle, including a native heap the proxy never saw, is refused: there is no registry entry
+//             to validate it against.
+// On success the PC CreateShaderResourceView (slot 18) is called with the live buffer and the same byte range as a
+// raw view: FirstElement (VA - buffer start) / 4, NumElements Width / 4. Nothing is clamped to the buffer.
+// On every refusal nothing is forwarded, the destination descriptor is untouched, the caller's descriptions are not
+// written, the refusal is counted, logged and traced ("unsupported" for a shape this layer does not implement,
+// "refused" for an invalid argument), and no reference is left behind. The method is void, so the title is not told.
+//
+// The buffer resolver is per device proxy. It finds the buffer that holds the VA and returns it with one reference
+// added for the caller, taken safely against a concurrent last Release (rt::d3d12::set_device_outer installs the
+// Vulkan layer's). Without one, slot 70 refuses every call.
+struct BufferAtVa {
+    ID3D12Resource* resource = nullptr;  // one reference, the caller's to release
+    std::uint64_t start = 0;             // the buffer's first console VA (what its GetGPUVirtualAddress returns)
+    std::uint64_t size = 0;              // its width in bytes
+};
+enum class BufferAtVaStatus {
+    found,                // `out` is filled: [va, va + bytes) lies in [start, start + size)
+    not_found,            // no live buffer of this device holds all of [va, va + bytes)
+    not_shader_readable,  // the buffer holding it denies shader-resource access (or is not a plain buffer)
+    failed,               // the resolver could not answer
+};
+// `real` is the device behind the proxy. On anything but `found`, out->resource must be null.
+using BufferAtVaResolver = BufferAtVaStatus (*)(ID3D12Device* real, std::uint64_t va, std::uint64_t bytes,
+                                                BufferAtVa* out);
+// `device` is the proxy or its DXGI pointer. False, with a line on stderr, when it is neither: nothing is set then.
+// Null removes the resolver.
+bool set_device_buffer_at_va_resolver(void* device, BufferAtVaResolver resolver);
+
+// What the last slot-70 call did (any device, any thread; for tests).
+enum class SrvAtVaOutcome {
+    none,                // no call yet (or reset)
+    created,             // a raw view was written through the PC slot 18
+    unreadable,          // a description pointer was null or its bytes are not all committed and readable
+    unsupported_shape,   // the descriptions are not the supported raw-buffer shape
+    invalid_range,       // a zero, misaligned or overflowing VA / width
+    invalid_destination, // not a CBV_SRV_UAV descriptor slot of a heap this device proxy created
+    no_resolver,         // no buffer resolver installed on this proxy
+    unknown_va,          // no live buffer of this device holds the whole range
+    not_shader_readable, // the buffer denies shader-resource access
+    resolver_failed,     // the resolver failed or answered a range that does not hold the request
+};
+SrvAtVaOutcome last_srv_at_va_outcome();
+std::uint64_t srv_at_va_created_calls();
+std::uint64_t srv_at_va_refused_calls();
+void reset_srv_at_va_stats();
+
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14, 17-24 (CPU descriptor handles translated), 26 (the console's struct-return
 // form), 31/34/35/45/46/50 (proxies unwrapped),
-// 32 and 36 (fence proxies), 48/73 and 78/79/80 (the Xbox slots above, at their configured indices), 62, 67, 76 and 133.
+// 32 and 36 (fence proxies), 48/73 and 78/79/80 (the Xbox slots above, at their configured indices), 62, 67, 70, 76
+// and 133. A configured route moved onto slot 70 takes precedence over the built-in slot-70 view.
 // Slot 10 is intentionally false: the measured 9/10 handle conversion is on the heap proxy, and device slot 9 is
 // CreateCommandAllocator, which the proxy handles for the allocator proxy.
 bool device_slot_overridden(unsigned slot);

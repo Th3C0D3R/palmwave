@@ -37,6 +37,9 @@
 namespace {
 
 using XboxHeapHandleFn = std::uint64_t(WINAPI*)(void* heap);  // heap slots 9/10: handle in RAX
+// Device slot 70: (resource desc, 64-byte view desc with the console VA at +0x28, CPU destination) (docs/d3d12_vulkan.md).
+using XboxSrvAtVaFn = std::uint64_t(WINAPI*)(void* device, std::uint64_t resource_desc, std::uint64_t view_desc,
+                                             std::uint64_t destination);
 // Device slot 62 as XboxBvhBuilder.dll calls it on 1.0.2.1: (desc, 0, 0, riid, out) (main's 28cf235).
 using XboxComputePipelineFn = HRESULT(WINAPI*)(void* device, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, std::uint64_t,
                                                std::uint64_t, const IID*, void**);
@@ -787,13 +790,37 @@ int main() {
             const auto slot_gpu = [&](UINT idx) { return D3D12_GPU_DESCRIPTOR_HANDLE{gpu + idx * inc}; };
             std::uint8_t zeros[32] = {};
 
-            // Slot 1: Raw buffer SRV A (FirstElement = 0, NumElements = 32 -> 128 bytes; words 32..63 must read 0).
+            // Slot 1: Raw buffer SRV A (FirstElement = 0, NumElements = 32 -> 128 bytes; words 32..63 must read 0),
+            // written by Xbox device slot 70 from the console VA alone: a 128-byte buffer resource desc and the 64-byte
+            // view desc with srv_va at +0x28. The GPU pass below reads slot 1, so this is the slot-70 shader regression.
             D3D12_SHADER_RESOURCE_VIEW_DESC raw_a{};
             raw_a.Format = DXGI_FORMAT_R32_TYPELESS;
             raw_a.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
             raw_a.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             raw_a.Buffer = {0, 32, 0, D3D12_BUFFER_SRV_FLAG_RAW};
-            device->CreateShaderResourceView(srv_default.p, &raw_a, slot_cpu(1));
+            // CPU baseline: PC slot 18 for the same view, into slot 7 (rewritten by the refusal checks below).
+            device->CreateShaderResourceView(srv_default.p, &raw_a, slot_cpu(7));
+            {
+                alignas(8) std::uint8_t res70[sizeof(D3D12_RESOURCE_DESC)] = {};
+                alignas(8) std::uint8_t view70[64] = {};
+                const D3D12_RESOURCE_DESC r70 = buffer_desc(32 * 4, D3D12_RESOURCE_FLAG_NONE);
+                std::memcpy(res70, &r70, sizeof(r70));
+                std::memcpy(view70, &raw_a, sizeof(raw_a));
+                const std::uint64_t va70 = srv_va;
+                std::memcpy(view70 + 0x28, &va70, sizeof(va70));
+                // Poison the destination (it still holds a CBV from the pass above): a slot 70 that writes nothing
+                // fails here and in the decode below (EXPECT returns before any dispatch), never passing on a leftover
+                // correct descriptor.
+                std::memset(reinterpret_cast<void*>(slot_cpu(1).ptr), 0xA5, inc);
+                rt::d3d12_xs::reset_srv_at_va_stats();
+                reinterpret_cast<XboxSrvAtVaFn>(slot(device.p, 70))(device.p, reinterpret_cast<std::uint64_t>(res70),
+                                                                    reinterpret_cast<std::uint64_t>(view70),
+                                                                    std::uint64_t(slot_cpu(1).ptr));
+                EXPECT(rt::d3d12_xs::last_srv_at_va_outcome() == rt::d3d12_xs::SrvAtVaOutcome::created);
+                EXPECT(rt::d3d12_xs::srv_at_va_created_calls() == 1 && rt::d3d12_xs::srv_at_va_refused_calls() == 0);
+                EXPECT(std::memcmp(reinterpret_cast<const void*>(slot_cpu(1).ptr),
+                                   reinterpret_cast<const void*>(slot_cpu(7).ptr), inc) == 0);
+            }
 
             // Slot 2: Raw buffer SRV B (FirstElement = 64, NumElements = 32 -> negative control shifted by +64 dwords).
             D3D12_SHADER_RESOURCE_VIEW_DESC raw_b = raw_a;

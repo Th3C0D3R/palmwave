@@ -2459,6 +2459,36 @@ The trace will enumerate them.
       does not establish console flag semantics. The 32 WC views reported RW after Vulkan cleanup without a
       VirtualProtect call in the probe, but when and why that protection changed remain unknown. The probe adapts
       Zunraz's public reproducer at `d7d2d4076bfa2411476305d0ca8ca3fc19c6a77a` (GPL-3.0).
+- **Device slot 70** (a raw buffer SRV named by console VA) **implemented for one bounded shape**
+  (`proxy_create_srv_at_va_x` in `d3d12_xs_device.cpp`, `buffer_at_va` in `d3d12_vulkan_device.cpp`). The Xbox
+  Series call is `(const D3D12_RESOURCE_DESC*, const view desc*, D3D12_CPU_DESCRIPTOR_HANDLE)`. The view desc is
+  64 bytes: the PC `D3D12_SHADER_RESOURCE_VIEW_DESC` (40 bytes) followed by the buffer's GPU VA at +0x28; bytes
+  0x30..0x3F are not read, and padding is ignored. FiveStar (`18e225d2cbd526ba710beb69b7884d6c758d9291`, GPL-3.0-or-later)
+  agrees with this 64-byte layout and the VA at +0x28.
+  - Accepted shape only: a `BUFFER` resource desc with Alignment 0, Height/DepthOrArraySize/MipLevels 1, Format
+    `UNKNOWN`, SampleDesc {1, 0}, `ROW_MAJOR`, Flags `NONE`, Width non-zero, a multiple of 4 and at most
+    0xFFFFFFFC; a view of `R32_TYPELESS`, `BUFFER`, the default mapping, FirstElement 0, NumElements = Width / 4,
+    stride 0 and Flags exactly `RAW`; a non-zero, 16-byte aligned VA with no overflow. Anything else is refused.
+  - The proxy translates the destination like slots 17..24 (title-backed heaps included), then asks the device's
+    resolver for a **live buffer of this device** that holds all of `[VA, VA + Width)`, and writes PC slot 18's raw
+    SRV for that buffer with FirstElement `(VA - start) / 4`. Nothing is cut to fit, nothing is copied, no shadow or
+    stand-in buffer is made. The resolver searches only the device's own VA index and also checks the found
+    resource's device state, because two devices may share one context. It takes its reference under the index lock
+    with `try_add_ref` (a buffer in its last `Release` is skipped); the proxy releases it exactly once after the
+    write. Acceleration-structure buffers, images and `DENY_SHADER_RESOURCE` buffers are refused.
+  - Every refusal (unreadable descriptions, unsupported shape, invalid range, invalid destination, no resolver,
+    unknown VA, not shader-readable, inconsistent resolver answer) leaves the destination unchanged, holds no
+    reference and counts in `srv_at_va_refused_calls`. Its reason is logged (the first of each kind, every one while
+    tracing) and the D3D12 trace records `unsupported` for a shape mismatch, `refused` otherwise.
+  - Tests: `xs_proxy_mock_test` (`check_srv_at_va`, `--slot70`: raw ABI, every shape field, ranges, destinations,
+    resolver faults, foreign devices, reference balance); `d3d12_compute_test` writes its raw SRV slot 1 through
+    slot 70 on an arena buffer (destination poisoned first, bytes equal to PC slot 18's) and a compute shader reads
+    it through the descriptor table (32 values plus 32 out-of-bounds zeros); `d3d12_host_placed_test`
+    (`check_slot70`) writes the view over a real host import into a title-backed heap and compares it with PC slot
+    18, with canaries for refusals.
+  - Not established: a shader read through a slot-70 view of a **host import**. Its V# base is the title's host VA,
+    and the shader adds `heap_base` (section 3.3), so that read is not run. Neither are the console's behaviour for
+    other shapes or offsets, or any frame.
 - `CreateReservedResource` **implemented** (`d3d12_vulkan_device.cpp`, `src/resource_tiling.h`, checked by
   `d3d12_vulkan_device_test` and `resource_tiling_test`):
   - `CreateReservedResource`, `CreateReservedResource1` (no protected sessions) and `CreateReservedResource2`
