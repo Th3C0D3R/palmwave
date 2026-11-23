@@ -493,6 +493,18 @@ $env:PALMWAVE_VK_VALIDATION = '1'
 .\runtime\build\RelWithDebInfo\d3d12_resource_desc_test.exe
 ```
 
+`d3d12_allocation_info_test` calls `GetResourceAllocationInfo` and `GetResourceAllocationInfo1` through the PC
+`ID3D12Device`/`ID3D12Device4` interfaces of the Vulkan-backed device. It compares each texture answer with a real
+`VkImage` created on the same `VkDevice` from a `VkImageCreateInfo` written out in the test, then destroyed without
+memory. The main description is a 3840x2160 RGBA8 render-target/UAV texture whose flags also carry the opaque bits
+`0x00300000`; a copy with flags `0x5` is the control. A three-resource array checks offsets, per-resource
+alignments and the total, alongside the refusals the current code defines. The output records the adapter, driver,
+raw Vulkan requirements and D3D12 answers. These source-crafted cases do not establish what the extra bits mean or
+show that console allocation or tiling is equivalent. On 2026-11-23, this test passed 56 checks with no skips or
+Vulkan validation errors on an NVIDIA GeForce RTX 5080, driver 621.14 (Vulkan 1.4.357): the 3840x2160 oracle
+reported 33,423,360 bytes with 1,024-byte alignment, and both D3D12 flag variants reported 33,423,360 bytes with
+65,536-byte alignment. This measurement applies to those descriptions on that device and driver.
+
 `d3d12_placed_dimensions_test` places 1D and 3D textures (arrays, mips, BC1, UAV and render targets, plus a 2D
 control) in heaps big enough for both sides' `GetResourceAllocationInfo`, at offset 0 and at 64 KiB, on the
 Vulkan-backed device and on Windows D3D12 (the default adapter and WARP), and compares the answers and `GetDesc`. A
