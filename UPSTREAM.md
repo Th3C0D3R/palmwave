@@ -286,3 +286,28 @@ Eight Xbox Series device slots now reach PC `ID3D12Device4` and `ID3D12Device8` 
 - **Tests.** CPU: `xs_proxy_mock_committed_texture_experiment` and `xs_proxy_mock_committed_texture_with_host_import` (`--committed-texture-experiment`, also part of the default `xs_proxy_mock` run). GPU: `d3d12_committed_texture` (`runtime/test/d3d12_committed_texture_test.cpp`, with hand-written GLSL fixtures `runtime/test/glsl/cs_committed_texture_{write,read}.comp`, not translated RDNA2). OpenAI Codex ran 17/17 CPU CTests successfully (0.37 s), then the GPU test on RTX 5080 / 621.14: PASS in 0.53 s, validation and synchronization validation enabled, zero errors. The same image produced 11,520 exact clear texels and 24,576 exact SRV texels after UAV writes, with an untouched-clear control patch. The CPU fixture was corrected after review: the last byte of the 64-byte DESC1 is part of the feedback depth, not padding; only actual padding at +4 is mutated. This proves the committed-image host path, not the separate host-import/arena shader path.
 - **Re-evaluation.** The first different tuple or console flag requires a common, evidenced rule and a meaningful oracle, not another tuple exception. The current default remains strict. A subsequent offline application probe created two matching 4K images and called SRV/RTV/UAV creation, then stopped at a separate allocation-accounting assertion whose contract remains under investigation: 2,249 D3D12 events, no draw, submission or present. That observation does not prove texture metadata semantics or a rendered frame.
 - **Credits.** Coded with Claude Code (Claude Opus 5.5), reviewed and tested by OpenAI Codex, as a Moon AI project contribution. No game data was provided to the coding tool. This is a component experiment, not a frame.
+
+
+## Experimental allocator-hook pages behind a committed texture
+
+Original Palmwave integration built on its existing XMem hook bridge, pin registry
+and Vulkan retirement path. Claude Code (Claude Opus 5.5) implemented the candidate
+and synthetic tests with source-only tools as a Moon AI project contribution.
+OpenAI Codex independently reviewed the lifetime, fixed partial-retirement and
+enqueue allocation failures, corrected test claims, compiled, and ran the tests.
+The coding session reached its configured turn limit after producing the core
+and tests; it did not run the GPU or the executable.
+
+Public comparisons used OpenScarlett (MIT, revision
+`87cdba6a16052a5809f904ed5725d70e50521744`), upstream PR #7240
+(jacksonslab, GPL-3.0, `d61755d4d1d02f9503f63448e1ebcc4ab361a3d0`) and
+PR #7411 (garuspl, GPL-3.0, `a6e85125d86ef64bfdb4a20fd76d3964532e59c1`).
+Their separate texture allocations were not imported as a storage-identity
+solution. No XCL implementation was copied. The slot-127 ABI attribution above
+remains unchanged.
+
+Validation: 2/2 new CPU CTests passed in 0.17 s; the runtime hook-backed texture
+GPU CTest passed in 0.87 s on RTX 5080 / 621.14, Vulkan and synchronization
+validation enabled, zero errors. This proves the synthetic imported-image
+contract and lifetime, not console DCC/tiling, a translated texture shader or
+a rendered executable frame.

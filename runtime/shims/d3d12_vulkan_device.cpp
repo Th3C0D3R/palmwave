@@ -20,6 +20,7 @@
 #include "../src/gfx10_descriptors.h"
 #include "../src/imported_view_address.h"
 #include "../src/depth24_fragment.h"
+#include "../src/hook_backed_image.h"
 #include "../src/uav_clear.h"
 #include "../src/vulkan_bindless.h"
 #include "../src/vulkan_memory.h"
@@ -648,6 +649,15 @@ struct DeviceState {
     PFN_vkGetMemoryHostPointerPropertiesEXT get_host_pointer_properties = nullptr;
     PFN_vkGetPhysicalDeviceExternalBufferProperties external_buffer_properties = nullptr;
     PFN_vkGetBufferMemoryRequirements2 buffer_requirements2 = nullptr;
+    // Palmwave: the opt-in hook-backed texture experiment (Resource::create_hook_backed_texture) also needs the image's
+    // own requirements with VkMemoryDedicatedRequirements, and its linear subresource layout (a diagnostic accessor).
+    PFN_vkGetImageMemoryRequirements2 image_requirements2 = nullptr;
+    PFN_vkGetImageSubresourceLayout subresource_layout = nullptr;
+    // Counters for the experiment (any resource of this device; tests).
+    std::atomic<std::uint64_t> hook_textures_live{0};
+    std::atomic<std::uint64_t> hook_logical_releases{0};
+    std::atomic<std::uint64_t> hook_unreturned_allocations{0};
+    std::atomic<std::uint64_t> hook_groups_retired{0};
 
     // Slot-133 imports of the title's pages (create_buffer_at_host_address). One VkDeviceMemory per pinned range,
     // shared by every resource whose own range it contains; counted by hand under host_import_mutex so an import is
@@ -1274,10 +1284,16 @@ struct DeviceState {
         }
     }
 
-    void release(const ImageEntry& entry) {  // descriptor_mutex held
+    // Palmwave: with `group` (a hook-backed texture), the views go into it, to be destroyed before its image and memory.
+    void release(const ImageEntry& entry, palmwave::RetiredImageGroup* group = nullptr) {  // descriptor_mutex held
         const std::uint64_t slot_handle =
             (static_cast<std::uint64_t>(entry.dimension) << 32) | static_cast<std::uint64_t>(entry.index);
         context->defer_destroy(palmwave::DeferredDeletionQueue::Kind::bindless_slot, slot_handle);
+        if (group) {
+            group->views.push_back(entry.sampled);
+            if (entry.storage) group->views.push_back(entry.storage);
+            return;
+        }
         context->defer_destroy(palmwave::DeferredDeletionQueue::Kind::image_view, entry.sampled);
         if (entry.storage) context->defer_destroy(palmwave::DeferredDeletionQueue::Kind::image_view, entry.storage);
     }
@@ -1413,20 +1429,20 @@ struct DeviceState {
     }
 
     // The texture at `address` is gone: its views leave set 0 and its T#s the hash table.
-    void forget_image(std::uint64_t address) {
+    void forget_image(std::uint64_t address, palmwave::RetiredImageGroup* group = nullptr) {
         std::lock_guard lock(descriptor_mutex);
         if (!bindless) return;
         const auto [first, last] = image_keys.equal_range(address);
         for (auto it = first; it != last; ++it) {
             const auto entry = image_entries.find(it->second);
             bindless->erase_key(it->second);
-            release(entry->second);
+            release(entry->second, group);
             image_entries.erase(entry);
         }
         image_keys.erase(first, last);
         std::erase_if(replaced_images, [&](const ImageEntry& entry) {
             if (entry.address != address) return false;
-            release(entry);
+            release(entry, group);
             return true;
         });
     }
@@ -1902,13 +1918,18 @@ public:
         : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags), placed_(true), va_(placed_va) {}
 
     ~Resource() override {
+        if (hook_) retire_hook_backed();  // takes the image, its views and memory; image_ is null afterwards
         if (accel_) {
             device_.context->unregister_acceleration_structure(gpu_va_);
             if (buffer_va_ && buffer_va_ != gpu_va_) device_.context->unregister_acceleration_structure(buffer_va_);
             device_.context->defer_destroy(palmwave::DeferredDeletionQueue::Kind::acceleration_structure, accel_);
         }
-        if (image_address_) device_.forget_image(image_address_);
-        device_.context->remove_resource(id());
+        // Hook-backed images own their complete cleanup, including fail-safe retention after an allocation failure.
+        // Retrying partial view collection here could enqueue a view after its image or throw from this destructor.
+        if (!hook_) {
+            if (image_address_) device_.forget_image(image_address_);
+            device_.context->remove_resource(id());
+        }
         if (host_import_) release_host_buffer();
         if (in_arena_) device_.arena_release(arena_offset_, desc_.Width, DeviceState::arena_buffer);
         if (image_ && !sparse_image_)
@@ -2314,6 +2335,367 @@ public:
         buffer_ = VK_NULL_HANDLE;
         device_.release_host_import(host_import_begin_);
         host_import_ = false;
+    }
+
+    // ---- Palmwave EXPERIMENT (opt-in): the slot-127 tuple on pages a TexturePageProvider returns ----
+    //
+    // ONE linear VkImage whose only memory is a VK_EXT_external_memory_host import of the provider's pages: no device
+    // memory image, no second image, no copy. Policy in src/hook_backed_image.h, provider contract in d3d12_xs_device.h.
+    // In order: every capability is checked and the image created and measured BEFORE anything is allocated (the
+    // external format query for this exact usage: IMPORTABLE and not DEDICATED_ONLY; no dedicated requirement; a
+    // HOST_VISIBLE | HOST_COHERENT type the image accepts); then the provider is asked for the image's real size, rounded
+    // only to minImportedHostPointerAlignment; its address must already meet the import and bind alignment (never
+    // rounded); the pages are pinned before they are checked (committed plain read-write, not write-combined/uncached);
+    // the import's memory type must be in the image's, the host pointer's and the coherent sets; then bind at offset 0.
+    // Registered in UNDEFINED and kept in GENERAL ever after (vulkan_replay.h image_layout); its first transition
+    // (zero-filled per the heap flags, as every committed texture) is submitted and WAITED FOR here, so host writes made
+    // after creation are never discarded by it. Any failure: null output, honest HRESULT, teardown_plan.
+    struct HookBacking {
+        rt::d3d12_xs::TexturePageProvider provider{};  // captured with the allocation: release and contract
+        std::uint64_t attributes = 0;                  // the word given to allocate, given again to release
+        rt::d3d12_xs::DescriptorHeapBacking backing{};
+        std::uint64_t bytes = 0;  // asked for and imported
+        std::uintptr_t begin = 0, end = 0;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        std::uint32_t memory_type = 0;
+        VkMemoryRequirements requirements{};
+        VkSubresourceLayout layout{};  // of subresource 0, from the driver
+        palmwave::hook_backed_image::Progress progress;
+        bool created = false;   // handed out: this is a final COM Release, not a failed creation
+        bool released = false;  // the logical release ran
+        palmwave::hook_backed_image::Contract contract() const {
+            return provider.contract == rt::d3d12_xs::TexturePageReleaseContract::owned_allocation
+                       ? palmwave::hook_backed_image::Contract::owned_allocation
+                       : palmwave::hook_backed_image::Contract::at_final_release_only;
+        }
+    };
+    const HookBacking* hook_backing() const { return hook_.get(); }
+    void mark_hook_backed_created() {
+        if (!hook_ || hook_->created) return;
+        hook_->created = true;
+        device_.hook_textures_live.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    HRESULT create_hook_backed_texture(const Format& format, const rt::d3d12_xs::TexturePageProvider& provider,
+                                       std::uint64_t attributes) {
+        namespace hb = palmwave::hook_backed_image;
+        auto& vk = device_.context->vk;
+        const VkDevice dev = device_.info.device;
+        const auto refuse = [](HRESULT hr, const char* why, long long value) {
+            log_once(why, int(value));
+            return hr;
+        };
+        try {
+            hook_ = std::make_unique<HookBacking>();
+        } catch (const std::bad_alloc&) {
+            return E_OUTOFMEMORY;
+        }
+        HookBacking& h = *hook_;
+        h.provider = provider;
+        h.attributes = attributes;
+        const VkDeviceSize host_alignment = device_.info.host_pointer_alignment;
+        if (!device_.get_host_pointer_properties || !device_.image_format_properties2 || !device_.image_requirements2 ||
+            !device_.format_properties || !hb::power_of_two(host_alignment))
+            return refuse(E_NOTIMPL,
+                          "hook-backed texture: no VK_EXT_external_memory_host, image format/requirements queries or "
+                          "power-of-two host alignment (nothing allocated); alignment", (long long)host_alignment);
+        if (!provider.allocate || !provider.release)
+            return refuse(E_NOTIMPL, "hook-backed texture: the page provider has no allocate/release pair", 0);
+        // Linear tiling is guaranteed only for single-sample, single-mip, single-layer 2D colour images, and the shapes
+        // the copies would need to reinterpret are not this path's: refused rather than approximated.
+        if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc_.MipLevels != 1 || desc_.DepthOrArraySize != 1 ||
+            desc_.SampleDesc.Count != 1 || format.typeless || format.aspects != VK_IMAGE_ASPECT_COLOR_BIT ||
+            format.r9g9b9e5_as_r32_uint || format.rgb96 || format.d24 || format.d24_as_float)
+            return refuse(E_NOTIMPL, "hook-backed texture: not a plain 2D single-mip colour texture; format",
+                          format.format);
+        VkFormatProperties features{};
+        device_.format_properties(device_.info.physical, format.format, &features);
+        TextureCreateInfo create(desc_, format,
+                                 (features.linearTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0);
+        VkImageCreateInfo& info = create.info;
+        if (info.pNext || info.flags)
+            return refuse(E_NOTIMPL, "hook-backed texture: the image would need create flags or a format list; flags",
+                          info.flags);
+        VkExternalMemoryImageCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO};
+        external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        info.pNext = &external;
+        info.tiling = VK_IMAGE_TILING_LINEAR;              // OPTIMAL measured with no memory type host pages can use
+        info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;     // external: never PREINITIALIZED (VUID-...-pNext-01443)
+        device_.share(info);
+        {
+            // This exact image: format, linear tiling, the unchanged usage, and host-allocation import.
+            VkPhysicalDeviceExternalImageFormatInfo external_query{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO};
+            external_query.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+            VkPhysicalDeviceImageFormatInfo2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, &external_query};
+            query.format = info.format;
+            query.type = info.imageType;
+            query.tiling = info.tiling;
+            query.usage = info.usage;
+            query.flags = info.flags;
+            VkExternalImageFormatProperties external_props{VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES};
+            VkImageFormatProperties2 props{VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, &external_props};
+            const VkResult r = device_.image_format_properties2(device_.info.physical, &query, &props);
+            if (r != VK_SUCCESS)
+                return refuse(r == VK_ERROR_OUT_OF_HOST_MEMORY || r == VK_ERROR_OUT_OF_DEVICE_MEMORY ? E_OUTOFMEMORY
+                                                                                                    : E_NOTIMPL,
+                              "hook-backed texture: no linear host-importable image of this format and usage; VkResult",
+                              r);
+            const VkImageFormatProperties& limits = props.imageFormatProperties;
+            if (info.extent.width > limits.maxExtent.width || info.extent.height > limits.maxExtent.height ||
+                info.mipLevels > limits.maxMipLevels || info.arrayLayers > limits.maxArrayLayers ||
+                !(limits.sampleCounts & info.samples))
+                return refuse(E_NOTIMPL, "hook-backed texture: the linear image exceeds its format limits; width",
+                              info.extent.width);
+            const VkExternalMemoryProperties& support = external_props.externalMemoryProperties;
+            if (!(support.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) ||
+                !(support.compatibleHandleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT))
+                return refuse(E_NOTIMPL, "hook-backed texture: host-allocation import not reported for the image; usage",
+                              info.usage);
+            if (support.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT)
+                return refuse(E_NOTIMPL, "hook-backed texture: host-allocation import is dedicated-only; usage",
+                              info.usage);
+        }
+        if (const VkResult r = vk.vkCreateImage(dev, &info, nullptr, &image_); r != VK_SUCCESS) {
+            image_ = VK_NULL_HANDLE;
+            return refuse(r == VK_ERROR_OUT_OF_HOST_MEMORY || r == VK_ERROR_OUT_OF_DEVICE_MEMORY ? E_OUTOFMEMORY
+                                                                                                : E_NOTIMPL,
+                          "hook-backed texture: vkCreateImage failed; VkResult", r);
+        }
+        h.progress.image = true;
+        VkMemoryDedicatedRequirements dedicated{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS};
+        VkMemoryRequirements2 requirements2{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, &dedicated};
+        VkImageMemoryRequirementsInfo2 which{VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2};
+        which.image = image_;
+        device_.image_requirements2(dev, &which, &requirements2);
+        h.requirements = requirements2.memoryRequirements;
+        if (dedicated.requiresDedicatedAllocation)
+            return refuse(E_NOTIMPL, "hook-backed texture: the linear image requires a dedicated allocation", 0);
+        if (hb::lease_bytes(h.requirements.size, host_alignment, h.bytes) != hb::SizeStatus::ok)
+            return refuse(E_NOTIMPL, "hook-backed texture: unusable image size; KiB",
+                          (long long)(h.requirements.size / 1024));
+        const std::uint64_t alignment = hb::bind_alignment(host_alignment, h.requirements.alignment);
+        if (!alignment)
+            return refuse(E_NOTIMPL, "hook-backed texture: the image's memory alignment is not a power of two",
+                          (long long)h.requirements.alignment);
+        {
+            constexpr VkMemoryPropertyFlags coherent =
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            bool any = false;
+            for (std::uint32_t i = 0; i < device_.memory.memoryTypeCount && i < 32; ++i)
+                any = any || ((h.requirements.memoryTypeBits & (1u << i)) &&
+                              (device_.memory.memoryTypes[i].propertyFlags & coherent) == coherent);
+            if (!any)
+                return refuse(E_NOTIMPL,
+                              "hook-backed texture: the linear image accepts no HOST_VISIBLE | HOST_COHERENT memory type "
+                              "(nothing allocated); image types", h.requirements.memoryTypeBits);
+        }
+
+        // The provider's code, with no lock held. Asked for the real size; nothing here pads it to a budget.
+        const rt::d3d12_xs::DescriptorBackingStatus status =
+            provider.allocate(static_cast<std::size_t>(h.bytes), attributes, &h.backing);
+        h.progress.leased = h.backing.address != nullptr;
+        if (status != rt::d3d12_xs::DescriptorBackingStatus::allocated || !h.backing.address)
+            return refuse(status == rt::d3d12_xs::DescriptorBackingStatus::out_of_memory ||
+                                  (status == rt::d3d12_xs::DescriptorBackingStatus::allocated && !h.backing.address)
+                              ? E_OUTOFMEMORY
+                              : E_FAIL,
+                          "hook-backed texture: the page provider did not allocate; status", int(status));
+        const auto begin = reinterpret_cast<std::uintptr_t>(h.backing.address);
+        switch (hb::check_address(begin, h.bytes, alignment)) {
+        case hb::AddressStatus::ok: break;
+        case hb::AddressStatus::misaligned:
+            return refuse(E_NOTIMPL, "hook-backed texture: the provider's address is not aligned for the import and "
+                                     "bind (never rounded); alignment", (long long)alignment);
+        default:
+            return refuse(E_INVALIDARG, "hook-backed texture: the provider's range is null or wraps", 0);
+        }
+        const std::uintptr_t end = begin + static_cast<std::uintptr_t>(h.bytes);
+        switch (rt::host_pins::pin(begin, end)) {
+        case rt::host_pins::PinResult::pinned: break;
+        case rt::host_pins::PinResult::invalid: return E_INVALIDARG;
+        case rt::host_pins::PinResult::out_of_memory: return E_OUTOFMEMORY;
+        case rt::host_pins::PinResult::unmanaged:
+            return refuse(E_NOTIMPL, "hook-backed texture: the pages are not wholly inside one allocation the title "
+                                     "shims own, so their lifetime cannot be held", 0);
+        default:
+            return refuse(E_NOTIMPL, "hook-backed texture: the pages overlap or alias another import, or no pin "
+                                     "provider is linked", 0);
+        }
+        h.progress.pinned = true;
+        h.begin = begin;
+        h.end = end;
+        if (const HRESULT pages = DeviceState::check_host_pages(begin, end); FAILED(pages)) return pages;
+
+        VkMemoryHostPointerPropertiesEXT host{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+        if (const VkResult r = device_.get_host_pointer_properties(
+                dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, h.backing.address, &host);
+            r != VK_SUCCESS)
+            return refuse(E_NOTIMPL, "hook-backed texture: vkGetMemoryHostPointerPropertiesEXT refused; VkResult", r);
+        const std::uint32_t types =
+            hb::coherent_import_types(h.requirements.memoryTypeBits, host.memoryTypeBits, device_.memory);
+        if (!types) {
+            std::fprintf(stderr,
+                         "[rt] d3d12: hook-backed texture refused: no memory type is in the image's (0x%x), the host "
+                         "pointer's (0x%x) and the HOST_VISIBLE | HOST_COHERENT sets\n",
+                         h.requirements.memoryTypeBits, host.memoryTypeBits);
+            return E_NOTIMPL;
+        }
+        VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
+        import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        import.pHostPointer = h.backing.address;
+        VkResult last = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        for (std::uint32_t i = 0; i < 32 && !h.memory; ++i) {
+            if (!(types & (1u << i))) continue;
+            VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &import};
+            allocate.allocationSize = h.bytes;
+            allocate.memoryTypeIndex = i;
+            last = vk.vkAllocateMemory(dev, &allocate, nullptr, &h.memory);
+            if (last != VK_SUCCESS) {
+                h.memory = VK_NULL_HANDLE;
+                continue;
+            }
+            h.memory_type = i;
+            memory_flags_ = device_.memory.memoryTypes[i].propertyFlags;
+        }
+        if (!h.memory)
+            return refuse(last == VK_ERROR_OUT_OF_HOST_MEMORY || last == VK_ERROR_OUT_OF_DEVICE_MEMORY ? E_OUTOFMEMORY
+                                                                                                      : E_NOTIMPL,
+                          "hook-backed texture: importing the pages failed; VkResult", last);
+        h.progress.memory = true;
+        if (const VkResult r = vk.vkBindImageMemory(dev, image_, h.memory, 0); r != VK_SUCCESS)
+            return refuse(E_OUTOFMEMORY, "hook-backed texture: vkBindImageMemory failed; VkResult", r);
+        if (device_.subresource_layout) {
+            const VkImageSubresource subresource{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
+            device_.subresource_layout(dev, image_, &subresource, &h.layout);
+            if (h.layout.offset > h.requirements.size || h.layout.size > h.requirements.size - h.layout.offset)
+                return refuse(E_FAIL, "hook-backed texture: the driver's subresource layout lies outside the image's "
+                                      "memory; offset", (long long)h.layout.offset);
+        }
+
+        palmwave::ResourceBinding binding{};
+        binding.image = image_;
+        binding.format = format.format;
+        binding.aspects = format.aspects;
+        binding.width = std::uint32_t(desc_.Width);
+        binding.height = desc_.Height;
+        binding.mip_levels = 1;
+        binding.array_layers = 1;
+        binding.depth = 1;
+        binding.samples = 1;
+        binding.color_attachment = (info.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0;
+        binding.sampled = (info.usage & VK_IMAGE_USAGE_SAMPLED_BIT) != 0;
+        binding.simultaneous_access = (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) != 0;
+        binding.not_zeroed = (heap_flags_ & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED) != 0;
+        binding.sampled_in_general = device_.bindless != nullptr;
+        // host + host_readable on an image: always GENERAL (image_layout) and a write -> host-read dependency after
+        // every submission while it is registered (VulkanQueue::host_read_barrier, host_image_writes).
+        binding.host = static_cast<const std::uint8_t*>(h.backing.address);
+        binding.host_readable = true;
+        format_ = format.format;
+        aspects_ = format.aspects;
+        image_address_ = device_.next_image_address.fetch_add(256);
+        binding_ = binding;
+        device_.context->add_resource(id(), binding, VK_IMAGE_LAYOUT_UNDEFINED);
+
+        // The first transition, UNDEFINED -> GENERAL (zero-filled unless CREATE_NOT_ZEROED), submitted and waited for
+        // now. Host writes after this return are kept: nothing discards the contents again.
+        palmwave::CommandList list;
+        constexpr std::uint32_t kCommon = 0;  // D3D12_RESOURCE_STATE_COMMON -> GENERAL
+        if (!list.transition({id(), palmwave::all_subresources, kCommon, kCommon}) || !list.close())
+            return refuse(E_FAIL, "hook-backed texture: the first transition could not be recorded", 0);
+        palmwave::ReplayResult result = palmwave::ReplayResult::unsupported;
+        {
+            std::lock_guard lock(device_.staging_mutex);
+            if (!device_.staging_queue)
+                device_.staging_queue = std::make_unique<palmwave::VulkanQueue>(*device_.context, device_.info.queue,
+                                                                               device_.info.queue_family);
+            if (device_.staging_queue->ok()) {
+                h.progress.submitted = true;  // from here the GPU may hold the image: retired, never destroyed at once
+                const palmwave::CommandList* lists[] = {&list};
+                result = device_.staging_queue->execute(lists);
+                if (result == palmwave::ReplayResult::success && !device_.staging_queue->idle())
+                    result = palmwave::ReplayResult::unsupported;
+            }
+        }
+        if (result != palmwave::ReplayResult::success)
+            return refuse(E_FAIL, "hook-backed texture: the first transition did not complete; replay result",
+                          int(result));
+        return S_OK;
+    }
+
+    // The texture's end, by teardown_plan (hook_backed_image.h). Called first in the destructor, with no lock held.
+    void retire_hook_backed() noexcept {
+        namespace hb = palmwave::hook_backed_image;
+        HookBacking& h = *hook_;
+        auto& context = *device_.context;
+        const VkDevice dev = device_.info.device;
+        const hb::Plan plan = hb::teardown_plan(h.progress, h.created, h.contract());
+        if (h.created) device_.hook_textures_live.fetch_sub(1, std::memory_order_relaxed);
+        for (unsigned i = 0; i < plan.count; ++i) {
+            switch (plan.steps[i]) {
+            case hb::Step::retire_group: {
+                // Views (bindless and cached), resolve framebuffers, the image and the memory: one deferred item, after
+                // every submission so far; its last step unpins. If the group cannot be made, all of it stays (pinned)
+                // for the process rather than being freed under the GPU.
+                auto* group = new (std::nothrow) palmwave::RetiredImageGroup;
+                try {
+                    if (!group) throw std::bad_alloc();
+                    group->image = image_;
+                    group->memory = h.memory;
+                    if (h.progress.pinned) {
+                        const std::uintptr_t b = h.begin, e = h.end;
+                        group->after = [b, e] { rt::host_pins::unpin(b, e); };
+                    }
+                    if (image_address_) device_.forget_image(image_address_, group);
+                    context.remove_resource(id(), group);
+                    context.defer_destroy(palmwave::DeferredDeletionQueue::Kind::image_group, group);
+                } catch (...) {
+                    // Collection can have moved only some views, or the deferred queue can have failed to grow.
+                    // Do not destroy even a partial group: all Vulkan handles and the pin stay alive. The logical
+                    // provider release below still runs in its scope; xmem defers its physical free under that pin.
+                    std::fprintf(stderr, "[rt] d3d12: hook-backed texture retirement allocation failed; "
+                                         "views, image, imported memory and pages are retained for this process\n");
+                }
+                // In either case this destructor must not separately destroy an image or retry view collection.
+                image_address_ = 0;
+                image_ = VK_NULL_HANDLE;
+                h.memory = VK_NULL_HANDLE;
+                h.progress.pinned = false;
+                break;
+            }
+            case hb::Step::destroy_image:
+                if (image_address_) device_.forget_image(image_address_);
+                image_address_ = 0;
+                context.remove_resource(id());
+                context.vk.vkDestroyImage(dev, image_, nullptr);
+                image_ = VK_NULL_HANDLE;
+                break;
+            case hb::Step::free_memory:
+                context.vk.vkFreeMemory(dev, h.memory, nullptr);
+                h.memory = VK_NULL_HANDLE;
+                break;
+            case hb::Step::unpin:
+                rt::host_pins::unpin(h.begin, h.end);
+                h.progress.pinned = false;
+                break;
+            case hb::Step::logical_release:
+                if (!h.released) {
+                    h.released = true;
+                    h.provider.release(h.backing, h.attributes);  // the captured routine and word, no lock held
+                    device_.hook_logical_releases.fetch_add(1, std::memory_order_relaxed);
+                }
+                break;
+            case hb::Step::keep_allocation:
+                device_.hook_unreturned_allocations.fetch_add(1, std::memory_order_relaxed);
+                std::fprintf(stderr,
+                             "[rt] d3d12: hook-backed texture creation failed after its pages were allocated (%p, %llu "
+                             "bytes); they are NOT released: the provider's release is valid only at a created "
+                             "texture's final Release (contract at_final_release_only)\n",
+                             h.backing.address, static_cast<unsigned long long>(h.bytes));
+                break;
+            }
+        }
     }
 
     HRESULT create_texture(const Format& format, const std::vector<VkFormat>& castable = {}) {
@@ -2755,6 +3137,7 @@ private:
     bool placed_ = false;
     palmwave::ResourceBinding binding_{};  // a texture's, as registered with the context
     bool host_transfer_ = false;          // created with VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT
+    std::unique_ptr<HookBacking> hook_;   // Palmwave: the opt-in hook-backed texture experiment only
     D3D12_GPU_VIRTUAL_ADDRESS va_ = 0;
     VkDeviceSize arena_offset_ = 0;
     bool in_arena_ = false;
@@ -5088,6 +5471,8 @@ public:
         // standalone device palmwave --run uses both come through here; upstream #7218). The handler refuses a device
         // that is not this layer's.
         rt::d3d12_xs::set_placed_at_va_handler(&create_buffer_at_host_address);
+        // Consulted only by slot 127's double opt-in hook-backed texture experiment (d3d12_xs_device.h).
+        rt::d3d12_xs::set_hook_backed_texture_handler(&create_hook_backed_texture);
         state_.info = info;
         queue_users_.resize(info.command_queues.size(), 0);
         compute_users_.resize(info.compute_queues.size(), 0);
@@ -5234,6 +5619,12 @@ public:
             if (!state_.external_buffer_properties || !state_.buffer_requirements2)
                 std::fprintf(stderr, "[rt] d3d12: vkGetPhysicalDeviceExternalBufferProperties or "
                                      "vkGetBufferMemoryRequirements2 did not load; slot 133 is E_NOTIMPL\n");
+            for (const char* name : {"vkGetImageMemoryRequirements2", "vkGetImageMemoryRequirements2KHR"})
+                if (!state_.image_requirements2)
+                    state_.image_requirements2 =
+                        reinterpret_cast<PFN_vkGetImageMemoryRequirements2>(get_device(info.device, name));
+            state_.subresource_layout = reinterpret_cast<PFN_vkGetImageSubresourceLayout>(
+                get_device(info.device, "vkGetImageSubresourceLayout"));
         }
         // Depth <-> colour copies are staged through scratch buffers (vulkan_scratch.h), on every GPU.
         state_.context->enable_copy_scratch(get_device, [this](const VkMemoryRequirements& requirements) {
@@ -7294,6 +7685,69 @@ public:
 
     std::size_t host_import_count() { return state_.host_import_count(); }
 
+    // Palmwave EXPERIMENT (opt-in; d3d12_xs_device.h): slot 127's frozen tuple, already a copy with Flags 0x5, on pages
+    // the provider returns (Resource::create_hook_backed_texture). The same description, layout and clear-value rules as
+    // CreateCommittedResource3, then only a DEFAULT-heap 2D texture. The resource is handed out through a
+    // QueryInterface made before the creation reference is dropped, so a refused IID is a failed creation (no logical
+    // release under at_final_release_only), never a final Release.
+    HRESULT create_hook_backed(const D3D12_HEAP_PROPERTIES& heap, D3D12_HEAP_FLAGS heap_flags,
+                               const D3D12_RESOURCE_DESC1& desc1, std::uint32_t layout, const D3D12_CLEAR_VALUE* clear,
+                               const rt::d3d12_xs::TexturePageProvider& provider, std::uint64_t attributes,
+                               REFIID riid, void** out) {
+        constexpr auto method = "Xbox CreateCommittedResource3 (device slot 127) hook-backed texture";
+        if (!out) return d3d12_trace::result(method, E_POINTER);
+        *out = nullptr;
+        if (texture_mip_region(desc1)) return d3d12_trace::result(method, E_INVALIDARG);
+        const D3D12_RESOURCE_DESC base = resource_desc(desc1);
+        if (const char* why = barrier_layout_refusal(base, static_cast<D3D12_BARRIER_LAYOUT>(layout))) {
+            log_once((std::string(method) + " refused (" + why + "), layout").c_str(), int(layout));
+            return d3d12_trace::result(method, E_INVALIDARG);
+        }
+        if (const char* why = committed_resource_refusal(heap, heap_flags, base, D3D12_RESOURCE_STATE_COMMON, clear,
+                                                         acceleration_structures())) {
+            log_once((std::string(method) + " refused (" + why + "), dimension").c_str(), int(base.Dimension));
+            return d3d12_trace::result(method, E_INVALIDARG);
+        }
+        D3D12_RESOURCE_DESC checked = base;
+        checked.SampleDesc.Quality = 0;
+        if (allocation(checked).SizeInBytes == UINT64_MAX) return d3d12_trace::result(method, E_INVALIDARG);
+        if (heap.Type != D3D12_HEAP_TYPE_DEFAULT || base.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+            return d3d12_trace::result(method, E_NOTIMPL);
+        const Format format = state_.texture_format(base);
+        if (format.format == VK_FORMAT_UNDEFINED) return d3d12_trace::result(method, E_INVALIDARG);
+        Resource* resource = nullptr;
+        try {
+            resource = new Resource(state_, base, heap, heap_flags);
+        } catch (const std::bad_alloc&) {
+            return d3d12_trace::result(method, E_OUTOFMEMORY);
+        }
+        resource->attach_device(identity());
+        HRESULT hr = E_OUTOFMEMORY;
+        try {
+            hr = resource->create_hook_backed_texture(format, provider, attributes);
+        } catch (const std::bad_alloc&) {
+            hr = E_OUTOFMEMORY;
+        }
+        void* handed = nullptr;
+        if (SUCCEEDED(hr)) {
+            hr = resource->QueryInterface(riid, &handed);
+            if (SUCCEEDED(hr) && !handed) hr = E_NOINTERFACE;
+        }
+        if (FAILED(hr)) {
+            resource->Release();  // a failed creation: teardown_plan with created = false
+            return d3d12_trace::result(method, hr);
+        }
+        resource->mark_hook_backed_created();
+        resource->Release();  // the creation reference; the caller holds `handed`
+        *out = handed;
+        return d3d12_trace::result(method, S_OK);
+    }
+
+    HookBackedTextureCounters hook_backed_counters() const {
+        return {state_.hook_textures_live.load(), state_.hook_logical_releases.load(),
+                state_.hook_unreturned_allocations.load()};
+    }
+
     HRESULT STDMETHODCALLTYPE OpenExistingHeapFromFileMapping(HANDLE file_mapping, REFIID, void** out) override {
         constexpr auto method = "ID3D12Device3::OpenExistingHeapFromFileMapping";
         if (out) *out = nullptr;
@@ -8980,6 +9434,45 @@ HRESULT create_buffer_at_host_address(ID3D12Device* device, void* address, const
     auto* d = Device::from<Device>(real ? real : device);
     if (!d) return E_NOTIMPL;  // a PC runtime device behind the proxy: it cannot place on the title's pages
     return d->create_at_host_address(address, desc, initial_state, riid, out);
+}
+
+HRESULT create_hook_backed_texture(ID3D12Device* device, const D3D12_HEAP_PROPERTIES& heap, D3D12_HEAP_FLAGS heap_flags,
+                                   const D3D12_RESOURCE_DESC1& desc, std::uint32_t initial_layout,
+                                   const D3D12_CLEAR_VALUE* clear, const rt::d3d12_xs::TexturePageProvider& provider,
+                                   std::uint64_t attributes, REFIID riid, void** out) {
+    if (out) *out = nullptr;
+    if (!device || !out) return E_POINTER;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    auto* d = Device::from<Device>(real ? real : device);
+    if (!d) return E_NOTIMPL;  // a PC runtime device: no import of the provider's pages, and no ordinary image instead
+    return d->create_hook_backed(heap, heap_flags, desc, initial_layout, clear, provider, attributes, riid, out);
+}
+
+bool hook_backed_texture_info(ID3D12Resource* resource, HookBackedTextureInfo* out) {
+    if (!out) return false;
+    *out = {};
+    const Resource* r = Resource::from<Resource>(resource);
+    const auto* h = r ? r->hook_backing() : nullptr;
+    if (!h || !h->created) return false;
+    out->address = h->backing.address;
+    out->bytes = h->bytes;
+    out->requirement_size = h->requirements.size;
+    out->requirement_alignment = h->requirements.alignment;
+    out->image_memory_types = h->requirements.memoryTypeBits;
+    out->memory_type = h->memory_type;
+    out->memory_flags = r->memory_flags();
+    out->offset = h->layout.offset;
+    out->row_pitch = h->layout.rowPitch;
+    out->layout_size = h->layout.size;
+    out->owned_allocation = h->contract() == palmwave::hook_backed_image::Contract::owned_allocation;
+    return true;
+}
+
+HookBackedTextureCounters hook_backed_texture_counters(ID3D12Device* device) {
+    if (!device) return {};
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    auto* d = Device::from<Device>(real ? real : device);
+    return d ? d->hook_backed_counters() : HookBackedTextureCounters{};
 }
 
 std::size_t host_import_count(ID3D12Device* device) {

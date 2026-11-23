@@ -73,6 +73,15 @@ void note_attributes(const char* api, uint64_t attributes, size_t size, const vo
 // per-allocation lock for them). Lock order: g_phys_mutex, then g_block_mutex, then the pin registry's.
 constexpr size_t kTrackedBlockMin = 0x1000;
 
+// Palmwave: a host implementation guarantee, not a reading of the attribute word. A block of at least 64 KiB (the size
+// of anything a GPU import of whole pages can usefully use) starts on a 64 KiB boundary, so a pool carved from it in
+// 64 KiB steps hands out slices that meet minImportedHostPointerAlignment (and the image's own memory alignment, both
+// still checked per import by the Vulkan layer). The pointer returned is the real allocation's start and the size is
+// exactly the size asked for; smaller blocks keep the 64-byte alignment. The console allocator's alignment field
+// is still not interpreted; Vulkan validates the actual address against its queried requirements.
+constexpr size_t kImportableBlockMin = 0x10000;
+constexpr size_t kImportableBlockAlign = 0x10000;
+
 struct Block {
     uintptr_t end;
     bool freed;  // the title freed it while a pin overlapped it; really freed after the last such pin goes
@@ -83,13 +92,19 @@ std::map<uintptr_t, Block> g_blocks;  // begin -> block
 size_t g_deferred_blocks = 0;         // entries with `freed` set
 
 void* allocate_block(size_t size) {
-    void* const p = _aligned_malloc(size ? size : 1, kAlign);
+    const bool importable = size >= kImportableBlockMin;
+    void* const p = _aligned_malloc(size ? size : 1, importable ? kImportableBlockAlign : kAlign);
     if (p && size >= kTrackedBlockMin) {
         const std::lock_guard blocks(g_block_mutex);
         try {
             g_blocks[reinterpret_cast<uintptr_t>(p)] = Block{reinterpret_cast<uintptr_t>(p) + size, false};
         } catch (const std::bad_alloc&) {
-            // Untracked: still a valid block for the title, but never accepted as an import's owner.
+            // Untracked: never accepted as an import's owner. A 64 KiB-aligned block must be tracked, because
+            // block_end measures an untracked block with the 64-byte alignment: an allocation failure instead.
+            if (importable) {
+                _aligned_free(p);
+                return nullptr;
+            }
         }
     }
     return p;

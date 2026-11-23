@@ -394,8 +394,14 @@ inline VkImageLayout vulkan_layout(std::uint32_t layout, bool presentable) {
 
 // The layout an image actually uses: simultaneous-access images live in GENERAL, and so do images in a
 // shader-resource state when set 0 names them (sampled_in_general).
+// Palmwave: so does an image bound to host pages the CPU reads and writes (`host` and `host_readable` set on an image:
+// only the linear image of the opt-in hook-backed texture). Host access to a linear image's memory is defined only in
+// GENERAL or PREINITIALIZED (Vulkan spec, "Image Layouts"), and PREINITIALIZED is invalid for an external image.
+inline bool host_shared_image_binding(const ResourceBinding& resource) {
+    return resource.image && resource.host && resource.host_readable;
+}
 inline VkImageLayout image_layout(const ResourceBinding& resource, VkImageLayout layout) {
-    if (resource.simultaneous_access && layout != VK_IMAGE_LAYOUT_UNDEFINED &&
+    if ((resource.simultaneous_access || host_shared_image_binding(resource)) && layout != VK_IMAGE_LAYOUT_UNDEFINED &&
         layout != VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
         return VK_IMAGE_LAYOUT_GENERAL;
     if (resource.sampled_in_general && layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
@@ -1483,6 +1489,10 @@ inline bool zero_compressed_image(const ReplayFunctions& vk, VkCommandBuffer com
 // so each such piece is zero-filled (clear for uncompressed images, zero-buffer copy for block-compressed formats
 // when a zero page or transfer scratch is available) and moved to `layout`, the layout the operation about to run
 // expects; with not_zeroed, it is only moved. The tracker records it.
+// Palmwave: no image is ever registered in PREINITIALIZED. The one image bound to imported host pages (the opt-in
+// hook-backed texture, d3d12_vulkan_device.cpp create_hook_backed_texture) is external, and an external image must be
+// created UNDEFINED (VUID-VkImageCreateInfo-pNext-01443); it gets this same first transition, submitted and fenced
+// before the resource is handed out, so host writes made after creation are never discarded by it.
 inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const ResourceBinding& resource,
                        ResourceId id, LayoutPieces& pieces, VkImageLayout layout, LayoutTracker* tracker) {
     constexpr VkAccessFlags any_memory = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;

@@ -404,6 +404,18 @@ private:
 
 struct SparseResource;
 
+// Palmwave: Vulkan objects on imported host pages that must go in one order, in ONE drain step, after the GPU work that
+// may use them has retired: framebuffers, views, the image, the imported memory, then `after` (which unpins the pages).
+// Separate queue items could be drained by two threads at once and lose that order. Only the opt-in hook-backed texture
+// experiment (d3d12_vulkan_device.cpp) makes one. `after` must not call into the title.
+struct RetiredImageGroup {
+    std::vector<VkFramebuffer> framebuffers;
+    std::vector<VkImageView> views;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    std::function<void()> after;
+};
+
 // Zero-allocation O(1) Ring Buffer deferred deletion queue tied to the device timeline semaphore.
 class DeferredDeletionQueue {
 public:
@@ -416,6 +428,7 @@ public:
         device_memory,
         acceleration_structure,
         framebuffer,
+        image_group,  // Palmwave: a RetiredImageGroup* the queue owns
     };
 
     struct Item {
@@ -507,6 +520,16 @@ public:
             case Kind::framebuffer:
                 vk.vkDestroyFramebuffer(device, reinterpret_cast<VkFramebuffer>(item.handle), nullptr);
                 break;
+            case Kind::image_group: {
+                auto* group = reinterpret_cast<RetiredImageGroup*>(item.handle);
+                for (VkFramebuffer framebuffer : group->framebuffers) vk.vkDestroyFramebuffer(device, framebuffer, nullptr);
+                for (VkImageView view : group->views) vk.vkDestroyImageView(device, view, nullptr);
+                if (group->image) vk.vkDestroyImage(device, group->image, nullptr);
+                if (group->memory) vk.vkFreeMemory(device, group->memory, nullptr);
+                if (group->after) group->after();  // the pages stay valid until every object on them is gone
+                delete group;
+                break;
+            }
             }
         }
     }
@@ -1158,7 +1181,9 @@ public:
         }
     }
 
-    void remove_resource(ResourceId id) {
+    // Palmwave: with `group`, the image's cached views and resolve framebuffers are moved into it instead of being
+    // deferred one by one, so the caller retires them together with the image and its memory (RetiredImageGroup).
+    void remove_resource(ResourceId id, RetiredImageGroup* group = nullptr) {
         VkImage img = VK_NULL_HANDLE;
         std::shared_ptr<SparseResource> sparse_resource;
         {
@@ -1168,6 +1193,7 @@ public:
             img = it->second.image;
             unindex_buffer(id, it->second);
             if (host_shared_buffer(it->second)) --host_shared_buffers_;
+            if (host_shared_image(it->second)) --host_shared_images_;
             resources_.erase(it);
             if (auto sparse = sparse_resources_.find(id); sparse != sparse_resources_.end()) {
                 sparse_resource = std::move(sparse->second);
@@ -1182,7 +1208,8 @@ public:
             std::lock_guard vlock(views_mutex_);
             for (auto f = resolve_framebuffers_.begin(); f != resolve_framebuffers_.end();) {
                 if (std::get<0>(f->first) == img || std::get<1>(f->first) == img) {
-                    defer_destroy(DeferredDeletionQueue::Kind::framebuffer, f->second);
+                    if (group) group->framebuffers.push_back(f->second);
+                    else defer_destroy(DeferredDeletionQueue::Kind::framebuffer, f->second);
                     f = resolve_framebuffers_.erase(f);
                 } else {
                     ++f;
@@ -1190,7 +1217,8 @@ public:
             }
             for (auto v = views_.begin(); v != views_.end();) {
                 if (std::get<0>(v->first) == img) {
-                    defer_destroy(DeferredDeletionQueue::Kind::image_view, v->second);
+                    if (group) group->views.push_back(v->second);
+                    else defer_destroy(DeferredDeletionQueue::Kind::image_view, v->second);
                     v = views_.erase(v);
                 } else {
                     ++v;
@@ -1262,6 +1290,12 @@ public:
     std::size_t host_shared_buffer_count() {
         std::shared_lock lock(resource_mutex_);
         return host_shared_buffers_;
+    }
+    // Palmwave: how many registered images are bound to host pages the CPU reads and writes (host_shared_image). For
+    // tests.
+    std::size_t host_shared_image_count() {
+        std::shared_lock lock(resource_mutex_);
+        return host_shared_images_;
     }
 
     // Pipelines are registered by an opaque id (the PSO object) for as long as the PSO lives.
@@ -1559,15 +1593,22 @@ private:
     // that runs shaders with a shader-write -> host-read dependency while one is registered. READBACK heaps have no
     // CPU-written mapping (`host` is null), cannot hold a D3D12 UAV, and keep their copy-tracked barrier only.
     static bool host_shared_buffer(const ResourceBinding& b) { return !b.image && b.buffer && b.host_readable && b.host; }
+    // Palmwave: an image bound to host pages the CPU reads and writes (only the linear image of the opt-in hook-backed
+    // texture experiment, d3d12_vulkan_device.cpp create_hook_backed_texture). Shaders, clears, copies and attachment
+    // stores can all write it, so while one is registered every submission ends with a write -> host-read dependency
+    // (host_read_barrier's host_image_writes).
+    static bool host_shared_image(const ResourceBinding& b) { return b.image && b.host_readable && b.host; }
     // resources_[id] = binding, with the VA index kept in step (a re-registered ID drops its old range first).
     void set_resource_locked(ResourceId id, const ResourceBinding& binding) {
         auto [it, inserted] = resources_.try_emplace(id, binding);
         if (!inserted) {
             unindex_buffer(id, it->second);
             if (host_shared_buffer(it->second)) --host_shared_buffers_;
+            if (host_shared_image(it->second)) --host_shared_images_;
             it->second = binding;
         }
         if (host_shared_buffer(binding)) ++host_shared_buffers_;
+        if (host_shared_image(binding)) ++host_shared_images_;
         if (addressable(binding)) buffer_vas_.insert(binding.va, binding.size, id);
     }
 
@@ -1677,6 +1718,7 @@ private:
     QueueHolds<VkSemaphore> holds_;
     std::unordered_map<ResourceId, ResourceBinding> resources_;
     std::size_t host_shared_buffers_ = 0;   // Palmwave: host_shared_buffer bindings in resources_ (resource_mutex_)
+    std::size_t host_shared_images_ = 0;    // Palmwave: host_shared_image bindings in resources_ (resource_mutex_)
     BufferVaIndex<ResourceId> buffer_vas_;  // the addressable buffers of resources_, by VA range (buffer_at)
     std::unordered_map<ResourceId, std::shared_ptr<SparseResource>> sparse_resources_;
     std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
@@ -1840,6 +1882,9 @@ public:
     //   - shader_host_writes (Palmwave): the submission runs shaders while a host_shared_buffer is registered. A shader
     //     can write one through any V# or raw VA, which the replay cannot enumerate, so every shader stage this queue
     //     supports is a source, with MEMORY_WRITE (which covers storage and physical-storage-buffer writes).
+    //   - host_image_writes (Palmwave): a host_shared_image is registered. Clears, copies, attachment stores and shader
+    //     stores can all write it, so every stage this queue supports that can write an image is a source (transfer,
+    //     compute, all graphics), with MEMORY_WRITE. Only the opt-in hook-backed texture experiment registers one.
     // Sources are kept within queue_supported_stages, so a copy queue never names a shader stage. Without either
     // reason no barrier is recorded, as before.
     struct HostReadBarrier {
@@ -1848,7 +1893,8 @@ public:
     };
     static constexpr HostReadBarrier host_read_barrier(QueueKind kind, bool wrote_readback,
                                                        VkPipelineStageFlags2 readback_stages,
-                                                       bool shader_host_writes) noexcept {
+                                                       bool shader_host_writes,
+                                                       bool host_image_writes = false) noexcept {
         const VkPipelineStageFlags2 allowed = queue_supported_stages(kind);
         VkPipelineStageFlags2 stages = 0;
         if (wrote_readback) {
@@ -1857,6 +1903,14 @@ public:
         }
         if (shader_host_writes)
             stages |= (VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT) & allowed;
+        if (host_image_writes) {
+            stages |= (VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                       VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT) & allowed;
+            if (!stages) stages = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            // A copy queue's transfer stages alone would read as copy_only below; an image write may be a clear or an
+            // attachment store, so the access is always the general one.
+            return {stages, VK_ACCESS_2_MEMORY_WRITE_BIT};
+        }
         if (!stages) return {};
         const bool copy_only = (stages & ~(VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT)) == 0;
         return {stages, copy_only ? VK_ACCESS_2_TRANSFER_WRITE_BIT : VK_ACCESS_2_MEMORY_WRITE_BIT};
@@ -1866,6 +1920,9 @@ public:
     // host_shared_buffer was registered (counted when the command buffer reached vkQueueSubmit). For tests: a driver
     // whose memory happens to be coherent without it cannot hide a missing dependency.
     std::uint64_t shader_host_read_barriers() const { return shader_host_read_barriers_.load(); }
+    // Palmwave: submissions this queue ended with a host-read dependency because a host_shared_image was registered.
+    // For tests, for the same reason.
+    std::uint64_t host_image_read_barriers() const { return host_image_read_barriers_.load(); }
 
     VulkanQueue(VulkanContext& context, VkQueue queue, std::uint32_t family, QueueKind kind = QueueKind::direct)
         : context_(context), queue_(queue), kind_(kind), family_(family) {
@@ -2560,7 +2617,11 @@ private:
         // of buffers registered when this submission was recorded.
         const bool shader_host_writes =
             runs_shaders && kind_ != QueueKind::copy && context_.host_shared_buffers_ != 0;
-        const HostReadBarrier host_read = host_read_barrier(kind_, wrote_readback, readback_stages, shader_host_writes);
+        // Palmwave: any submission while a host-page-backed image is registered (it need not name the image: no
+        // command list here can be proven not to write it without decoding every view).
+        const bool host_image_writes = context_.host_shared_images_ != 0;
+        const HostReadBarrier host_read =
+            host_read_barrier(kind_, wrote_readback, readback_stages, shader_host_writes, host_image_writes);
         if (host_read.stages) {
             const VkPipelineStageFlags2 src_stages = host_read.stages;
             const bool copy_only = host_read.access == VK_ACCESS_2_TRANSFER_WRITE_BIT;
@@ -2620,6 +2681,7 @@ private:
         }
         if (submitted) {
             if (shader_host_writes) shader_host_read_barriers_.fetch_add(1);
+            if (host_image_writes && host_read.stages) host_image_read_barriers_.fetch_add(1);
             context_.tracker_ = std::move(next_tracker);
             slot->predicate = std::move(batch);
             slot->predicated_copy = std::move(copy_batch);
@@ -3209,6 +3271,7 @@ private:
     std::deque<TicketedPin> pin_queue_;  // released once progress_ reaches the ticket
     std::atomic<int> held_failure_{0};                 // a ReplayResult: the first held batch that failed
     std::atomic<std::uint64_t> shader_host_read_barriers_{0};  // Palmwave: shader_host_read_barriers()
+    std::atomic<std::uint64_t> host_image_read_barriers_{0};   // Palmwave: host_image_read_barriers()
 };
 
 } // namespace palmwave

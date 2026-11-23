@@ -148,6 +148,21 @@ void xmem_descriptor_release(const xs::DescriptorHeapBacking& backing, std::uint
 constexpr xs::DescriptorHeapAllocator kXmemDescriptorHeapAllocator{&xmem_descriptor_allocate,
                                                                    &xmem_descriptor_release};
 
+// The opt-in hook-backed texture experiment's default page provider (d3d12_xs_device.h, TexturePageProvider): the same
+// allocation bridge, and the same generation-checked free as the LOGICAL release at the texture's final COM Release.
+// Contract at_final_release_only: what the title's free does with the pointer (a scoped free that ignores interior
+// slices and forwards only its pool base was measured) is the title's; a failed creation never calls it.
+void xmem_texture_release(const xs::DescriptorHeapBacking& backing, std::uint64_t attributes) {
+    const auto free_fn = reinterpret_cast<rt::shims::XMemFreeHookFn>(backing.release_hook);
+    if (!rt::shims::xmem_free_with_hooks(backing.token, free_fn, backing.address, attributes))
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: hook-backed texture pages %p not released to the title: the image whose hooks "
+                     "allocated them is no longer registered\n", backing.address);
+}
+
+constexpr xs::TexturePageProvider kXmemTexturePageProvider{&xmem_descriptor_allocate, &xmem_texture_release,
+                                                           xs::TexturePageReleaseContract::at_final_release_only};
+
 // Measured shape: D3D12XboxCreateDevice(adapter, params, riid, out), where params is a 24-word block that is only
 // logged and not used to create the device. The struct's total size is unknown, so the log reads 24 x 32-bit words
 // (96 bytes) and no more. The PC D3D12CreateDevice needs a minimum feature level instead, so 12_0 is used as the
@@ -157,6 +172,8 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
     using rt::d3d12_trace::result;
     // Slot 14 of every device proxy consults the title's hooks from now on (an explicit test allocator still wins).
     rt::d3d12_xs::set_default_descriptor_heap_allocator(&kXmemDescriptorHeapAllocator);
+    // Consulted only by slot 127's double opt-in hook-backed texture experiment (an explicit test provider still wins).
+    rt::d3d12_xs::set_default_texture_page_provider(&kXmemTexturePageProvider);
     if (!out) return result(method, E_POINTER);
     *out = nullptr;
     if (!riid) return result(method, E_POINTER);

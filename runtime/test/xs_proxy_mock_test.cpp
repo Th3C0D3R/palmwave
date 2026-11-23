@@ -3768,6 +3768,7 @@ int check_resource_routes() {
 // Slot 127's opt-in experiment variable (read on every call). The strict checks pin it unset for their duration and
 // give the process's value back on every return path, so the other checks in this process see what they saw before.
 constexpr char kCommittedTextureEnv[] = "PALMWAVE_EXPERIMENTAL_XBOX_COMMITTED_TEXTURE";
+constexpr char kHookBackingEnv[] = "PALMWAVE_EXPERIMENTAL_XBOX_TEXTURE_HOOK_BACKING";
 
 class EnvRestore {
 public:
@@ -3950,7 +3951,9 @@ int check_committed_texture_experiment() {
 #ifdef __ID3D12Device10_INTERFACE_DEFINED__
     const EnvRestore saved_texture(kCommittedTextureEnv);
     const EnvRestore saved_flush(kFlushEnv);
-    EXPECT(saved_texture.ok() && saved_flush.ok());
+    const EnvRestore saved_hook(kHookBackingEnv);  // the hook-backing route on top is checked separately
+    EXPECT(saved_texture.ok() && saved_flush.ok() && saved_hook.ok());
+    SetEnvironmentVariableA(kHookBackingEnv, nullptr);
     constexpr std::uint64_t kPoison = 0xA5A5A5A500000000ull;
     constexpr std::uint64_t kOtherPoison = 0x5A5A5A5A00000000ull;
 
@@ -4207,6 +4210,170 @@ int check_committed_texture_experiment() {
     return 0;
 }
 
+// ---- Slot 127's hook-backing route on top of the experiment (PALMWAVE_EXPERIMENTAL_XBOX_TEXTURE_HOOK_BACKING) ----
+//
+// A counting handler and provider: the proxy never allocates itself, routes only the exact tuple with BOTH variables
+// exactly "1", refuses with E_NOTIMPL (no handler call, no backend call) without a handler or a usable provider, gives
+// the handler the Flags-0x5 copy, the title's other words, a copy of the provider and the attribute word, leaves the
+// title's description unchanged, and clears the output on a failing handler. Every other case is the strict path or the
+// plain experiment, never the handler.
+struct HookSeen {
+    unsigned calls = 0;
+    const void* real = nullptr;
+    const D3D12_RESOURCE_DESC1* desc = nullptr;
+    D3D12_RESOURCE_DESC1 desc_bytes{};
+    std::uint32_t heap_flags = 0, layout = 0;
+    const void* clear = nullptr;
+    xs::TexturePageProvider provider{};
+    std::uint64_t attributes = 0;
+    HRESULT answer = S_OK;
+};
+HookSeen g_hook_seen;
+unsigned g_hook_allocations = 0;
+xs::DescriptorBackingStatus hook_test_allocate(std::size_t, std::uint64_t, xs::DescriptorHeapBacking*) {
+    ++g_hook_allocations;
+    return xs::DescriptorBackingStatus::out_of_memory;
+}
+void hook_test_release(const xs::DescriptorHeapBacking&, std::uint64_t) {}
+int g_hook_resource_sentinel = 0;
+HRESULT hook_test_handler(ID3D12Device* real, const D3D12_HEAP_PROPERTIES&, D3D12_HEAP_FLAGS heap_flags,
+                          const D3D12_RESOURCE_DESC1& desc, std::uint32_t layout, const D3D12_CLEAR_VALUE* clear,
+                          const xs::TexturePageProvider& provider, std::uint64_t attributes, REFIID, void** out) {
+    HookSeen& s = g_hook_seen;
+    ++s.calls;
+    s.real = real;
+    s.desc = &desc;
+    std::memcpy(&s.desc_bytes, &desc, sizeof(desc));
+    s.heap_flags = static_cast<std::uint32_t>(heap_flags);
+    s.layout = layout;
+    s.clear = clear;
+    s.provider = provider;
+    s.attributes = attributes;
+    *out = SUCCEEDED(s.answer) ? static_cast<void*>(&g_hook_resource_sentinel) : reinterpret_cast<void*>(1);
+    return s.answer;
+}
+
+int check_texture_hook_backing() {
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+    const EnvRestore saved_texture(kCommittedTextureEnv), saved_hook(kHookBackingEnv);
+    EXPECT(saved_texture.ok() && saved_hook.ok());
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    heap.CreationNodeMask = 1;
+    heap.VisibleNodeMask = 1;
+    D3D12_RESOURCE_DESC1 desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = 3840;
+    desc.Height = 2160;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = static_cast<DXGI_FORMAT>(28);
+    desc.SampleDesc = {1, 0};
+    desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x00300005);
+    D3D12_CLEAR_VALUE clear{};
+    clear.Format = static_cast<DXGI_FORMAT>(28);
+
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 10, true);
+    EXPECT(device);
+    Mock* alias = new_mock(Kind::device);
+    alias->refs = 1;
+    mock->device10_alias = alias;
+    mock->create_result = E_UNEXPECTED;
+    g_committed3 = {};
+    const Committed3Seen& backend = g_committed3;
+    const long base_refs = mock->refs;
+    const auto proxy_refs = xs::device_proxy_ref_count(device);
+    void* resource = nullptr;
+    const auto call = [&](D3D12_RESOURCE_DESC1& d) {
+        std::uint64_t w[10] = {word(&heap), std::uint64_t(D3D12_HEAP_FLAG_ALLOW_DISPLAY), word(&d), 3,
+                               word(&clear), 0, 0, 0, word(&kResourceIid), word(&resource)};
+        resource = reinterpret_cast<void*>(1);
+        return hr_of(raw10(device, 127, w));
+    };
+    const auto balanced = [&] {
+        return alias->refs == 1 && mock->refs == base_refs && xs::device_proxy_ref_count(device) == proxy_refs;
+    };
+    const xs::TexturePageProvider provider{&hook_test_allocate, &hook_test_release,
+                                           xs::TexturePageReleaseContract::at_final_release_only};
+    xs::set_hook_backed_texture_handler(&hook_test_handler);
+    xs::set_texture_page_provider(&provider);
+
+    // 1. The hook variable alone, or not exactly "1", or a near miss: never the handler.
+    SetEnvironmentVariableA(kCommittedTextureEnv, nullptr);
+    EXPECT(SetEnvironmentVariableA(kHookBackingEnv, "1") != FALSE);
+    EXPECT(call(desc) == E_INVALIDARG && !resource && backend.calls == 1 && g_hook_seen.calls == 0);
+    EXPECT(SetEnvironmentVariableA(kCommittedTextureEnv, "1") != FALSE);
+    for (const char* value : {"", "0", "11", "true", "1 "}) {
+        EXPECT(SetEnvironmentVariableA(kHookBackingEnv, value) != FALSE);
+        alias->create_result = S_OK;
+        const unsigned before = backend.calls;
+        EXPECT(call(desc) == S_OK && backend.calls == before + 1 && g_hook_seen.calls == 0);  // the plain experiment
+        EXPECT(resource && resource != reinterpret_cast<void*>(1) && release(resource) == 0);
+    }
+    EXPECT(SetEnvironmentVariableA(kHookBackingEnv, "1") != FALSE);
+    {
+        D3D12_RESOURCE_DESC1 near_miss = desc;
+        near_miss.Width = 3839;
+        const unsigned before = backend.calls;
+        alias->create_result = E_INVALIDARG;
+        EXPECT(call(near_miss) == E_INVALIDARG && !resource && backend.calls == before + 1 && g_hook_seen.calls == 0);
+    }
+    alias->create_result = E_UNEXPECTED;  // only the handler may create from here
+
+    // 2. No handler, then no usable provider: E_NOTIMPL, null output, no handler and no backend call, nothing allocated.
+    const unsigned backend_calls = backend.calls;
+    const auto refused = xs::hook_backed_texture_refused_calls();
+    xs::set_hook_backed_texture_handler(nullptr);
+    EXPECT(call(desc) == E_NOTIMPL && !resource);
+    xs::set_hook_backed_texture_handler(&hook_test_handler);
+    xs::set_texture_page_provider(nullptr);
+    EXPECT(call(desc) == E_NOTIMPL && !resource);
+    const xs::TexturePageProvider no_contract{&hook_test_allocate, &hook_test_release,
+                                              static_cast<xs::TexturePageReleaseContract>(0)};
+    xs::set_texture_page_provider(&no_contract);
+    EXPECT(call(desc) == E_NOTIMPL && !resource);
+    const xs::TexturePageProvider no_release{&hook_test_allocate, nullptr,
+                                             xs::TexturePageReleaseContract::owned_allocation};
+    xs::set_texture_page_provider(&no_release);
+    EXPECT(call(desc) == E_NOTIMPL && !resource);
+    EXPECT(xs::hook_backed_texture_refused_calls() == refused + 4 && g_hook_seen.calls == 0);
+    EXPECT(backend.calls == backend_calls && g_hook_allocations == 0 && balanced());
+
+    // 3. Routed: the handler gets the copy, the title's words, a copy of the provider and the attribute word.
+    xs::set_texture_page_provider(&provider);
+    D3D12_RESOURCE_DESC1 before;
+    std::memcpy(&before, &desc, sizeof(desc));
+    const auto routed = xs::hook_backed_texture_routed_calls();
+    EXPECT(call(desc) == S_OK && resource == &g_hook_resource_sentinel);
+    const HookSeen& s = g_hook_seen;
+    D3D12_RESOURCE_DESC1 expected = before;
+    expected.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x5);
+    EXPECT(s.calls == 1 && s.real == alias && s.desc != &desc && std::memcmp(&s.desc_bytes, &expected, sizeof(expected)) == 0);
+    EXPECT(std::memcmp(&desc, &before, sizeof(desc)) == 0);  // the title's description is not written
+    EXPECT(s.heap_flags == std::uint32_t(D3D12_HEAP_FLAG_ALLOW_DISPLAY) && s.layout == 3 && s.clear == &clear);
+    EXPECT(s.provider.allocate == provider.allocate && s.provider.release == provider.release &&
+           s.provider.contract == provider.contract && s.attributes == xs::kXmemCommittedTextureAttributesHypothesis);
+    EXPECT(xs::hook_backed_texture_routed_calls() == routed + 1 && backend.calls == backend_calls);
+    EXPECT(g_hook_allocations == 0 && balanced());  // the proxy allocates nothing itself
+
+    // 4. A failing handler: its answer, the output cleared even though the handler wrote it.
+    g_hook_seen.answer = E_OUTOFMEMORY;
+    EXPECT(call(desc) == E_OUTOFMEMORY && resource == nullptr && g_hook_seen.calls == 2 && balanced());
+    g_hook_seen = {};
+
+    xs::set_hook_backed_texture_handler(nullptr);
+    xs::set_texture_page_provider(nullptr);
+    EXPECT(release(device) == 0);
+    std::printf("%s: texture hook-backing route: PASS (both variables exactly \"1\" and the exact tuple only; no "
+                "handler/provider is E_NOTIMPL with nothing called; the copy, words, provider and attribute reach the "
+                "handler; the title's description is unchanged; a failure clears the output)\n", g_label);
+#else
+    std::printf("%s: texture hook-backing route not checked: the SDK has no ID3D12Device10\n", g_label);
+#endif
+    return 0;
+}
+
 // A configured route moved onto 127 (inside 3..127) keeps its priority over the built-in adapter.
 int run_env_slot127() {
     EXPECT(SetEnvironmentVariableA("PALMWAVE_XS_FRAME_INTERVAL_SLOT", "127") != FALSE);
@@ -4367,6 +4534,7 @@ int main(int argc, char** argv) {
         rt::d3d12_trace::set_enabled(true);  // every outcome is a traced line, as under palmwave --trace-d3d12
         return check_committed_resource3();
     }
+    if (argc == 2 && std::strcmp(argv[1], "--texture-hook-backing") == 0) return check_texture_hook_backing();
     if (argc == 2 && std::strcmp(argv[1], "--committed-texture-experiment") == 0) {
         rt::d3d12_trace::set_enabled(true);  // each experimental attempt and its real result are traced lines
         return check_committed_texture_experiment();

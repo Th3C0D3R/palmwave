@@ -997,6 +997,10 @@ if(BUILD_TESTING)
     set_tests_properties(xs_proxy_mock_committed_texture_experiment PROPERTIES
                          ENVIRONMENT_MODIFICATION "PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT=unset:"
                          FAIL_REGULAR_EXPRESSION "line [0-9]+:")
+    # Palmwave: the double opt-in hook-backed texture route on slot 127 (d3d12_xs_device.h), with a counting handler and
+    # provider: never routed without both variables exactly "1" and the exact tuple; refusals call nothing.
+    add_test(NAME xs_proxy_mock_texture_hook_backing COMMAND xs_proxy_mock_test --texture-hook-backing)
+    set_tests_properties(xs_proxy_mock_texture_hook_backing PROPERTIES FAIL_REGULAR_EXPRESSION "line [0-9]+:")
     add_test(NAME xs_proxy_mock_committed_texture_with_host_import
              COMMAND xs_proxy_mock_test --committed-texture-experiment)
     set_tests_properties(xs_proxy_mock_committed_texture_with_host_import PROPERTIES
@@ -2864,7 +2868,27 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_committed_texture COMMAND d3d12_committed_texture_test)
       set_tests_properties(d3d12_committed_texture PROPERTIES SKIP_RETURN_CODE 77
                            FAIL_REGULAR_EXPRESSION "Validation Error;VUID-"
-                           ENVIRONMENT_MODIFICATION "PALMWAVE_EXPERIMENTAL_XBOX_COMMITTED_TEXTURE=unset:")
+                           ENVIRONMENT_MODIFICATION
+                             "PALMWAVE_EXPERIMENTAL_XBOX_COMMITTED_TEXTURE=unset:;PALMWAVE_EXPERIMENTAL_XBOX_TEXTURE_HOOK_BACKING=unset:")
+      # Palmwave: the double opt-in hook-backed texture experiment (d3d12_xs_device.h TexturePageProvider): ONE linear
+      # image on a synthetic provider's pages (a model of the measured allocation/free scope over the served xmem pool),
+      # the same RT/copy/UAV/SRV oracle plus both directions through the ORIGINAL pages, in-flight reverse release inside
+      # the free scope, release-A-while-B-lives, and rollback. xmem.cpp and registry.cpp give it the served XMemAlloc /
+      # VirtualAlloc and the pin provider. Synchronization validation is required (PALMWAVE_VK_VALIDATION=1).
+      add_executable(d3d12_hook_backed_texture_test test/d3d12_hook_backed_texture_test.cpp shims/d3d12_xs_device.cpp
+                     shims/xmem.cpp shims/host_pins.h shims/registry.cpp
+                     ${PALMWAVE_TEST_CS_COMMITTED_TEXTURE_WRITE} ${PALMWAVE_TEST_CS_COMMITTED_TEXTURE_READ})
+      target_link_libraries(d3d12_hook_backed_texture_test PRIVATE palmwave_d3d12_com psapi)
+      target_compile_definitions(d3d12_hook_backed_texture_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+        PALMWAVE_TEST_CS_COMMITTED_TEXTURE_WRITE_SPV="${PALMWAVE_TEST_CS_COMMITTED_TEXTURE_WRITE}"
+        PALMWAVE_TEST_CS_COMMITTED_TEXTURE_READ_SPV="${PALMWAVE_TEST_CS_COMMITTED_TEXTURE_READ}")
+      target_compile_options(d3d12_hook_backed_texture_test PRIVATE /W4 /permissive- /utf-8)
+      target_link_options(d3d12_hook_backed_texture_test PRIVATE /OPT:NOREF)  # keep the self-registering shim tables
+      add_test(NAME d3d12_hook_backed_texture COMMAND d3d12_hook_backed_texture_test)
+      set_tests_properties(d3d12_hook_backed_texture PROPERTIES SKIP_RETURN_CODE 77
+                           FAIL_REGULAR_EXPRESSION "Validation Error;VUID-"
+                           ENVIRONMENT_MODIFICATION
+                             "PALMWAVE_VK_VALIDATION=set:1;PALMWAVE_EXPERIMENTAL_XBOX_COMMITTED_TEXTURE=unset:;PALMWAVE_EXPERIMENTAL_XBOX_TEXTURE_HOOK_BACKING=unset:")
       # Bindless table churn on a direct and a compute queue: the table grows and live keys move without a
       # device-idle wait (D3D-314); the same shader, run twice (deferred retirement, and the old wait for timing).
       add_executable(d3d12_bindless_churn_test test/d3d12_bindless_churn_test.cpp shims/d3d12_xs_device.cpp
@@ -3237,6 +3261,19 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(host_read_barrier_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME host_read_barrier COMMAND host_read_barrier_test)
+    if(WIN32)
+      # Palmwave: the opt-in hook-backed texture experiment's CPU rules (src/hook_backed_image.h), the grouped retirement
+      # order of DeferredDeletionQueue, and two slices of one served xmem pool under pins with a scoped free. xmem.cpp
+      # and registry.cpp give it the served XMemAlloc/XMemFree and the pin provider (no GPU or game data).
+      add_executable(hook_backed_image_test test/hook_backed_image_test.cpp shims/xmem.cpp shims/host_pins.h
+                     shims/experimental_host_import.h shims/registry.cpp)
+      target_link_libraries(hook_backed_image_test PRIVATE Vulkan::Headers psapi)
+      target_include_directories(hook_backed_image_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+      target_compile_definitions(hook_backed_image_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      target_compile_options(hook_backed_image_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+      target_link_options(hook_backed_image_test PRIVATE /OPT:NOREF)
+      add_test(NAME hook_backed_image COMMAND hook_backed_image_test)
+    endif()
     # GFX10 T#/S#/V# descriptor encoding and its Vulkan mappings (src/gfx10_descriptors.h).
     add_executable(gfx10_descriptors_test test/gfx10_descriptors_test.cpp)
     target_link_libraries(gfx10_descriptors_test PRIVATE Vulkan::Headers)

@@ -3070,10 +3070,42 @@ constexpr std::uint32_t kExpCommittedTextureHostFlags = 0x00000005u;  // RT | UA
 constexpr std::uint32_t kExpCommittedTextureLayout = 3;  // passed unchanged (public UNORDERED_ACCESS)
 
 // Exactly "1" enables; unset, empty, "0", "true", "11", "1 " or anything longer disables.
-bool experimental_committed_texture_requested() {
+bool exactly_one(const char* variable) {
     char value[4] = {};
-    const DWORD length = GetEnvironmentVariableA(kExperimentalCommittedTextureVariable, value, sizeof(value));
+    const DWORD length = GetEnvironmentVariableA(variable, value, sizeof(value));
     return length == 1 && value[0] == '1';
+}
+bool experimental_committed_texture_requested() { return exactly_one(kExperimentalCommittedTextureVariable); }
+
+// ---- EXPERIMENT on top of the one above (opt-in, a diagnostic): the same frozen tuple on title-hook pages ----
+//
+// With PALMWAVE_EXPERIMENTAL_XBOX_TEXTURE_HOOK_BACKING exactly "1" as well (read on every call), the experimental
+// tuple goes to the registered HookBackedTextureHandler instead of CreateCommittedResource3 (contract in the header).
+// This is not a second tuple: the shape test is the same function, and nothing else is routed. Unset, the experiment
+// above is unchanged byte for byte.
+constexpr char kExperimentalTextureHookBackingVariable[] = "PALMWAVE_EXPERIMENTAL_XBOX_TEXTURE_HOOK_BACKING";
+std::atomic<HookBackedTextureHandler> g_hook_backed_texture{nullptr};
+std::atomic<std::uint64_t> g_hook_backed_routed{0};
+std::atomic<std::uint64_t> g_hook_backed_refused{0};
+
+// The page provider the route copies: an explicit one (tests) before the default (D3D12XboxCreateDevice's bridge).
+std::mutex& texture_provider_mutex() {
+    static auto* m = new std::mutex;
+    return *m;
+}
+TexturePageProvider g_explicit_texture_provider{};
+bool g_has_explicit_texture_provider = false;
+TexturePageProvider g_default_texture_provider{};
+
+TexturePageProvider current_texture_provider() {
+    std::lock_guard lock(texture_provider_mutex());
+    return g_has_explicit_texture_provider ? g_explicit_texture_provider : g_default_texture_provider;
+}
+
+bool usable_texture_provider(const TexturePageProvider& p) {
+    return p.allocate && p.release &&
+           (p.contract == TexturePageReleaseContract::at_final_release_only ||
+            p.contract == TexturePageReleaseContract::owned_allocation);
 }
 
 // The whole tuple, named field by named field. The DWORD at +4 of the description (padding after Dimension) and any
@@ -3143,13 +3175,41 @@ HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap
         pc_desc = &host_desc;
     }
 
+    // The hook-backing experiment on top (contract in the header): the same tuple, the same copy, a different creator.
+    const bool hook_backing = experimental && exactly_one(kExperimentalTextureHookBackingVariable);
+
     HRESULT hr = E_NOTIMPL;
     bool has_device10 = false;
 #ifdef __ID3D12Device10_INTERFACE_DEFINED__
     ID3D12Device10* device10 = nullptr;
     if (FAILED(self->real->QueryInterface(__uuidof(ID3D12Device10), reinterpret_cast<void**>(&device10))))
         device10 = nullptr;
-    if (device10) {
+    if (device10 && hook_backing) {
+        has_device10 = true;
+        const HookBackedTextureHandler handler = g_hook_backed_texture.load(std::memory_order_acquire);
+        const TexturePageProvider provider = current_texture_provider();  // captured once, for the resource's life
+        const char* refusal = !handler                              ? "no hook-backed texture handler is registered"
+                              : !usable_texture_provider(provider) ? "no texture page provider with a release contract"
+                                                                   : nullptr;
+        if (refusal) {
+            g_hook_backed_refused.fetch_add(1, std::memory_order_relaxed);
+            hr = E_NOTIMPL;  // nothing allocated, no ordinary image instead
+        } else {
+            g_hook_backed_routed.fetch_add(1, std::memory_order_relaxed);
+            hr = handler(device10, *heap, static_cast<D3D12_HEAP_FLAGS>(heap_flags), *pc_desc, layout,
+                         reinterpret_cast<const D3D12_CLEAR_VALUE*>(clear_word), provider,
+                         kXmemCommittedTextureAttributesHypothesis, *riid, out);
+        }
+        device10->Release();
+        if (FAILED(hr) && out) *out = nullptr;
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 127 EXPERIMENTAL hook-backed texture (PALMWAVE_EXPERIMENTAL_XBOX_TEXTURE_HOOK_"
+                     "BACKING=1; a diagnostic, not a console ABI): attributes 0x%llx (hypothesis) -> 0x%08lx%s%s\n",
+                     static_cast<unsigned long long>(kXmemCommittedTextureAttributesHypothesis),
+                     static_cast<unsigned long>(hr), refusal ? ", refused: " : "", refusal ? refusal : "");
+        d3d12_trace::record("Xbox CreateCommittedResource3 (device slot 127) EXPERIMENTAL hook-backed texture",
+                            "experimental-hypothesis");
+    } else if (device10) {
         has_device10 = true;
         hr = device10->CreateCommittedResource3(
             heap, static_cast<D3D12_HEAP_FLAGS>(heap_flags), pc_desc, static_cast<D3D12_BARRIER_LAYOUT>(layout),
@@ -3161,6 +3221,7 @@ HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap
     }
 #else
     (void)self;
+    (void)hook_backing;
 #endif
     if (experimental) {
         // Every experimental attempt is logged and traced after the backend has answered; the outcome token marks the
@@ -4233,6 +4294,24 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 void set_placed_at_va_handler(PlacedAtVaHandler handler) {
     g_placed_at_va.store(handler, std::memory_order_release);
 }
+
+void set_hook_backed_texture_handler(HookBackedTextureHandler handler) {
+    g_hook_backed_texture.store(handler, std::memory_order_release);
+}
+
+void set_texture_page_provider(const TexturePageProvider* provider) {
+    std::lock_guard lock(texture_provider_mutex());
+    g_has_explicit_texture_provider = provider != nullptr;
+    g_explicit_texture_provider = provider ? *provider : TexturePageProvider{};
+}
+
+void set_default_texture_page_provider(const TexturePageProvider* provider) {
+    std::lock_guard lock(texture_provider_mutex());
+    g_default_texture_provider = provider ? *provider : TexturePageProvider{};
+}
+
+std::uint64_t hook_backed_texture_routed_calls() { return g_hook_backed_routed.load(std::memory_order_relaxed); }
+std::uint64_t hook_backed_texture_refused_calls() { return g_hook_backed_refused.load(std::memory_order_relaxed); }
 
 bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || (slot >= 17 && slot <= 24) || slot == 25 || slot == 26 ||

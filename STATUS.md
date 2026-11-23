@@ -315,3 +315,29 @@ DLL initializations, no unimplemented import, and 2,249 D3D12 events (2,205 ok, 
 12 experimental-hypothesis, one experimental, two refused imported RAW views). No Draw,
 ExecuteCommandLists, Present or rendered game frame was observed. The debugger's exit code zero
 records diagnostic completion, not successful completion of the executable.
+
+
+## Committed images use the registered allocator's real pages
+
+An additional opt-in, PALMWAVE_EXPERIMENTAL_XBOX_TEXTURE_HOOK_BACKING=1, binds the frozen
+committed-texture tuple to the actual pages returned through its allocation callbacks.
+Each 4K image imports 33,177,600 bytes into one linear VkImage; the same original pages are
+used by CPU access, RTV clears, UAV writes and SRV reads. The callback's scoped allocation
+cursor now advances naturally. Logical frees occur inside the caller's scope, while pins
+retain the physical pool until Vulkan views, images and memory have retired.
+
+The integrated runtime passed all three focused CTests in 1.07 seconds. On NVIDIA GeForce
+RTX 5080 / 621.14, the hook-backed GPU test passed in 0.87 seconds with zero Vulkan and
+synchronization-validation errors. It verifies original-page pixels, two slices of one 64 MiB
+pool, both release orders, scope removal before deferred retirement, and explicit refusal
+and rollback cases. The release test does not claim deterministic GPU concurrency.
+
+Two offline executable runs then created both hook-backed images successfully and reached
+CreateRootSignature and CreateComputePipelineState. The previous allocation-accounting
+assertion was not observed. Both stopped instead on a secondary-thread null write at RVA
+0x2215c35. The second capture found the pipeline-creation thread inside ShaderLibrary's JSON
+index loader at that moment; this identifies work in progress, not yet the cause of the
+secondary-thread stop. Each trace records 24 startup events, four successful DLL initializations,
+no unimplemented import, and 2,251 D3D12 events (2,205 ok, 29 called, 14 experimental-hypothesis,
+one experimental, two refused negative-address RAW views). No Draw, ExecuteCommandLists,
+Present or game image was observed. The runtime remains experimental.

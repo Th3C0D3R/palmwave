@@ -32,6 +32,10 @@ class VulkanPresenter;
 struct PresentPlanes;
 }
 
+namespace rt::d3d12_xs {
+struct TexturePageProvider;  // d3d12_xs_device.h
+}
+
 namespace rt::d3d12 {
 
 // How a queue answers GetClockCalibration. With `calibrated` (vkGetCalibratedTimestampsKHR or its EXT alias, on a
@@ -260,6 +264,48 @@ HRESULT create_buffer_at_host_address(ID3D12Device* device, void* address, const
                                       std::uint32_t initial_state, REFIID riid, void** out);
 // Live slot-133 host imports on `device` (each shared by one or more resources). For tests.
 std::size_t host_import_count(ID3D12Device* device);
+
+// Palmwave EXPERIMENT, opt-in only (d3d12_xs_device.h "title-hook pages behind slot 127's experimental texture"): the
+// handler the device proxy calls for slot 127's frozen tuple when PALMWAVE_EXPERIMENTAL_XBOX_TEXTURE_HOOK_BACKING=1 as
+// well. It makes ONE linear VkImage whose memory is a VK_EXT_external_memory_host import of the pages
+// `provider.allocate` returns for the image's real size (rounded only to minImportedHostPointerAlignment), bound at
+// offset 0, or fails with a null output; it never makes an ordinary image instead. Policy: src/hook_backed_image.h.
+//   - Refused before any allocation (E_NOTIMPL unless noted): not this layer's device, no extension or queries, not a
+//     DEFAULT-heap single-mip single-sample plain colour 2D texture, a linear image of this format and usage not
+//     host-importable or dedicated-only, a dedicated requirement, no HOST_VISIBLE | HOST_COHERENT type for the image;
+//     description, layout and clear-value rules as CreateCommittedResource3 (E_INVALIDARG).
+//   - Refused after: the provider's failure (E_OUTOFMEMORY / E_FAIL), an address not aligned to
+//     max(minImportedHostPointerAlignment, the image's memory alignment) (never rounded), pages no shim owns or already
+//     imported, pages not committed plain read-write (E_INVALIDARG) or write-combined/uncached, an empty
+//     image & host-pointer & coherent type set, an import, bind or first-transition failure.
+// The pages are pinned from before they are checked until the image, its views and the import are destroyed after the
+// GPU work that used them retires (one deferred group, in that order, then the unpin). The provider's release is called
+// once, synchronously, at the final COM Release (or at a failed creation only under the owned_allocation contract).
+// The texture lives in GENERAL; its first transition (zero fill unless CREATE_NOT_ZEROED) is submitted and waited for
+// before this returns, so host writes afterwards are kept. GetDesc reports Layout UNKNOWN: the linear tiling is this
+// layer's choice, not the console's layout, DCC or tiling.
+HRESULT create_hook_backed_texture(ID3D12Device* device, const D3D12_HEAP_PROPERTIES& heap, D3D12_HEAP_FLAGS heap_flags,
+                                   const D3D12_RESOURCE_DESC1& desc, std::uint32_t initial_layout,
+                                   const D3D12_CLEAR_VALUE* clear, const rt::d3d12_xs::TexturePageProvider& provider,
+                                   std::uint64_t attributes, REFIID riid, void** out);
+// Diagnostics for tests: where a created hook-backed texture's bytes are. False for any other resource.
+struct HookBackedTextureInfo {
+    void* address = nullptr;          // the provider's address: the import's first byte, the image bound at offset 0
+    std::uint64_t bytes = 0;          // asked for and imported
+    std::uint64_t requirement_size = 0, requirement_alignment = 0;
+    std::uint32_t image_memory_types = 0;  // VkMemoryRequirements::memoryTypeBits of the linear image
+    std::uint32_t memory_type = 0;         // the import's type index
+    VkMemoryPropertyFlags memory_flags = 0;
+    std::uint64_t offset = 0, row_pitch = 0, layout_size = 0;  // vkGetImageSubresourceLayout, subresource 0
+    bool owned_allocation = false;    // the provider's release contract
+};
+bool hook_backed_texture_info(ID3D12Resource* resource, HookBackedTextureInfo* out);
+struct HookBackedTextureCounters {
+    std::uint64_t live = 0;                    // created and not yet released
+    std::uint64_t logical_releases = 0;        // provider release calls
+    std::uint64_t unreturned_allocations = 0;  // failed creations whose pages were kept (at_final_release_only)
+};
+HookBackedTextureCounters hook_backed_texture_counters(ID3D12Device* device);
 
 // The property flags of the Vulkan memory type behind a resource created by such a device, or 0. For tests.
 VkMemoryPropertyFlags vulkan_memory_flags(ID3D12Resource* resource);

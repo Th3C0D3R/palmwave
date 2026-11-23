@@ -248,6 +248,73 @@ using PlacedAtVaHandler = HRESULT (*)(ID3D12Device* real, void* va, const D3D12_
                                       std::uint32_t initial_state, REFIID riid, void** out);
 void set_placed_at_va_handler(PlacedAtVaHandler handler);
 
+// ---- EXPERIMENT, opt-in only: title-hook pages behind slot 127's experimental texture (a diagnostic, not a console ABI) --
+//
+// Off unless BOTH PALMWAVE_EXPERIMENTAL_XBOX_COMMITTED_TEXTURE and PALMWAVE_EXPERIMENTAL_XBOX_TEXTURE_HOOK_BACKING are
+// exactly "1" (each read on every slot-127 call) AND the request is the one frozen tuple of
+// experimental_committed_texture_shape. No other tuple, flag or call (PC CreateCommittedResource3 included) is routed
+// here. Then, instead of ID3D12Device10::CreateCommittedResource3 on the copy, the proxy calls the registered handler
+// on the ID3D12Device10 pointer QueryInterface returned (released after the call, as on the strict path) with:
+//   - the same copy of the description (Flags 0x00300005 -> 0x5), the title's heap, heap flags, initial layout word
+//     (3, unchanged), clear value, riid and out;
+//   - a COPY of the current TexturePageProvider (below), so allocate, release and the release contract are captured
+//     together for the resource's whole life, whatever is registered later;
+//   - kXmemCommittedTextureAttributesHypothesis.
+// The handler (the Vulkan layer's rt::d3d12::create_hook_backed_texture) makes ONE linear VkImage bound to an import of
+// the pages the provider returns, or fails with a null output. It never makes an ordinary image instead. No handler or
+// no provider: E_NOTIMPL, null output, nothing allocated. A failing handler must leave *out null; the proxy clears it
+// again. Every attempt is logged and traced "experimental-hypothesis".
+//
+// The attribute word is a HYPOTHESIS: (0x80 << 16) | (2 << 14), the value public reference code (Leonida PR #7240,
+// jacksonslab, d61755d4, GPL-3.0, labelled a hypothesis there; also OpenScarlett 87cdba6, MIT) passes for committed
+// resources. The allocator field (bits 16..23 = 0x80) matches how the registered hook pair decodes the allocator ID; the
+// page-size and object-type fields are not established. It is used only to request real pages under this opt-in, and
+// the exact word is passed again at the logical release.
+inline constexpr std::uint64_t kXmemCommittedTextureAttributesHypothesis = 0x00808000ull;
+
+// Pages for one texture. allocate/release have the DescriptorHeapAllocator shape and the backing record is the same
+// (address, an opaque token such as the hook registration's generation, an opaque release routine).
+//
+// Two lifetimes are kept apart:
+//   - LOGICAL release: `release(backing, attributes)`, exactly once, called synchronously from the texture's final COM
+//     Release (no lock held, the captured routine and word). A title's allocation scope that hands out slices of one
+//     pool expects its scoped free to see each slice there (its free ignores interior slices and forwards only the pool
+//     base); it is not deferred to GPU retirement, when that scope may be gone.
+//   - PHYSICAL pages: pinned (host_pins.h) from before the import until the image, its views and the imported memory
+//     are destroyed after the GPU work that used them retires. A shim-mediated free of the pool while pinned is
+//     deferred or refused there, so the logical release cannot pull the pages from under the GPU. An allocator that
+//     reuses the bytes itself before then is outside what a pin can block.
+// `contract` says when `release` is known to be valid:
+//   - at_final_release_only: only from the final COM Release of a texture that was created. A creation that fails after
+//     `allocate` succeeded does NOT call it (no free scope is known to be active then, and a free of an interior slice
+//     outside that scope would reach a default free with a non-base pointer); the allocation is left with its allocator
+//     and the failure is logged and counted (hook_backed_texture_unreturned_allocations). Not a silent leak, not a
+//     reclamation either. The title-hook bridge uses this.
+//   - owned_allocation: each backing is a separate allocation the provider owns, and `release` frees it at any time,
+//     a failed creation included (after the image is destroyed, the memory freed and the pages unpinned).
+enum class TexturePageReleaseContract : std::uint32_t { at_final_release_only = 1, owned_allocation = 2 };
+struct TexturePageProvider {
+    DescriptorBackingStatus (*allocate)(std::size_t byte_size, std::uint64_t attributes, DescriptorHeapBacking* out);
+    void (*release)(const DescriptorHeapBacking& backing, std::uint64_t attributes);
+    TexturePageReleaseContract contract;
+};
+// The provider the route consults (copied). An explicit one (tests) wins; the default (D3D12XboxCreateDevice's bridge
+// to the title's registered __XMemAllocationHooks__, contract at_final_release_only) is used only while no explicit
+// one is set. Null clears.
+void set_texture_page_provider(const TexturePageProvider* provider);
+void set_default_texture_page_provider(const TexturePageProvider* provider);
+
+using HookBackedTextureHandler = HRESULT (*)(ID3D12Device* real, const D3D12_HEAP_PROPERTIES& heap,
+                                             D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC1& desc,
+                                             std::uint32_t initial_layout, const D3D12_CLEAR_VALUE* clear,
+                                             const TexturePageProvider& provider, std::uint64_t attributes,
+                                             REFIID riid, void** out);
+void set_hook_backed_texture_handler(HookBackedTextureHandler handler);
+// Slot-127 hook-backing attempts (any device; for tests): routed to the handler, and refused before it (no handler or
+// no usable provider; nothing allocated).
+std::uint64_t hook_backed_texture_routed_calls();
+std::uint64_t hook_backed_texture_refused_calls();
+
 // ---- Device slot 70: a raw buffer SRV named by console GPU VA ----
 //
 // The console call is void(this, const D3D12_RESOURCE_DESC* resource, const view* view, D3D12_CPU_DESCRIPTOR_HANDLE

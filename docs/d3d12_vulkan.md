@@ -4481,3 +4481,59 @@ leaving their destination descriptors unchanged. This replaces the earlier succe
 claim with a checked refusal for this placement; it does not establish that the executable can read the import.
 The probe still reached the strict slot-127 texture flag refusal, with 2,238 D3D12 events and no Draw,
 ExecuteCommandLists or Present observed. Supporting a negative relative base remains necessary.
+
+
+### Experimental hook-backed committed texture
+
+The existing frozen slot-127 experiment gains a second exact opt-in,
+`PALMWAVE_EXPERIMENTAL_XBOX_TEXTURE_HOOK_BACKING=1`, in addition to
+`PALMWAVE_EXPERIMENTAL_XBOX_COMMITTED_TEXTURE=1`. It accepts the same tuple only.
+The provider returns pages for the queried Vulkan image requirements; one LINEAR
+`VkImage` imports those pages using `VK_EXT_external_memory_host`. There is no
+independent DEFAULT image, shadow allocation, copy fallback or synthetic budget
+charge. Unsupported image features, dedicated allocation, memory-type intersection,
+address alignment, page protection or pin ownership cause a real refusal. The
+caller description and initial layout word remain unchanged. This host storage
+choice does not establish console tiling, DCC or the meaning of resource bits
+`0x00300000`. The first different tuple still requires a common, evidenced rule
+and an oracle; it must not become another tuple exception.
+
+The allocator bridge captures the registered allocation/free pair and generation.
+For this diagnostic it passes attributes `0x00808000`; locally observed scope
+behavior supports the allocator-index and filter fields, not a universal attribute
+ABI. The hook, not the shim, rounds each requested size to its pool granularity.
+Managed XMem allocations of at least 64 KiB now have a host alignment guarantee
+of 64 KiB while retaining their exact logical size and original allocation pointer.
+Every import still checks its actual Vulkan requirements.
+
+Logical free runs synchronously at final resource COM Release while the caller's
+free scope remains active. Its pool-base physical free stays pending under every
+import pin. One deferred group destroys framebuffers, views, the image, then its
+imported memory, and only then unpins. A failed group allocation, collection or
+enqueue retains the group/pages and reports it rather than freeing live objects.
+Failed creation with an `at_final_release_only` provider does not call an unsafe
+free outside that scope: the unreturned allocation is explicitly counted. An
+owned-allocation test provider can release on rollback.
+
+External images start UNDEFINED. A real transition to GENERAL and its fence
+complete before the resource is returned; CPU writes afterwards are preserved.
+The image remains in GENERAL and submissions include a write-to-HOST_READ
+dependency before fence completion.
+
+Validation on 2026-11-23: the focused runtime GPU CTest passed in 0.87 s on NVIDIA
+GeForce RTX 5080 / 621.14 with Vulkan and synchronization validation, zero errors.
+It created two slices from one real 64 MiB XMem pool, each requesting 33,177,600
+bytes (image alignment 128, host import alignment 4096, coherent memory type 2,
+row pitch 15,360). It checked RTV clear/UAV writes in the original pages, CPU
+writes read through the real SRV, reversed logical releases before the host wait,
+pin retirement, a surviving interior slice after base release, and strict rollback.
+The GLSL fixtures implement the runtime descriptor contract; they are not a
+translated console texture shader. The test does not deterministically hold the
+GPU busy at Release. Two focused CPU CTests also passed (0.17 s total).
+
+The subsequent offline executable probe returned S_OK for two hook-backed
+textures and reached CreateRootSignature and CreateComputePipelineState. The
+previous allocation assertion was not observed. It stopped in a secondary thread;
+its cause remains under investigation. There were 2,251 D3D12 events and no
+observed Draw or Present. These results do not establish an executable frame or
+the separate imported-buffer/arena addressing path.

@@ -72,3 +72,23 @@ A backend recording failure still makes `Close` fail. Implementation: `runtime/s
 - That it is a compatibility fix. Its purpose is to reveal the next blocker in a diagnostic run. Any result obtained with it set (getting further in a boot, or any image) is an experimental observation and must be reported as one, not as a frame or a supported ABI.
 
 **To close it.** Decode the fast path paired with the vtable call, if there is one, and record only the public PM4 names and fields. If 131 emits `ACQUIRE_MEM` and 132 a `VS/PS/CS_PARTIAL_FLUSH`, the effect is established without publishing executable bytes. The synthetic producer → barrier → consumer test exercises the implemented dependency, but cannot identify the console methods. Until their contract is established, the default stays strict.
+
+
+### Hook-backed texture allocation: experimental runtime proof
+
+The frozen slot-127 texture experiment can now import real allocator-hook pages
+into one Vulkan LINEAR image under the additional
+`PALMWAVE_EXPERIMENTAL_XBOX_TEXTURE_HOOK_BACKING=1` opt-in. The focused RTX 5080
+oracle passed with zero Vulkan/synchronization errors: original-page RT/UAV
+writes, CPU-to-SRV reads, scoped logical frees, pinned physical retirement, and
+rollback. Two CPU tests passed too. Unknown console metadata/tiling semantics
+remain unknown; strict defaults and the first-different-tuple reevaluation rule
+remain in force. Creation failure may retain an allocation whose callback is
+valid only during final Release; this is explicitly logged/counted, not hidden.
+
+The offline executable subsequently created both hook-backed textures and reached
+root-signature and compute-pipeline creation. Its previous allocation assertion
+was not observed; a new secondary-thread stop is being investigated. The probe
+recorded 2,251 D3D12 events and no Draw or Present. No frame is claimed, and this
+texture result proves nothing about the separate imported-buffer shader address
+path.
