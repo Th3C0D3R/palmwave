@@ -41,6 +41,31 @@
 //   slots 78/79/80  SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX. A per-device token state machine answers
 //             them before the PC vtable is indexed; WaitFrameEventX returns at once with a fresh non-zero token.
 //             Slot 80 is outside a PC ID3D12Device11 table, so it is checked before the beyond-table refusal.
+//   slots 92-95, 108-110, 112  Xbox Series positions of ID3D12Device4/ID3D12Device8 resource methods. The mapping
+//             comes from public reference code (OpenScarlett, MIT, 87cdba6a). Leonida PR #7490's offset rule gives the
+//             same methods, and #7201 gives slot 108. It is not a measured retail call. Each call queries the PC device for the PC interface, calls that exact
+//             method through the returned pointer and releases it:
+//               92  -> ID3D12Device4::CreateCommittedResource1   93  -> ID3D12Device4::CreateHeap1
+//               94  -> ID3D12Device4::CreateReservedResource1    95  -> ID3D12Device4::GetResourceAllocationInfo1
+//               108 -> ID3D12Device8::GetResourceAllocationInfo2 109 -> ID3D12Device8::CreateCommittedResource2
+//               110 -> ID3D12Device8::CreatePlacedResource1      112 -> ID3D12Device8::GetCopyableFootprints1
+//             The caller's pointers (descriptions, DESC1 with its SamplerFeedbackMipRegion, heap properties, clear
+//             value, protected session, heap, output arrays) and values (heap flags, state, offset) reach the device
+//             unchanged. Mask, count and first-subresource words are truncated to UINT. The proxy reads none of the
+//             pointed-to bytes. Nothing is converted, masked, retried or replaced, and the device's result (HRESULT,
+//             UINT64_MAX allocation, failure footprint) comes back as it is. A null IID is E_POINTER and a null output
+//             goes to the device (its S_FALSE capability check). The device validates every other pointer. Heaps are
+//             the device's own ID3D12Heap objects, because the proxy does not wrap ID3D12Heap.
+//             No interface: the HRESULT routes return E_NOTIMPL with a null output. 95/108 write
+//             {UINT64_MAX, UINT64_MAX} and leave the per-resource array unwritten. 112 writes the PC failure footprint
+//             (each of `count` entries all ones, total UINT64_MAX). Each such call is logged once and traced
+//             "unsupported".
+//             95/108 accept the slot-25 console form (RCX return buffer, RDX device, R8 mask, R9 count, descriptions
+//             and per-resource array as stack words) and the PC C++ form (RCX device, RDX hidden return buffer). They
+//             write exactly 16 bytes and return the buffer in RAX. A null buffer is refused without a write or a
+//             device call, and RAX is null.
+//             A configured Xbox route (below) moved onto one of these slots keeps priority, as on slot 70. The global
+//             console mapping for 104-107 is not changed here.
 // The slots 48/73/78/79/80 are the public HLE Freminet/ScarlettX's observation, not Microsoft documentation, and can
 // be moved with PALMWAVE_XS_QUEUE_X_SLOT, PALMWAVE_XS_LIST_X_SLOT, PALMWAVE_XS_FRAME_INTERVAL_SLOT,
 // PALMWAVE_XS_SCHEDULE_EVENT_SLOT and PALMWAVE_XS_WAIT_EVENT_SLOT (3..127; anything else is logged once and ignored).
@@ -291,7 +316,8 @@ void reset_srv_at_va_stats();
 // proxies), 9 (allocator proxies), 14, 17-24 (CPU descriptor handles translated), 26 (the console's struct-return
 // form), 31/34/35/45/46/50 (proxies unwrapped),
 // 32 and 36 (fence proxies), 48/73 and 78/79/80 (the Xbox slots above, at their configured indices), 62, 67, 70, 76,
-// 127 and 133. A configured route moved onto slot 70 or 127 takes precedence over the built-in handler.
+// 92-95, 108-110, 112 (the Device4/Device8 resource routes), 127 and 133. A configured route moved onto
+// slot 70, 127 or a resource route takes precedence over the built-in handler.
 // Slot 10 is intentionally false: the measured 9/10 handle conversion is on the heap proxy, and device slot 9 is
 // CreateCommandAllocator, which the proxy handles for the allocator proxy.
 bool device_slot_overridden(unsigned slot);

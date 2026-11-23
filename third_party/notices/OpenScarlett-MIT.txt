@@ -1,0 +1,31 @@
+OpenScarlett notice
+
+Palmwave's Xbox Series device resource routes (device slots 92-95, 108-110 and 112 in
+runtime/shims/d3d12_xs_device.cpp) take their slot-to-method mapping from OpenScarlett,
+src/shims/d3d12_xs_shim.cpp, revision 87cdba6a16052a5809f904ed5725d70e50521744
+(2026-11-23T21:38:41Z), by OpenScarlett Contributors. Only that mapping, and the idea of
+accepting both struct-return call forms at slots 95/108, is used. OpenScarlett's method bodies
+(description conversion, session dropping, state retries, flag masking and fallback resources)
+are not used. Its license follows unchanged.
+
+MIT License
+
+Copyright (c) 2026 OpenScarlett Contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

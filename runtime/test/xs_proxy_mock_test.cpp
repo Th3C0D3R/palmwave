@@ -18,6 +18,8 @@
 //     a raw view of the live buffer through PC slot 18 with the translated handle, never PC slot 70; every refusal
 //     (shape, range, destination, VA, resolver, unreadable bytes) writes nothing and leaves no reference. --slot70 runs
 //     it with the D3D12 trace on; --env-slots-70 moves a configured route onto 70, which must win;
+//   - --resource-routes: device slots 92-95, 108-110 and 112 to ID3D12Device4/ID3D12Device8 through separate
+//     queried interface objects (95/108 in the console and the PC struct-return form), and their explicit refusals;
 //   - --host-import-experiment on|off: device slot 133's opt-in experiment (PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT, set
 //     by CTest for the process, never by the test): the one experimental tuple reaches the handler as UAV / COMMON
 //     only when the variable is "1"; every near miss is refused before the handler either way.
@@ -40,6 +42,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <iterator>
 #include <new>
 #include <utility>
@@ -107,6 +110,22 @@ constexpr std::uint64_t kMockHeapGpuBase = 0x0000580000000000ull;
 // {5d1e0c4a-2b7f-4e61-9a3d-8c4b2f1e6a70}: an interface the mock queue implements that the proxy does not model.
 constexpr GUID kExtraIid{0x5d1e0c4a, 0x2b7f, 0x4e61, {0x9a, 0x3d, 0x8c, 0x4b, 0x2f, 0x1e, 0x6a, 0x70}};
 
+// A separate ID3D12Device4 or ID3D12Device8 interface object of a mock device (section 11): QueryInterface for that
+// IID returns this, not the device, so a route that used the base pointer or never released would show. Only the PC
+// slots of the routes are typed entries; every other slot counts as a stray call.
+struct RouteAlias {
+    void** vtable;
+    long refs;                     // 1, held by the test; every route's query must give its reference back
+    unsigned calls[kMockSlots];    // per PC slot entered on this object
+    unsigned total_calls;          // every entry but AddRef/Release
+    std::uint64_t words[8];        // the words after `this` of the last call (the hidden buffer first for 56/68)
+    std::uint8_t desc_bytes[2][sizeof(D3D12_RESOURCE_DESC1)];  // descriptions as they arrived, padding included
+    HRESULT result;                // what the next create answers (S_OK makes an object)
+    void* made;                    // the object the last successful create wrote
+    D3D12_RESOURCE_ALLOCATION_INFO answer;  // 56/68
+    D3D12_RESOURCE_ALLOCATION_INFO1 per[2];  // 56/68, written for the first two resources
+};
+
 struct Mock {
     void** vtable;
     Kind kind;
@@ -149,6 +168,9 @@ struct Mock {
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
     // device slot 18 (CreateShaderResourceView): the description as it arrived (the caller's copy is temporary).
     D3D12_SHADER_RESOURCE_VIEW_DESC srv;
+    // device: the separate objects QueryInterface returns for ID3D12Device4 / ID3D12Device8 (null: the device itself).
+    RouteAlias* device4_alias;
+    RouteAlias* device8_alias;
 };
 
 Mock g_pool[512];
@@ -246,6 +268,16 @@ HRESULT mock_query(Mock* m, const IID* riid, void** out) {
     }
 #endif
     if (!riid || !mock_has(m, *riid)) return E_NOINTERFACE;
+    if (m->kind == Kind::device) {
+        RouteAlias* alias = IsEqualIID(*riid, __uuidof(ID3D12Device4))   ? m->device4_alias
+                            : IsEqualIID(*riid, __uuidof(ID3D12Device8)) ? m->device8_alias
+                                                                         : nullptr;
+        if (alias) {
+            *out = alias;
+            ++alias->refs;
+            return S_OK;
+        }
+    }
     *out = m;
     ++m->refs;
     return S_OK;
@@ -3099,6 +3131,635 @@ int check_srv_at_va() {
     return 0;
 }
 
+// ---- 11. Device4/Device8 resource routes: console slots 92-95, 108-110 and 112 (--resource-routes) ----
+//
+// The slot-to-method mapping is public reference only (OpenScarlett and two upstream PRs), not a measured retail call.
+// The mock device answers ID3D12Device4/ID3D12Device8 with separate RouteAlias objects. Each route must use the
+// returned pointer and release it (reference counts balanced), and call the PC slot of the method exactly once with the
+// caller's pointers and bytes (padding, DESC1 mip region, unknown flag bits) and values. A word after the method's
+// own carries a canary that must never arrive, and every output sits between canaries. A device without the interface
+// must get the explicit refusal for each shape. No GPU, no D3D12 runtime.
+
+static_assert(sizeof(D3D12_RESOURCE_DESC) == 56 && sizeof(D3D12_RESOURCE_DESC1) == 64,
+              "the description strides the routes forward unchanged");
+constexpr std::uint64_t kTailCanary = 0xC0DEC0DE00000000ull;  // + word index, past the method's own words
+constexpr std::uint64_t kFootprintTotal = 0x0000000BADC0FFEEull;
+
+RouteAlias g_aliases[8];
+unsigned g_aliases_used = 0;
+
+template <unsigned Slot>
+std::uint64_t WINAPI alias_slot(RouteAlias* self, std::uint64_t, std::uint64_t a2, std::uint64_t, std::uint64_t) {
+    (void)a2;  // QueryInterface's output; the other slots ignore their words
+    if constexpr (Slot == 1) {
+        return static_cast<std::uint64_t>(++self->refs);
+    } else if constexpr (Slot == 2) {
+        return static_cast<std::uint64_t>(--self->refs);
+    } else {
+        ++self->calls[Slot];  // a stray call: a route reached a PC slot that is not its method
+        ++self->total_calls;
+        if constexpr (Slot == 0) {
+            if (a2) *reinterpret_cast<void**>(a2) = nullptr;
+            return static_cast<std::uint32_t>(E_NOINTERFACE);
+        }
+        return static_cast<std::uint32_t>(E_FAIL);
+    }
+}
+
+void alias_record(RouteAlias* self, unsigned pc_slot, const std::uint64_t* words, unsigned count, std::uint64_t descs,
+                  std::size_t stride, std::uint32_t desc_count) {
+    ++self->calls[pc_slot];
+    ++self->total_calls;
+    std::memset(self->words, 0, sizeof(self->words));
+    std::memcpy(self->words, words, count * sizeof(std::uint64_t));
+    std::memset(self->desc_bytes, 0, sizeof(self->desc_bytes));
+    for (std::uint32_t i = 0; descs && i < desc_count && i < 2; ++i)
+        std::memcpy(self->desc_bytes[i], reinterpret_cast<const std::uint8_t*>(descs) + i * stride, stride);
+}
+
+// S_FALSE without an output (the PC capability check); `result` otherwise, with a new object on success.
+std::uint64_t alias_create(RouteAlias* self, std::uint64_t out_word) {
+    auto** out = reinterpret_cast<void**>(out_word);
+    if (!out) return static_cast<std::uint32_t>(S_FALSE);
+    *out = nullptr;
+    if (FAILED(self->result)) return static_cast<std::uint32_t>(self->result);
+    Mock* child = new_mock(Kind::resource);
+    child->refs = 1;
+    self->made = child;
+    *out = child;
+    return static_cast<std::uint32_t>(S_OK);
+}
+
+// PC slot 53, ID3D12Device4::CreateCommittedResource1(heap properties, heap flags, desc, state, clear, session, riid, out)
+std::uint64_t WINAPI alias_committed1(RouteAlias* self, std::uint64_t heap, std::uint64_t flags, std::uint64_t desc,
+                                      std::uint64_t state, std::uint64_t clear, std::uint64_t session,
+                                      std::uint64_t riid, std::uint64_t out) {
+    const std::uint64_t w[] = {heap, flags, desc, state, clear, session, riid, out};
+    alias_record(self, 53, w, 8, desc, sizeof(D3D12_RESOURCE_DESC), 1);
+    return alias_create(self, out);
+}
+
+// PC slot 54, ID3D12Device4::CreateHeap1(heap desc, session, riid, out)
+std::uint64_t WINAPI alias_heap1(RouteAlias* self, std::uint64_t desc, std::uint64_t session, std::uint64_t riid,
+                                 std::uint64_t out) {
+    const std::uint64_t w[] = {desc, session, riid, out};
+    alias_record(self, 54, w, 4, desc, sizeof(D3D12_HEAP_DESC), 1);
+    return alias_create(self, out);
+}
+
+// PC slot 55, ID3D12Device4::CreateReservedResource1(desc, state, clear, session, riid, out)
+std::uint64_t WINAPI alias_reserved1(RouteAlias* self, std::uint64_t desc, std::uint64_t state, std::uint64_t clear,
+                                     std::uint64_t session, std::uint64_t riid, std::uint64_t out) {
+    const std::uint64_t w[] = {desc, state, clear, session, riid, out};
+    alias_record(self, 55, w, 6, desc, sizeof(D3D12_RESOURCE_DESC), 1);
+    return alias_create(self, out);
+}
+
+// PC slot 69, ID3D12Device8::CreateCommittedResource2(heap properties, heap flags, DESC1, state, clear, session, riid,
+// out)
+std::uint64_t WINAPI alias_committed2(RouteAlias* self, std::uint64_t heap, std::uint64_t flags, std::uint64_t desc,
+                                      std::uint64_t state, std::uint64_t clear, std::uint64_t session,
+                                      std::uint64_t riid, std::uint64_t out) {
+    const std::uint64_t w[] = {heap, flags, desc, state, clear, session, riid, out};
+    alias_record(self, 69, w, 8, desc, sizeof(D3D12_RESOURCE_DESC1), 1);
+    return alias_create(self, out);
+}
+
+// PC slot 70, ID3D12Device8::CreatePlacedResource1(heap, offset, DESC1, state, clear, riid, out)
+std::uint64_t WINAPI alias_placed1(RouteAlias* self, std::uint64_t heap, std::uint64_t offset, std::uint64_t desc,
+                                   std::uint64_t state, std::uint64_t clear, std::uint64_t riid, std::uint64_t out) {
+    const std::uint64_t w[] = {heap, offset, desc, state, clear, riid, out};
+    alias_record(self, 70, w, 7, desc, sizeof(D3D12_RESOURCE_DESC1), 1);
+    return alias_create(self, out);
+}
+
+// PC slots 56 and 68 as the MSVC C++ methods are called: `this`, the hidden return buffer, mask, count, the
+// descriptions and the per-resource array (both on the stack). The buffer's address comes back in RAX.
+template <unsigned PcSlot, class Desc>
+std::uint64_t WINAPI alias_allocation(RouteAlias* self, std::uint64_t ret, std::uint64_t mask, std::uint64_t count,
+                                      std::uint64_t descs, std::uint64_t infos) {
+    const std::uint64_t w[] = {ret, mask, count, descs, infos};
+    const auto n = static_cast<std::uint32_t>(count);
+    alias_record(self, PcSlot, w, 5, descs, sizeof(Desc), n);
+    auto* each = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO1*>(infos);
+    for (std::uint32_t i = 0; each && i < n && i < 2; ++i) each[i] = self->per[i];
+    if (ret) std::memcpy(reinterpret_cast<void*>(ret), &self->answer, sizeof(self->answer));
+    return ret;
+}
+
+D3D12_PLACED_SUBRESOURCE_FOOTPRINT expected_footprint(std::uint64_t base, std::uint32_t i) {
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT f{};
+    f.Offset = base + i * 0x10000ull;
+    f.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, 64u >> i, 40u >> i, 1, 512};
+    return f;
+}
+
+bool same_footprint(const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& a, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& b) {
+    return a.Offset == b.Offset && a.Footprint.Format == b.Footprint.Format && a.Footprint.Width == b.Footprint.Width &&
+           a.Footprint.Height == b.Footprint.Height && a.Footprint.Depth == b.Footprint.Depth &&
+           a.Footprint.RowPitch == b.Footprint.RowPitch;
+}
+
+// PC slot 72, ID3D12Device8::GetCopyableFootprints1(DESC1, first, count, base offset, layouts, rows, row sizes, total)
+std::uint64_t WINAPI alias_footprints1(RouteAlias* self, std::uint64_t desc, std::uint64_t first, std::uint64_t count,
+                                       std::uint64_t base, std::uint64_t layouts, std::uint64_t rows,
+                                       std::uint64_t row_sizes, std::uint64_t total) {
+    const std::uint64_t w[] = {desc, first, count, base, layouts, rows, row_sizes, total};
+    alias_record(self, 72, w, 8, desc, sizeof(D3D12_RESOURCE_DESC1), 1);
+    const auto n = static_cast<std::uint32_t>(count);
+    for (std::uint32_t i = 0; i < n && i < 2; ++i) {
+        if (layouts) reinterpret_cast<D3D12_PLACED_SUBRESOURCE_FOOTPRINT*>(layouts)[i] = expected_footprint(base, i);
+        if (rows) reinterpret_cast<UINT*>(rows)[i] = 40u + i;
+        if (row_sizes) reinterpret_cast<UINT64*>(row_sizes)[i] = 0x300ull + i;
+    }
+    if (total) *reinterpret_cast<UINT64*>(total) = kFootprintTotal;
+    return 0;
+}
+
+template <std::size_t... I>
+void fill_alias_vtable(void** vtable, std::index_sequence<I...>) {
+    ((vtable[I] = reinterpret_cast<void*>(&alias_slot<static_cast<unsigned>(I)>)), ...);
+}
+
+void** alias_vtable() {
+    static void* table[kMockSlots];
+    static const bool filled = [] {
+        fill_alias_vtable(table, std::make_index_sequence<kMockSlots>{});
+        table[53] = reinterpret_cast<void*>(&alias_committed1);
+        table[54] = reinterpret_cast<void*>(&alias_heap1);
+        table[55] = reinterpret_cast<void*>(&alias_reserved1);
+        table[56] = reinterpret_cast<void*>(&alias_allocation<56, D3D12_RESOURCE_DESC>);
+        table[68] = reinterpret_cast<void*>(&alias_allocation<68, D3D12_RESOURCE_DESC1>);
+        table[69] = reinterpret_cast<void*>(&alias_committed2);
+        table[70] = reinterpret_cast<void*>(&alias_placed1);
+        table[72] = reinterpret_cast<void*>(&alias_footprints1);
+        return true;
+    }();
+    (void)filled;
+    return table;
+}
+
+RouteAlias* new_alias() {
+    if (g_aliases_used == std::size(g_aliases)) {
+        std::fprintf(stderr, "%s: alias pool exhausted\n", g_label);
+        std::exit(1);
+    }
+    RouteAlias* a = &g_aliases[g_aliases_used++];
+    std::memset(a, 0, sizeof(*a));
+    a->vtable = alias_vtable();
+    a->refs = 1;
+    return a;
+}
+
+// A device proxy over a mock at `level` whose Device4/Device8 queries (when that level answers them) return aliases.
+void* make_route_device(int level, Mock*& mock, RouteAlias*& device4, RouteAlias*& device8) {
+    mock = new_mock(Kind::device);
+    mock->device_level = level;
+    mock->refs = 1;
+    device4 = level >= 4 ? new_alias() : nullptr;
+    device8 = level >= 8 ? new_alias() : nullptr;
+    mock->device4_alias = device4;
+    mock->device8_alias = device8;
+    void* device = nullptr;
+    if (FAILED(xs::create_device_proxy(reinterpret_cast<ID3D12Device*>(mock), __uuidof(ID3D12Device), &device)))
+        return nullptr;
+    return device;
+}
+
+// A raw call through the proxy's table: `rcx` first (the proxy, or the console's return buffer), then 14 words.
+std::uint64_t call_slot(const void* device, unsigned slot, const void* rcx, const std::uint64_t (&w)[14]) {
+    void* const* vtable = *reinterpret_cast<void* const* const*>(device);
+    return reinterpret_cast<SlotFn>(vtable[slot])(const_cast<void*>(rcx), w[0], w[1], w[2], w[3], w[4], w[5], w[6],
+                                                  w[7], w[8], w[9], w[10], w[11], w[12], w[13]);
+}
+
+// The method's words first, canaries after them.
+void set_words(std::uint64_t (&w)[14], const std::uint64_t* args, unsigned count) {
+    for (unsigned i = 0; i < 14; ++i) w[i] = i < count ? args[i] : kTailCanary + i;
+}
+
+bool canaries_unseen(const RouteAlias* alias) {
+    for (const std::uint64_t value : alias->words)
+        if ((value & 0xFFFFFFFF00000000ull) == kTailCanary) return false;
+    return true;
+}
+
+struct OutSlot {
+    std::uint64_t before;
+    void* value;
+    std::uint64_t after;
+};
+constexpr std::uint64_t kOutBefore = 0x0123456789ABCDEFull, kOutAfter = 0xFEDCBA9876543210ull;
+
+struct CreateRoute {
+    unsigned slot, pc_slot, words;  // console slot, PC slot on the alias, argument words after `this`
+    unsigned riid_index, out_index;
+    std::uint32_t narrow;           // bit i: word i is 32-bit (poisoned above); only its low half must arrive
+    const void* desc;               // the description whose bytes must arrive and stay unchanged (or null)
+    std::size_t desc_bytes;
+};
+
+bool same_words(const RouteAlias* alias, const std::uint64_t (&w)[14], const CreateRoute& r) {
+    for (unsigned i = 0; i < r.words; ++i) {
+        const std::uint64_t mask = (r.narrow >> i) & 1 ? 0xFFFFFFFFull : ~0ull;
+        if ((alias->words[i] & mask) != (w[i] & mask)) return false;
+    }
+    return canaries_unseen(alias);
+}
+
+// One HRESULT route on a device that has the interface: S_OK with an object, the device's E_INVALIDARG and
+// E_OUTOFMEMORY with a null output, a null output (S_FALSE from the device), and a null IID (E_POINTER, no call).
+int check_create_route(void* device, Mock* mock, RouteAlias* alias, RouteAlias* other, const CreateRoute& r,
+                       const std::uint64_t* args) {
+    std::uint8_t desc_before[sizeof(D3D12_RESOURCE_DESC1)] = {};
+    if (r.desc) std::memcpy(desc_before, r.desc, r.desc_bytes);
+    const long alias_refs = alias->refs, host_refs = mock->refs;
+    const long other_refs = other ? other->refs : 0;
+    const unsigned other_calls = other ? other->total_calls : 0;
+    const unsigned long proxy_refs = xs::device_proxy_ref_count(device);
+    EXPECT(xs::device_slot_overridden(r.slot));
+    for (const HRESULT expected : {S_OK, E_INVALIDARG, E_OUTOFMEMORY}) {
+        alias->result = expected;
+        alias->made = nullptr;
+        OutSlot out{kOutBefore, reinterpret_cast<void*>(1), kOutAfter};
+        std::uint64_t w[14];
+        set_words(w, args, r.words);
+        w[r.out_index] = word(&out.value);
+        const unsigned calls = alias->calls[r.pc_slot], total = alias->total_calls;
+        const std::uint64_t hits = xs::device_slot_hits(r.slot);
+        EXPECT(hr_of(call_slot(device, r.slot, device, w)) == expected);
+        EXPECT(alias->calls[r.pc_slot] == calls + 1 && alias->total_calls == total + 1);
+        EXPECT(same_words(alias, w, r));
+        if (r.desc)
+            EXPECT(std::memcmp(alias->desc_bytes[0], desc_before, r.desc_bytes) == 0 &&
+                   std::memcmp(r.desc, desc_before, r.desc_bytes) == 0);
+        EXPECT(out.before == kOutBefore && out.after == kOutAfter);
+        if (expected == S_OK) {
+            EXPECT(alias->made && out.value == alias->made);
+            EXPECT(release(out.value) == 0);
+        } else {
+            EXPECT(out.value == nullptr);
+        }
+        EXPECT(xs::device_slot_hits(r.slot) == hits + 1);
+        EXPECT(alias->refs == alias_refs && mock->refs == host_refs && xs::device_proxy_ref_count(device) == proxy_refs);
+    }
+    alias->result = S_OK;
+    {  // The PC capability check: a null output reaches the device, whose S_FALSE comes back.
+        std::uint64_t w[14];
+        set_words(w, args, r.words);
+        w[r.out_index] = 0;
+        const unsigned calls = alias->calls[r.pc_slot];
+        EXPECT(hr_of(call_slot(device, r.slot, device, w)) == S_FALSE);
+        EXPECT(alias->calls[r.pc_slot] == calls + 1 && same_words(alias, w, r) && alias->words[r.out_index] == 0);
+    }
+    {  // A null IID cannot become a REFIID: E_POINTER, a null output and no query or call.
+        OutSlot out{kOutBefore, reinterpret_cast<void*>(1), kOutAfter};
+        std::uint64_t w[14];
+        set_words(w, args, r.words);
+        w[r.out_index] = word(&out.value);
+        w[r.riid_index] = 0;
+        const unsigned total = alias->total_calls;
+        const std::uint64_t hits = xs::device_slot_hits(r.slot);
+        EXPECT(hr_of(call_slot(device, r.slot, device, w)) == E_POINTER);
+        EXPECT(out.value == nullptr && out.before == kOutBefore && out.after == kOutAfter);
+        EXPECT(alias->total_calls == total && xs::device_slot_hits(r.slot) == hits + 1);
+    }
+    // Never the other interface object, the base device's PC slot or the console slot index on the device.
+    EXPECT(!other || (other->total_calls == other_calls && other->refs == other_refs));
+    EXPECT(mock->calls[r.pc_slot] == 0 && mock->calls[r.slot] == 0);
+    EXPECT(alias->refs == alias_refs && mock->refs == host_refs);
+    return 0;
+}
+
+// An HRESULT route on a device without its interface: E_NOTIMPL, a null output, nothing reaches any object.
+int expect_create_unsupported(void* device, Mock* mock, RouteAlias* present, const CreateRoute& r,
+                              const std::uint64_t* args) {
+    const unsigned present_calls = present ? present->total_calls : 0;
+    const long present_refs = present ? present->refs : 0;
+    const long host_refs = mock->refs;
+    for (const bool with_out : {true, false}) {
+        OutSlot out{kOutBefore, reinterpret_cast<void*>(1), kOutAfter};
+        std::uint64_t w[14];
+        set_words(w, args, r.words);
+        w[r.out_index] = with_out ? word(&out.value) : 0;
+        const std::uint64_t hits = xs::device_slot_hits(r.slot);
+        EXPECT(hr_of(call_slot(device, r.slot, device, w)) == E_NOTIMPL);
+        EXPECT(out.before == kOutBefore && out.after == kOutAfter);
+        EXPECT(with_out ? out.value == nullptr : out.value == reinterpret_cast<void*>(1));
+        EXPECT(xs::device_slot_hits(r.slot) == hits + 1);
+    }
+    EXPECT(!present || (present->total_calls == present_calls && present->refs == present_refs));
+    EXPECT(mock->calls[r.pc_slot] == 0 && mock->calls[r.slot] == 0 && mock->refs == host_refs);
+    return 0;
+}
+
+struct AllocationBuffer {
+    std::uint8_t before[16];
+    D3D12_RESOURCE_ALLOCATION_INFO value;
+    std::uint8_t after[64];
+};
+
+bool bytes_are(const void* p, std::size_t n, std::uint8_t value) {
+    const auto* b = static_cast<const std::uint8_t*>(p);
+    for (std::size_t i = 0; i < n; ++i)
+        if (b[i] != value) return false;
+    return true;
+}
+
+// Slot 95 or 108 in the console form (`console`: RCX buffer, RDX device) or the PC form (RCX device, RDX buffer),
+// with two descriptions, mask/count poisoned in their upper halves, and a three-entry per-resource array whose last
+// entry must stay untouched. `buffer` may be null. Returns RAX.
+std::uint64_t call_allocation(void* device, unsigned slot, bool console, AllocationBuffer* buffer, const void* descs,
+                              D3D12_RESOURCE_ALLOCATION_INFO1* infos) {
+    void* const value = buffer ? &buffer->value : nullptr;
+    const std::uint64_t args[] = {console ? word(device) : word(value), 0xDEADBEEF00000003ull, 0xFEEDFACE00000002ull,
+                                  word(descs), word(infos)};
+    std::uint64_t w[14];
+    set_words(w, args, 5);
+    return call_slot(device, slot, console ? value : device, w);
+}
+
+int check_allocation_route(void* device, Mock* mock, RouteAlias* alias, RouteAlias* other, unsigned slot,
+                           unsigned pc_slot, const void* descs, std::size_t stride) {
+    std::uint8_t descs_before[2 * sizeof(D3D12_RESOURCE_DESC1)];
+    std::memcpy(descs_before, descs, 2 * stride);
+    const long alias_refs = alias->refs, host_refs = mock->refs;
+    const long other_refs = other ? other->refs : 0;
+    const unsigned other_calls = other ? other->total_calls : 0;
+    EXPECT(xs::device_slot_overridden(slot));
+    alias->per[0] = {0x0000000000000000ull, 0x0000000000010000ull, 0x0000000000056000ull};
+    alias->per[1] = {0x0000000000060000ull, 0x0000000000000200ull, 0x0000000000001234ull};
+    const D3D12_RESOURCE_ALLOCATION_INFO answers[] = {{0x0000000123456000ull, 0x0000000000010000ull},
+                                                      {UINT64_MAX, 0x0000000000000200ull}};
+    for (const bool console : {true, false}) {
+        for (const D3D12_RESOURCE_ALLOCATION_INFO& answer : answers) {
+            alias->answer = answer;
+            AllocationBuffer buffer;
+            std::memset(&buffer, 0xA5, sizeof(buffer));
+            D3D12_RESOURCE_ALLOCATION_INFO1 infos[3];
+            std::memset(infos, 0x77, sizeof(infos));
+            const unsigned calls = alias->calls[pc_slot], total = alias->total_calls;
+            const std::uint64_t hits = xs::device_slot_hits(slot);
+            EXPECT(call_allocation(device, slot, console, &buffer, descs, infos) == word(&buffer.value));
+            EXPECT(alias->calls[pc_slot] == calls + 1 && alias->total_calls == total + 1);
+            EXPECT(alias->words[0] != 0 && static_cast<std::uint32_t>(alias->words[1]) == 3 &&
+                   static_cast<std::uint32_t>(alias->words[2]) == 2 && alias->words[3] == word(descs) &&
+                   alias->words[4] == word(infos) && canaries_unseen(alias));
+            for (unsigned i = 0; i < 2; ++i)
+                EXPECT(std::memcmp(alias->desc_bytes[i], descs_before + i * stride, stride) == 0);
+            EXPECT(std::memcmp(descs, descs_before, 2 * stride) == 0);
+            // Exactly the 16 bytes, the device's answer (UINT64_MAX included) unchanged.
+            EXPECT(buffer.value.SizeInBytes == answer.SizeInBytes && buffer.value.Alignment == answer.Alignment);
+            EXPECT(bytes_are(buffer.before, sizeof(buffer.before), 0xA5) &&
+                   bytes_are(buffer.after, sizeof(buffer.after), 0xA5));
+            EXPECT(std::memcmp(&infos[0], &alias->per[0], sizeof(infos[0])) == 0 &&
+                   std::memcmp(&infos[1], &alias->per[1], sizeof(infos[1])) == 0 &&
+                   bytes_are(&infos[2], sizeof(infos[2]), 0x77));
+            EXPECT(xs::device_slot_hits(slot) == hits + 1);
+            EXPECT(alias->refs == alias_refs && mock->refs == host_refs && xs::is_device_proxy(device));
+        }
+        // A null return buffer: refused, nothing written, no device call, RAX null.
+        D3D12_RESOURCE_ALLOCATION_INFO1 infos[3];
+        std::memset(infos, 0x77, sizeof(infos));
+        const unsigned total = alias->total_calls;
+        const std::uint64_t hits = xs::device_slot_hits(slot);
+        EXPECT(call_allocation(device, slot, console, nullptr, descs, infos) == 0);
+        EXPECT(alias->total_calls == total && bytes_are(infos, sizeof(infos), 0x77));
+        EXPECT(xs::device_slot_hits(slot) == hits + 1);
+    }
+    EXPECT(!other || (other->total_calls == other_calls && other->refs == other_refs));
+    EXPECT(mock->calls[pc_slot] == 0 && mock->calls[slot] == 0);
+    EXPECT(alias->refs == alias_refs && mock->refs == host_refs);
+    return 0;
+}
+
+// Slot 95 or 108 on a device without the interface: {UINT64_MAX, UINT64_MAX} in both forms, the per-resource array
+// unwritten, RAX the buffer.
+int expect_allocation_unsupported(void* device, Mock* mock, RouteAlias* present, unsigned slot, const void* descs) {
+    const unsigned present_calls = present ? present->total_calls : 0;
+    for (const bool console : {true, false}) {
+        AllocationBuffer buffer;
+        std::memset(&buffer, 0xA5, sizeof(buffer));
+        D3D12_RESOURCE_ALLOCATION_INFO1 infos[3];
+        std::memset(infos, 0x77, sizeof(infos));
+        const std::uint64_t hits = xs::device_slot_hits(slot);
+        EXPECT(call_allocation(device, slot, console, &buffer, descs, infos) == word(&buffer.value));
+        EXPECT(buffer.value.SizeInBytes == UINT64_MAX && buffer.value.Alignment == UINT64_MAX);
+        EXPECT(bytes_are(buffer.before, sizeof(buffer.before), 0xA5) &&
+               bytes_are(buffer.after, sizeof(buffer.after), 0xA5));
+        EXPECT(bytes_are(infos, sizeof(infos), 0x77));
+        EXPECT(xs::device_slot_hits(slot) == hits + 1);
+    }
+    EXPECT(!present || present->total_calls == present_calls);
+    EXPECT(mock->calls[slot] == 0);
+    return 0;
+}
+
+struct FootprintOutputs {
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layouts[3];
+    UINT rows[3];
+    UINT64 row_sizes[3];
+    UINT64 total;
+    UINT64 after;
+};
+
+void call_footprints(void* device, const D3D12_RESOURCE_DESC1* desc, std::uint64_t base, FootprintOutputs& o) {
+    const std::uint64_t args[] = {word(desc), 0xAAAA000000000001ull, 0xBBBB000000000002ull, base,
+                                  word(o.layouts), word(o.rows), word(o.row_sizes), word(&o.total)};
+    std::uint64_t w[14];
+    set_words(w, args, 8);
+    (void)call_slot(device, 112, device, w);
+}
+
+int check_footprints_route(void* device, Mock* mock, RouteAlias* alias, RouteAlias* other,
+                           const D3D12_RESOURCE_DESC1* desc) {
+    EXPECT(xs::device_slot_overridden(112));
+    std::uint8_t desc_before[sizeof(D3D12_RESOURCE_DESC1)];
+    std::memcpy(desc_before, desc, sizeof(desc_before));
+    const long alias_refs = alias->refs;
+    const unsigned other_calls = other ? other->total_calls : 0;
+    constexpr std::uint64_t kBase = 0x123456789ABCDEF0ull;  // a 64-bit offset: its upper half must arrive
+    FootprintOutputs o;
+    std::memset(&o, 0x66, sizeof(o));
+    const unsigned calls = alias->calls[72], total = alias->total_calls;
+    const std::uint64_t hits = xs::device_slot_hits(112);
+    call_footprints(device, desc, kBase, o);
+    EXPECT(alias->calls[72] == calls + 1 && alias->total_calls == total + 1);
+    EXPECT(alias->words[0] == word(desc) && static_cast<std::uint32_t>(alias->words[1]) == 1 &&
+           static_cast<std::uint32_t>(alias->words[2]) == 2 && alias->words[3] == kBase &&
+           alias->words[4] == word(o.layouts) && alias->words[5] == word(o.rows) &&
+           alias->words[6] == word(o.row_sizes) && alias->words[7] == word(&o.total) && canaries_unseen(alias));
+    EXPECT(std::memcmp(alias->desc_bytes[0], desc_before, sizeof(desc_before)) == 0 &&
+           std::memcmp(desc, desc_before, sizeof(desc_before)) == 0);
+    for (std::uint32_t i = 0; i < 2; ++i)
+        EXPECT(same_footprint(o.layouts[i], expected_footprint(kBase, i)) && o.rows[i] == 40u + i &&
+               o.row_sizes[i] == 0x300ull + i);
+    EXPECT(bytes_are(&o.layouts[2], sizeof(o.layouts[2]), 0x66) && bytes_are(&o.rows[2], sizeof(o.rows[2]), 0x66) &&
+           bytes_are(&o.row_sizes[2], sizeof(o.row_sizes[2]), 0x66));
+    EXPECT(o.total == kFootprintTotal && bytes_are(&o.after, sizeof(o.after), 0x66));
+    EXPECT(xs::device_slot_hits(112) == hits + 1);
+    EXPECT(alias->refs == alias_refs && (!other || other->total_calls == other_calls));
+    EXPECT(mock->calls[72] == 0 && mock->calls[112] == 0);
+    return 0;
+}
+
+// Slot 112 without ID3D12Device8: the PC failure footprint for the `count` entries, never a usable one.
+int expect_footprints_unsupported(void* device, Mock* mock, RouteAlias* present, const D3D12_RESOURCE_DESC1* desc) {
+    const unsigned present_calls = present ? present->total_calls : 0;
+    FootprintOutputs o;
+    std::memset(&o, 0x66, sizeof(o));
+    const std::uint64_t hits = xs::device_slot_hits(112);
+    call_footprints(device, desc, 0x123456789ABCDEF0ull, o);
+    for (unsigned i = 0; i < 2; ++i)
+        EXPECT(bytes_are(&o.layouts[i], sizeof(o.layouts[i]), 0xFF) && o.rows[i] == ~0u && o.row_sizes[i] == ~0ull);
+    EXPECT(bytes_are(&o.layouts[2], sizeof(o.layouts[2]), 0x66) && bytes_are(&o.rows[2], sizeof(o.rows[2]), 0x66) &&
+           bytes_are(&o.row_sizes[2], sizeof(o.row_sizes[2]), 0x66));
+    EXPECT(o.total == UINT64_MAX && bytes_are(&o.after, sizeof(o.after), 0x66));
+    EXPECT(xs::device_slot_hits(112) == hits + 1);
+    EXPECT(!present || present->total_calls == present_calls);
+    EXPECT(mock->calls[72] == 0 && mock->calls[112] == 0);
+    return 0;
+}
+
+int check_resource_routes() {
+    // Two descriptions of each kind: patterned padding, console-looking layout words and unknown flag bits, and a
+    // nonzero sampler-feedback mip region in every DESC1. The proxy must hand all of it over untouched.
+    D3D12_RESOURCE_DESC descs[2];
+    std::memset(descs, 0x5C, sizeof(descs));
+    descs[0].Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    descs[0].Alignment = 0x10000;
+    descs[0].Width = 0x1234;
+    descs[0].Height = 0x567;
+    descs[0].DepthOrArraySize = 6;
+    descs[0].MipLevels = 9;
+    descs[0].Format = DXGI_FORMAT_BC7_UNORM;
+    descs[0].SampleDesc = {1, 0};
+    descs[0].Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+    descs[0].Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x80020000u);
+    descs[1].Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    descs[1].Alignment = 0;
+    descs[1].Width = 0xABCDE;
+    descs[1].Height = 1;
+    descs[1].DepthOrArraySize = 1;
+    descs[1].MipLevels = 1;
+    descs[1].Format = DXGI_FORMAT_UNKNOWN;
+    descs[1].SampleDesc = {1, 0};
+    descs[1].Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x1);
+    descs[1].Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x20004u);
+    D3D12_RESOURCE_DESC1 descs1[2];
+    std::memset(descs1, 0x3C, sizeof(descs1));  // padding at +4; DESC1 uses the original DESC tail padding
+    descs1[0].Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    descs1[0].Alignment = 0x400000;
+    descs1[0].Width = 0x800;
+    descs1[0].Height = 0x400;
+    descs1[0].DepthOrArraySize = 1;
+    descs1[0].MipLevels = 12;
+    descs1[0].Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    descs1[0].SampleDesc = {1, 0};
+    descs1[0].Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+    descs1[0].Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x00820004u);
+    descs1[0].SamplerFeedbackMipRegion = {4, 8, 1};
+    descs1[1] = descs1[0];
+    descs1[1].Width = 0x200;
+    descs1[1].Format = DXGI_FORMAT_BC1_UNORM;
+    descs1[1].SamplerFeedbackMipRegion = {2, 2, 1};
+
+    const D3D12_HEAP_PROPERTIES heap_properties{D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+                                                D3D12_MEMORY_POOL_UNKNOWN, 0x3, 0x5};
+    D3D12_HEAP_DESC heap_desc;
+    std::memset(&heap_desc, 0x4E, sizeof(heap_desc));
+    heap_desc.SizeInBytes = 0x400000;
+    heap_desc.Alignment = 0x10000;
+    D3D12_CLEAR_VALUE clear{};
+    clear.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    // Opaque objects nobody may read: the session and the heap only have to arrive as the same pointers.
+    std::uint64_t session_token = 0x5E55105E55105E55ull, heap_token = 0x4EA94EA94EA94EA9ull;
+    const IID resource_iid = __uuidof(ID3D12Resource), heap_iid = __uuidof(ID3D12Heap);
+
+    // Word values: 32-bit flags/states poisoned above, a 64-bit heap offset with its upper half set.
+    const std::uint64_t args92[] = {word(&heap_properties), 0xDEAD000000000105ull, word(&descs[0]),
+                                    0xBEEF0000FFFFFFFFull, word(&clear), word(&session_token), word(&resource_iid), 0};
+    const std::uint64_t args93[] = {word(&heap_desc), word(&session_token), word(&heap_iid), 0};
+    const std::uint64_t args94[] = {word(&descs[0]), 0xBEEF000000000400ull, word(&clear), word(&session_token),
+                                    word(&resource_iid), 0};
+    const std::uint64_t args109[] = {word(&heap_properties), 0xDEAD000000000244ull, word(&descs1[0]),
+                                     0xBEEF0000FFFFFFFFull, word(&clear), word(&session_token), word(&resource_iid), 0};
+    const std::uint64_t args110[] = {word(&heap_token), 0x0000000700010000ull, word(&descs1[0]), 0xBEEF000000000080ull,
+                                     word(&clear), word(&resource_iid), 0};
+    const CreateRoute r92{92, 53, 8, 6, 7, (1u << 1) | (1u << 3), &descs[0], sizeof(D3D12_RESOURCE_DESC)};
+    const CreateRoute r93{93, 54, 4, 2, 3, 0, &heap_desc, sizeof(D3D12_HEAP_DESC)};
+    const CreateRoute r94{94, 55, 6, 4, 5, 1u << 1, &descs[0], sizeof(D3D12_RESOURCE_DESC)};
+    const CreateRoute r109{109, 69, 8, 6, 7, (1u << 1) | (1u << 3), &descs1[0], sizeof(D3D12_RESOURCE_DESC1)};
+    const CreateRoute r110{110, 70, 7, 5, 6, 1u << 3, &descs1[0], sizeof(D3D12_RESOURCE_DESC1)};
+
+    // Device8 (and so Device4): every route reaches its PC method on the right interface object.
+    {
+        Mock* mock = nullptr;
+        RouteAlias *device4 = nullptr, *device8 = nullptr;
+        void* device = make_route_device(8, mock, device4, device8);
+        EXPECT(device && device4 && device8 && device4 != device8);
+        EXPECT(word(device4) != word(mock) && word(device8) != word(mock));
+        EXPECT(device4->refs == 1 && device8->refs == 1);  // the detection queries gave their references back
+        xs::reset_device_proxy_stats();
+        rt::d3d12_trace::set_enabled(true);
+        if (check_create_route(device, mock, device4, device8, r92, args92) ||
+            check_create_route(device, mock, device4, device8, r93, args93) ||
+            check_create_route(device, mock, device4, device8, r94, args94) ||
+            check_allocation_route(device, mock, device4, device8, 95, 56, descs, sizeof(D3D12_RESOURCE_DESC)) ||
+            check_allocation_route(device, mock, device8, device4, 108, 68, descs1, sizeof(D3D12_RESOURCE_DESC1)) ||
+            check_create_route(device, mock, device8, device4, r109, args109) ||
+            check_create_route(device, mock, device8, device4, r110, args110) ||
+            check_footprints_route(device, mock, device8, device4, &descs1[0]))
+            return 1;
+        rt::d3d12_trace::set_enabled(false);
+        // The stray counters: only the routes' PC slots were ever entered on either object.
+        for (unsigned slot = 0; slot < kMockSlots; ++slot) {
+            const bool device4_slot = slot >= 53 && slot <= 56;
+            const bool device8_slot = slot == 68 || slot == 69 || slot == 70 || slot == 72;
+            EXPECT(device4_slot || device4->calls[slot] == 0);
+            EXPECT(device8_slot || device8->calls[slot] == 0);
+        }
+        EXPECT(release(device) == 0 && mock->refs == 0 && device4->refs == 1 && device8->refs == 1);
+    }
+
+    // Device7 (Device4, no Device8): 92-95 still route; 108-112 are refused explicitly.
+    {
+        Mock* mock = nullptr;
+        RouteAlias *device4 = nullptr, *device8 = nullptr;
+        void* device = make_route_device(7, mock, device4, device8);
+        EXPECT(device && device4 && !device8);
+        xs::reset_device_proxy_stats();
+        if (check_create_route(device, mock, device4, nullptr, r92, args92) ||
+            expect_allocation_unsupported(device, mock, device4, 108, descs1) ||
+            expect_create_unsupported(device, mock, device4, r109, args109) ||
+            expect_create_unsupported(device, mock, device4, r110, args110) ||
+            expect_footprints_unsupported(device, mock, device4, &descs1[0]))
+            return 1;
+        EXPECT(device4->calls[68] == 0 && device4->calls[69] == 0 && device4->calls[70] == 0 &&
+               device4->calls[72] == 0);
+        EXPECT(release(device) == 0 && mock->refs == 0 && device4->refs == 1);
+    }
+
+    // Device3 (no Device4): 92-95 are refused explicitly too.
+    {
+        Mock* mock = nullptr;
+        RouteAlias *device4 = nullptr, *device8 = nullptr;
+        void* device = make_route_device(3, mock, device4, device8);
+        EXPECT(device && !device4 && !device8);
+        xs::reset_device_proxy_stats();
+        if (expect_create_unsupported(device, mock, nullptr, r92, args92) ||
+            expect_create_unsupported(device, mock, nullptr, r93, args93) ||
+            expect_create_unsupported(device, mock, nullptr, r94, args94) ||
+            expect_allocation_unsupported(device, mock, nullptr, 95, descs))
+            return 1;
+        EXPECT(release(device) == 0 && mock->refs == 0);
+    }
+    std::printf("%s: resource routes 92-95/108-110/112 reach ID3D12Device4/8 once each through the queried interface "
+                "with the caller's pointers and bytes, balance every reference, and refuse explicitly without the "
+                "interface (public reference mapping, no retail call observed)\n", g_label);
+    return 0;
+}
+
 // ---- 10. The refused tail and the guard region ----
 
 // ---- Device slot 127: ID3D12Device10::CreateCommittedResource3 called the console's way ----
@@ -3396,6 +4057,7 @@ int main(int argc, char** argv) {
         return check_committed_resource3();
     }
     if (argc == 2 && std::strcmp(argv[1], "--slot25") == 0) return check_resource_allocation_info();
+    if (argc == 2 && std::strcmp(argv[1], "--resource-routes") == 0) return check_resource_routes();
     if (argc == 3 && std::strcmp(argv[1], "--host-import-experiment") == 0) {
         if (std::strcmp(argv[2], "on") == 0) return run_host_import_experiment(true);
         if (std::strcmp(argv[2], "off") == 0) return run_host_import_experiment(false);

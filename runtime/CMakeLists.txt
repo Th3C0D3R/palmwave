@@ -961,6 +961,8 @@ if(BUILD_TESTING)
     # Device slot 70 (a raw buffer SRV named by GPU VA) with the D3D12 trace on: its refusals are traced explicitly.
     add_test(NAME xs_proxy_mock_slot127_trace COMMAND xs_proxy_mock_test --slot127)
     add_test(NAME xs_proxy_mock_env_slots_127 COMMAND xs_proxy_mock_test --env-slots-127)
+    # Device slots 92-95/108-110/112 to ID3D12Device4/8 over mock interface objects (CPU only, no GPU).
+    add_test(NAME xs_proxy_mock_resource_routes COMMAND xs_proxy_mock_test --resource-routes)
     add_test(NAME xs_proxy_mock_slot70_trace COMMAND xs_proxy_mock_test --slot70)
     set_tests_properties(xs_proxy_mock_slot70_trace PROPERTIES
                          PASS_REGULAR_EXPRESSION "[(]device slot 70[)] unsupported"

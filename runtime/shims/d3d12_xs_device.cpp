@@ -8,7 +8,8 @@
 // are IUnknown (0-2), slot 14 (which wraps the heap), 25/26 (the title passes the return buffer in RCX and the device in
 // RDX), 62, 70 (a raw buffer SRV named by GPU VA, never the PC CreatePlacedResource1), 76, 127 (the PC
 // ID3D12Device10::CreateCommittedResource3 through its own interface pointer) and 133
-// (CreatePlacedResourceX, handed to the device's registered handler), plus the heap proxy's 9/10 conversion from the PC hidden-pointer form to the Xbox RAX form. Slots
+// (CreatePlacedResourceX, handed to the registered handler), plus Device4/Device8 routes 92-95 and 108-110/112
+// (95/108 in both struct-return forms), and heap proxy 9/10 conversion from the PC hidden-pointer form to Xbox RAX. Slots
 // 8/75 (command queues), 36 (fences) and 32 (a shared fence) wrap what they create in queue and fence proxies built
 // the same way, and slots 31/34/35/45/46/50 hand the real objects behind heap, queue and fence proxies to the real
 // device (see the command queue and fence section). Slots 17..24 translate title-backed CPU descriptor handles
@@ -189,6 +190,14 @@ const char* slot_name(unsigned slot) {
         case 79: return "Xbox ScheduleFrameEventX";
         case 80: return "Xbox WaitFrameEventX";
         case 127: return "Xbox CreateCommittedResource3 (device slot 127)";
+        case 92: return "ID3D12Device4::CreateCommittedResource1 (Xbox device slot 92)";
+        case 93: return "ID3D12Device4::CreateHeap1 (Xbox device slot 93)";
+        case 94: return "ID3D12Device4::CreateReservedResource1 (Xbox device slot 94)";
+        case 95: return "ID3D12Device4::GetResourceAllocationInfo1 (Xbox device slot 95)";
+        case 108: return "ID3D12Device8::GetResourceAllocationInfo2 (Xbox device slot 108)";
+        case 109: return "ID3D12Device8::CreateCommittedResource2 (Xbox device slot 109)";
+        case 110: return "ID3D12Device8::CreatePlacedResource1 (Xbox device slot 110)";
+        case 112: return "ID3D12Device8::GetCopyableFootprints1 (Xbox device slot 112)";
         case 133: return "Xbox CreatePlacedResourceX (a buffer on the title's own pages)";
         default: return "forwarded";
     }
@@ -3108,6 +3117,243 @@ D3D12_RESOURCE_ALLOCATION_INFO* proxy_get_resource_allocation_info(D3D12_RESOURC
     return out;
 }
 
+// ---- Device slots 92-95 and 108-112: ID3D12Device4 / ID3D12Device8 resource methods (contract in the header) ----
+//
+// The slot-to-method order is public reference only, not a measured retail call: OpenScarlett (MIT, revision
+// 87cdba6a16052a5809f904ed5725d70e50521744, OpenScarlett Contributors; third_party/notices/OpenScarlett-MIT.txt) lists
+// 92 CreateCommittedResource1, 93 CreateHeap1, 94 CreateReservedResource1, 95 GetResourceAllocationInfo1, 108
+// GetResourceAllocationInfo2, 109 CreateCommittedResource2, 110 CreatePlacedResource1 and 112 GetCopyableFootprints1.
+// Leonida #7490 (GPL-3.0; console 83-103/105-112 forwarded 39/40 slots lower) gives the same methods, and #7201 gives
+// slot 108. No code was taken from either. Only the mapping is taken. Their method bodies are not: they convert DESC1 to DESC, drop the protected session, retry with COMMON, mask
+// flags and fall back to committed resources. Here each route asks the PC device for the PC interface on every call,
+// calls that exact method through the pointer it returned, with the caller's own pointers and values, and releases
+// it. The proxy reads no description, clear value, heap or session; the device validates them and its answer comes
+// back unchanged. A device without the interface gets an explicit refusal: E_NOTIMPL and a null output, the invalid
+// allocation {UINT64_MAX, UINT64_MAX}, or the PC failure footprint (every output all ones). It never gets a stand-in.
+// Heaps passed to 110 are the device's own ID3D12Heap objects: CreateHeap (PC slot 28) and 93 return them unwrapped.
+// The proxy has no ID3D12Heap wrapper to undo. Its descriptor-heap proxy is not an ID3D12Heap.
+
+// The PC interface `Interface` of `real`, held for one call and released on scope exit. Null when the device does
+// not answer it. On failure, COM leaves the output null and adds no reference, so a failed query has nothing to release.
+template <class Interface>
+class DeviceInterface {
+public:
+    explicit DeviceInterface(ID3D12Device* real) {
+        void* found = nullptr;
+        if (SUCCEEDED(real->QueryInterface(__uuidof(Interface), &found))) ptr_ = static_cast<Interface*>(found);
+    }
+    ~DeviceInterface() {
+        if (ptr_) ptr_->Release();
+    }
+    DeviceInterface(const DeviceInterface&) = delete;
+    DeviceInterface& operator=(const DeviceInterface&) = delete;
+    Interface* get() const { return ptr_; }
+
+private:
+    Interface* ptr_ = nullptr;
+};
+
+// The answer of a struct route on a device without its interface. UINT64_MAX in both fields is never a valid size
+// or alignment.
+constexpr D3D12_RESOURCE_ALLOCATION_INFO kUnsupportedAllocation{UINT64_MAX, UINT64_MAX};
+
+// Logs the first call of a slot whose interface the device lacks and traces every call "unsupported".
+void report_route_unsupported(unsigned slot, const char* interface_name) {
+    static std::atomic<bool> warned[kMaxSlots];
+    if (slot < kMaxSlots && first_call(warned[slot]))
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: device slot %u (%s): the PC device does not implement %s; refused, no stand-in\n",
+                     slot, slot_name(slot), interface_name);
+    d3d12_trace::record(slot_name(slot), "unsupported");
+}
+
+HRESULT route_unsupported(unsigned slot, const char* interface_name) {
+    report_route_unsupported(slot, interface_name);
+    return E_NOTIMPL;
+}
+
+// A null IID cannot be passed as a REFIID without forming a reference through null. It is refused before the device
+// is queried. The device validates every other pointer.
+HRESULT route_null_iid(unsigned slot) {
+    static std::atomic<bool> warned[kMaxSlots];
+    if (slot < kMaxSlots && first_call(warned[slot]))
+        std::fprintf(stderr, "[rt] d3d12_xs: device slot %u (%s): null IID; refused with E_POINTER\n", slot,
+                     slot_name(slot));
+    return d3d12_trace::result(slot_name(slot), E_POINTER);
+}
+
+// The device's HRESULT, traced. A failed call leaves no object behind in the title's output.
+HRESULT finish_create_route(unsigned slot, HRESULT hr, void** out) {
+    if (FAILED(hr) && out) *out = nullptr;
+    return d3d12_trace::result(slot_name(slot), hr);
+}
+
+D3D12_HEAP_FLAGS heap_flags_word(std::uint64_t word) {
+    return static_cast<D3D12_HEAP_FLAGS>(static_cast<std::uint32_t>(word));
+}
+
+D3D12_RESOURCE_STATES state_word(std::uint64_t word) {
+    return static_cast<D3D12_RESOURCE_STATES>(static_cast<std::uint32_t>(word));
+}
+
+// Every route below keeps each argument word in its thunk position (see "A thunk declares 14 argument words").
+
+HRESULT proxy_create_committed_resource1(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* heap_properties,
+                                         std::uint64_t heap_flags, const D3D12_RESOURCE_DESC* desc,
+                                         std::uint64_t initial_state, const D3D12_CLEAR_VALUE* clear,
+                                         ID3D12ProtectedResourceSession* session, const IID* riid, void** out) {
+    constexpr unsigned kSlot = 92;
+    if (out) *out = nullptr;
+    if (!riid) return route_null_iid(kSlot);
+    const DeviceInterface<ID3D12Device4> device(self->real);
+    if (!device.get()) return route_unsupported(kSlot, "ID3D12Device4");
+    const HRESULT hr = device.get()->CreateCommittedResource1(heap_properties, heap_flags_word(heap_flags), desc,
+                                                              state_word(initial_state), clear, session, *riid, out);
+    return finish_create_route(kSlot, hr, out);
+}
+
+HRESULT proxy_create_heap1(DeviceProxy* self, const D3D12_HEAP_DESC* heap_desc, ID3D12ProtectedResourceSession* session,
+                           const IID* riid, void** out) {
+    constexpr unsigned kSlot = 93;
+    if (out) *out = nullptr;
+    if (!riid) return route_null_iid(kSlot);
+    const DeviceInterface<ID3D12Device4> device(self->real);
+    if (!device.get()) return route_unsupported(kSlot, "ID3D12Device4");
+    const HRESULT hr = device.get()->CreateHeap1(heap_desc, session, *riid, out);
+    return finish_create_route(kSlot, hr, out);
+}
+
+HRESULT proxy_create_reserved_resource1(DeviceProxy* self, const D3D12_RESOURCE_DESC* desc, std::uint64_t initial_state,
+                                        const D3D12_CLEAR_VALUE* clear, ID3D12ProtectedResourceSession* session,
+                                        const IID* riid, void** out) {
+    constexpr unsigned kSlot = 94;
+    if (out) *out = nullptr;
+    if (!riid) return route_null_iid(kSlot);
+    const DeviceInterface<ID3D12Device4> device(self->real);
+    if (!device.get()) return route_unsupported(kSlot, "ID3D12Device4");
+    const HRESULT hr =
+        device.get()->CreateReservedResource1(desc, state_word(initial_state), clear, session, *riid, out);
+    return finish_create_route(kSlot, hr, out);
+}
+
+HRESULT proxy_create_committed_resource2(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* heap_properties,
+                                         std::uint64_t heap_flags, const D3D12_RESOURCE_DESC1* desc,
+                                         std::uint64_t initial_state, const D3D12_CLEAR_VALUE* clear,
+                                         ID3D12ProtectedResourceSession* session, const IID* riid, void** out) {
+    constexpr unsigned kSlot = 109;
+    if (out) *out = nullptr;
+    if (!riid) return route_null_iid(kSlot);
+    const DeviceInterface<ID3D12Device8> device(self->real);
+    if (!device.get()) return route_unsupported(kSlot, "ID3D12Device8");
+    const HRESULT hr = device.get()->CreateCommittedResource2(heap_properties, heap_flags_word(heap_flags), desc,
+                                                              state_word(initial_state), clear, session, *riid, out);
+    return finish_create_route(kSlot, hr, out);
+}
+
+HRESULT proxy_create_placed_resource1(DeviceProxy* self, ID3D12Heap* heap, std::uint64_t heap_offset,
+                                      const D3D12_RESOURCE_DESC1* desc, std::uint64_t initial_state,
+                                      const D3D12_CLEAR_VALUE* clear, const IID* riid, void** out) {
+    constexpr unsigned kSlot = 110;
+    if (out) *out = nullptr;
+    if (!riid) return route_null_iid(kSlot);
+    const DeviceInterface<ID3D12Device8> device(self->real);
+    if (!device.get()) return route_unsupported(kSlot, "ID3D12Device8");
+    const HRESULT hr =
+        device.get()->CreatePlacedResource1(heap, heap_offset, desc, state_word(initial_state), clear, *riid, out);
+    return finish_create_route(kSlot, hr, out);
+}
+
+// Slots 95 and 108 return the 16-byte D3D12_RESOURCE_ALLOCATION_INFO. `out` is the return buffer in either call form
+// (the thunk tells them apart). A null buffer is refused without a write or a device call, and RAX is null. Otherwise
+// exactly 16 bytes are written and `out` goes back in RAX. The per-resource array follows the PC contract: the device
+// fills it, and on a device without the interface it is not written, because its length is the title's count and
+// nothing here can check it.
+D3D12_RESOURCE_ALLOCATION_INFO* refuse_null_allocation_buffer(unsigned slot) {
+    static std::atomic<bool> warned[kMaxSlots];
+    if (slot < kMaxSlots && first_call(warned[slot]))
+        std::fprintf(stderr, "[rt] d3d12_xs: device slot %u (%s): null return buffer; refused, nothing written\n", slot,
+                     slot_name(slot));
+    d3d12_trace::record(slot_name(slot), "refused");
+    return nullptr;
+}
+
+void record_allocation_route(unsigned slot, UINT mask, UINT count, const D3D12_RESOURCE_ALLOCATION_INFO& info) {
+    const bool failed = info.SizeInBytes == UINT64_MAX;
+    d3d12_trace::record(slot_name(slot), failed ? "failed" : "ok");
+    if (d3d12_trace::enabled() || trace_enabled())
+        std::fprintf(stderr, "[rt] d3d12_xs: slot %u allocation node_mask=%u count=%u size=%llu alignment=%llu result=%s\n",
+                     slot, mask, count, static_cast<unsigned long long>(info.SizeInBytes),
+                     static_cast<unsigned long long>(info.Alignment), failed ? "failed" : "ok");
+}
+
+D3D12_RESOURCE_ALLOCATION_INFO* proxy_get_resource_allocation_info1(D3D12_RESOURCE_ALLOCATION_INFO* out,
+                                                                    DeviceProxy* self, std::uint64_t mask_word,
+                                                                    std::uint64_t count_word,
+                                                                    const D3D12_RESOURCE_DESC* descs,
+                                                                    D3D12_RESOURCE_ALLOCATION_INFO1* infos) {
+    constexpr unsigned kSlot = 95;
+    if (!out) return refuse_null_allocation_buffer(kSlot);
+    const UINT mask = static_cast<UINT>(mask_word);
+    const UINT count = static_cast<UINT>(count_word);
+    const DeviceInterface<ID3D12Device4> device(self->real);
+    if (!device.get()) {
+        *out = kUnsupportedAllocation;
+        report_route_unsupported(kSlot, "ID3D12Device4");
+        return out;
+    }
+    const D3D12_RESOURCE_ALLOCATION_INFO info = device.get()->GetResourceAllocationInfo1(mask, count, descs, infos);
+    *out = info;
+    record_allocation_route(kSlot, mask, count, info);
+    return out;
+}
+
+D3D12_RESOURCE_ALLOCATION_INFO* proxy_get_resource_allocation_info2(D3D12_RESOURCE_ALLOCATION_INFO* out,
+                                                                    DeviceProxy* self, std::uint64_t mask_word,
+                                                                    std::uint64_t count_word,
+                                                                    const D3D12_RESOURCE_DESC1* descs,
+                                                                    D3D12_RESOURCE_ALLOCATION_INFO1* infos) {
+    constexpr unsigned kSlot = 108;
+    if (!out) return refuse_null_allocation_buffer(kSlot);
+    const UINT mask = static_cast<UINT>(mask_word);
+    const UINT count = static_cast<UINT>(count_word);
+    const DeviceInterface<ID3D12Device8> device(self->real);
+    if (!device.get()) {
+        *out = kUnsupportedAllocation;
+        report_route_unsupported(kSlot, "ID3D12Device8");
+        return out;
+    }
+    const D3D12_RESOURCE_ALLOCATION_INFO info = device.get()->GetResourceAllocationInfo2(mask, count, descs, infos);
+    *out = info;
+    record_allocation_route(kSlot, mask, count, info);
+    return out;
+}
+
+// Slot 112 is void. The device writes every output. Without ID3D12Device8 the outputs get the PC runtime's failure
+// answer, as the Vulkan backend's GetCopyableFootprints writes it: each of the `count` entries all ones and the total
+// UINT64_MAX. That is never a usable footprint, and nothing is zeroed. The trace says "failed" when the device's total
+// is UINT64_MAX, otherwise "called": the void method reports nothing else.
+void proxy_get_copyable_footprints1(DeviceProxy* self, const D3D12_RESOURCE_DESC1* desc, std::uint64_t first_word,
+                                    std::uint64_t count_word, std::uint64_t base_offset,
+                                    D3D12_PLACED_SUBRESOURCE_FOOTPRINT* layouts, UINT* rows, UINT64* row_sizes,
+                                    UINT64* total) {
+    constexpr unsigned kSlot = 112;
+    const UINT first = static_cast<UINT>(first_word);
+    const UINT count = static_cast<UINT>(count_word);
+    const DeviceInterface<ID3D12Device8> device(self->real);
+    if (!device.get()) {
+        for (UINT i = 0; i < count; ++i) {
+            if (layouts) std::memset(&layouts[i], 0xff, sizeof(layouts[i]));
+            if (rows) rows[i] = ~0u;
+            if (row_sizes) row_sizes[i] = UINT64_MAX;
+        }
+        if (total) *total = UINT64_MAX;
+        report_route_unsupported(kSlot, "ID3D12Device8");
+        return;
+    }
+    device.get()->GetCopyableFootprints1(desc, first, count, base_offset, layouts, rows, row_sizes, total);
+    d3d12_trace::record(slot_name(kSlot), total && *total == UINT64_MAX ? "failed" : "called");
+}
+
 // Device slot 133 is the console's CreatePlacedResourceX: (va, desc, state, clear, riid, out), measured on the retail
 // executable (docs/retail_boot_chain.md section 3.4: riid IID_ID3D12Resource, the third word 0xFFFFFFFF, whose meaning
 // is not established). `va` is the start of memory the title has just mapped and `desc` a 56-byte description. The
@@ -3544,6 +3790,45 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         std::uint64_t routed = 0;
         if (route_xbox_device_slot(self, Slot, a1, a2, a3, a4, a5, routed)) return routed;
         return hr_to_u64(proxy_create_committed_resource3_x(self, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10));
+    } else if constexpr (Slot == 92 || Slot == 93 || Slot == 94 || Slot == 109 || Slot == 110 || Slot == 112) {
+        // The Device4/Device8 routes take `this` first. A configured Xbox route moved onto one of these slots keeps
+        // its priority, as on slot 70.
+        note_slot(Slot);
+        std::uint64_t routed = 0;
+        if (route_xbox_device_slot(self, Slot, a1, a2, a3, a4, a5, routed)) return routed;
+        if constexpr (Slot == 92) {
+            return hr_to_u64(proxy_create_committed_resource1(
+                self, reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(a1), a2,
+                reinterpret_cast<const D3D12_RESOURCE_DESC*>(a3), a4, reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5),
+                reinterpret_cast<ID3D12ProtectedResourceSession*>(a6), reinterpret_cast<const IID*>(a7),
+                reinterpret_cast<void**>(a8)));
+        } else if constexpr (Slot == 93) {
+            return hr_to_u64(proxy_create_heap1(self, reinterpret_cast<const D3D12_HEAP_DESC*>(a1),
+                                                reinterpret_cast<ID3D12ProtectedResourceSession*>(a2),
+                                                reinterpret_cast<const IID*>(a3), reinterpret_cast<void**>(a4)));
+        } else if constexpr (Slot == 94) {
+            return hr_to_u64(proxy_create_reserved_resource1(
+                self, reinterpret_cast<const D3D12_RESOURCE_DESC*>(a1), a2,
+                reinterpret_cast<const D3D12_CLEAR_VALUE*>(a3), reinterpret_cast<ID3D12ProtectedResourceSession*>(a4),
+                reinterpret_cast<const IID*>(a5), reinterpret_cast<void**>(a6)));
+        } else if constexpr (Slot == 109) {
+            return hr_to_u64(proxy_create_committed_resource2(
+                self, reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(a1), a2,
+                reinterpret_cast<const D3D12_RESOURCE_DESC1*>(a3), a4, reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5),
+                reinterpret_cast<ID3D12ProtectedResourceSession*>(a6), reinterpret_cast<const IID*>(a7),
+                reinterpret_cast<void**>(a8)));
+        } else if constexpr (Slot == 110) {
+            return hr_to_u64(proxy_create_placed_resource1(
+                self, reinterpret_cast<ID3D12Heap*>(a1), a2, reinterpret_cast<const D3D12_RESOURCE_DESC1*>(a3), a4,
+                reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5), reinterpret_cast<const IID*>(a6),
+                reinterpret_cast<void**>(a7)));
+        } else {
+            proxy_get_copyable_footprints1(self, reinterpret_cast<const D3D12_RESOURCE_DESC1*>(a1), a2, a3, a4,
+                                           reinterpret_cast<D3D12_PLACED_SUBRESOURCE_FOOTPRINT*>(a5),
+                                           reinterpret_cast<UINT*>(a6), reinterpret_cast<UINT64*>(a7),
+                                           reinterpret_cast<UINT64*>(a8));
+            return 0;  // void method: the return register carries nothing
+        }
     } else if constexpr (Slot == 133) {
         return hr_to_u64(proxy_create_placed_resource_x(
             self, reinterpret_cast<void*>(a1), reinterpret_cast<const D3D12_RESOURCE_DESC*>(a2),
@@ -3566,22 +3851,51 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                     reinterpret_cast<D3D12_HEAP_PROPERTIES*>(self), reinterpret_cast<DeviceProxy*>(a1),
                     static_cast<UINT>(a2), static_cast<D3D12_HEAP_TYPE>(static_cast<std::uint32_t>(a3))));
         }
+        if constexpr (Slot == 95 || Slot == 108) {
+            // The slot-25 rule: the console C ABI form has the return buffer in RCX and the device in RDX, recognised
+            // before `self` is read. In both forms a2/a3 are the mask and count and a4/a5 the first two stack words
+            // (descriptions, per-resource array), so they keep their positions.
+            if (is_device_proxy(reinterpret_cast<const void*>(a1))) {
+                note_slot(Slot);
+                auto* out = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(self);
+                auto* device = reinterpret_cast<DeviceProxy*>(a1);
+                auto* infos = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO1*>(a5);
+                if constexpr (Slot == 95)
+                    return reinterpret_cast<std::uint64_t>(proxy_get_resource_allocation_info1(
+                        out, device, a2, a3, reinterpret_cast<const D3D12_RESOURCE_DESC*>(a4), infos));
+                else
+                    return reinterpret_cast<std::uint64_t>(proxy_get_resource_allocation_info2(
+                        out, device, a2, a3, reinterpret_cast<const D3D12_RESOURCE_DESC1*>(a4), infos));
+            }
+        }
         note_slot(Slot);
         // Xbox device slots, before the PC vtable is indexed: the public HLE's 78/79/80 would otherwise reach
         // CreateReservedResource2/CreateSampler2 or fall past an 80-slot table, and 48/73 would reach unrelated PC
         // methods. The check is before the slot-count refusal because slot 80 is outside a PC ID3D12Device11 table.
         std::uint64_t routed = 0;
         if (route_xbox_device_slot(self, Slot, a1, a2, a3, a4, a5, routed)) return routed;
-        if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
+        if constexpr (Slot == 95 || Slot == 108) {
+            // The PC C++ form: the proxy in RCX and the hidden return buffer in RDX.
+            auto* out = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(a1);
+            auto* infos = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO1*>(a5);
+            if constexpr (Slot == 95)
+                return reinterpret_cast<std::uint64_t>(proxy_get_resource_allocation_info1(
+                    out, self, a2, a3, reinterpret_cast<const D3D12_RESOURCE_DESC*>(a4), infos));
+            else
+                return reinterpret_cast<std::uint64_t>(proxy_get_resource_allocation_info2(
+                    out, self, a2, a3, reinterpret_cast<const D3D12_RESOURCE_DESC1*>(a4), infos));
+        } else {
+            if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
 
-        // The PC vtable entry, called with the PC device as `this`. Integer/pointer arguments, the hidden
-        // struct-return pointer and any stack arguments keep their positions; XMM registers are untouched.
-        using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
-                                                 std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
-                                                 std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
-                                                 std::uint64_t, std::uint64_t, std::uint64_t);
-        auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[Slot]);
-        return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+            // The PC vtable entry, called with the PC device as `this`. Integer/pointer arguments, the hidden
+            // struct-return pointer and any stack arguments keep their positions; XMM registers are untouched.
+            using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                     std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                     std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                     std::uint64_t, std::uint64_t, std::uint64_t);
+            auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[Slot]);
+            return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+        }
     }
 }
 
@@ -3778,7 +4092,8 @@ bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || (slot >= 17 && slot <= 24) || slot == 25 || slot == 26 ||
         slot == 31 || slot == 32 || slot == 34 ||
         slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
-        slot == 70 || slot == 75 || slot == 76 || slot == kCreateCommittedResource3X || slot == 133)
+        slot == 70 || slot == 75 || slot == 76 || slot == kCreateCommittedResource3X || slot == 133 ||
+        (slot >= 92 && slot <= 95) || (slot >= 108 && slot <= 110) || slot == 112)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||

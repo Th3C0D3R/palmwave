@@ -259,3 +259,15 @@ The combined runtime passed 17 focused CPU/WARP CTests in 0.48 seconds; this cha
 The last GPU integration result remains 24 targeted tests on RTX 5080 / 621.14. Public implementations were
 compared at pinned revisions and their disagreements are recorded in docs/BLOCKERS.md. No retail submission
 or frame is claimed by these adapter tests.
+
+## Additional resource interface routes
+
+Eight corroborated console device methods now reach the corresponding Device4 or Device8 interface:
+slots 92, 93, 94, 95, 108, 109, 110 and 112. Allocation-info returns support the console and PC argument orders;
+resource descriptions, layouts, session pointers, castable information and HRESULTs are preserved.
+This adds no flag sanitization or substitute allocation.
+
+The integrated build passed 18 focused CPU/WARP CTests in 0.47 seconds, including separate QueryInterface
+pointers, missing-interface failures and the combined queue/proxy regressions. No new GPU run was needed for
+these adapters, and no local executable call through these eight routes is yet claimed. The previous RTX 5080
+GPU result and the unresolved imported-address/texture blockers still apply.
