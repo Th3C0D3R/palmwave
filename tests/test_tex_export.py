@@ -479,12 +479,12 @@ def test_packed_r10g10b10a2_writes_a_png(eq, tmp_path, monkeypatch, capsys):
 
 
 def test_undecodable_format_keeps_the_dds_and_counts_unsupported(eq, tmp_path, monkeypatch, capsys):
-    carve, expected = build_case(eq, tmp_path, 41, top_first=True)  # R32_FLOAT: dds_png has no decoder
-    t = texture(41, "R32_FLOAT", 64, 64, mips=2)
+    carve, expected = build_case(eq, tmp_path, 95, top_first=True)  # BC6H_UF16: dds_png has no decoder
+    t = texture(95, "BC6H_UF16", 64, 64, mips=2)
     out, code, text = png_main(tmp_path, monkeypatch, capsys, [t], carve, "--png")
     assert code is None  # main() returns None, so the process exits 0
-    assert tree(out) == ["export_log.json", f"x.rpf{os.sep}{0xABC:012x}_3_64x64_R32_FLOAT.dds"]
-    assert (out / "x.rpf" / f"{0xABC:012x}_3_64x64_R32_FLOAT.dds").read_bytes()[148:] == expected
+    assert tree(out) == ["export_log.json", f"x.rpf{os.sep}{0xABC:012x}_3_64x64_BC6H_UF16.dds"]
+    assert (out / "x.rpf" / f"{0xABC:012x}_3_64x64_BC6H_UF16.dds").read_bytes()[148:] == expected
     assert json.loads((out / "export_log.json").read_text(encoding="utf-8"))[0]["export"]["png"] == "unsupported"
     assert text.splitlines()[1:] == ["png: {'unsupported': 1}"]
 
@@ -493,12 +493,32 @@ def test_mixed_run_counts_each_kind(eq, tmp_path, monkeypatch, capsys):
     carve, _ = build_case(eq, tmp_path, 28, top_first=True)
     with open(os.path.join(carve, "x.rpf", f"{0x1000:012x}.bin"), "rb") as f:
         write_blob(carve, "x.rpf", 0x2000, f.read())  # same 4 bpe size, so the equation is already in place
+    eq(16)
+    write_blob(carve, "x.rpf", 0x3000, bytes(4096))  # one BC6H block in a padded tile
     textures = [texture(28, "R8G8B8A8_UNORM", 64, 64, mips=2),
                 texture(41, "R32_FLOAT", 64, 64, mips=2, gpu=0x2000),
-                texture(9999, "X", 4, 4, 1, gpu=0x3000)]
+                texture(95, "BC6H_UF16", 4, 4, 1, gpu=0x3000),
+                texture(9999, "X", 4, 4, 1, gpu=0x4000)]
     out, code, text = png_main(tmp_path, monkeypatch, capsys, textures, carve, "--png")
-    assert text.splitlines()[1] == "png: {'written': 1, 'unsupported': 1}"
-    assert len([f for f in tree(out) if f.endswith(".png")]) == 1
+    assert code is None
+    assert text.splitlines()[1] == "png: {'written': 2, 'unsupported': 1}"
+    assert len([f for f in tree(out) if f.endswith(".png")]) == 2
+    log = json.loads((out / "export_log.json").read_text(encoding="utf-8"))
+    assert [t.get("export", {}).get("png") for t in log] == ["written", "written", "unsupported", None]
+
+
+def test_r32_float_png_export_clamps_red_and_preserves_dds(eq, tmp_path, monkeypatch, capsys):
+    eq(4)
+    values = [float("-inf"), -1.0, 0.0, 0.5, 1.0, 2.0, float("inf"), float("nan")]
+    texels = struct.pack("<8f", *values)
+    carve = str(tmp_path / "carve")
+    write_blob(carve, "x.rpf", 0x1000, texels.ljust(4096, b"\0"))
+    out, code, text = png_main(tmp_path, monkeypatch, capsys, [texture(41, "R32_FLOAT", 8, 1, 1)], carve, "--png")
+    assert code is None
+    assert text.splitlines()[1] == "png: {'written': 1}"
+    assert next(out.rglob("*.dds")).read_bytes()[148:] == texels
+    expected = bytes(channel for red in (0, 0, 0, 128, 255, 255, 255, 0) for channel in (red, 0, 0, 255))
+    assert read_png(next(out.rglob("*.png"))) == (8, 1, expected)
 
 
 
