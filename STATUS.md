@@ -20,7 +20,7 @@ Source revision: original upstream `dde82f27e994337094afc476ded0b1426f6e87e2`, m
 | Driver pipeline creation | Running on RTX 5080; final full-corpus counts pending |
 | Retail dry-run | Exit 0; five modules mapped |
 | Retail initialization | Exit 0; four DLL initializations succeed |
-| Retail execution | Vulkan device, two command queues and a fence created; next stop is a rejected Xbox queue description |
+| Retail execution | Vulkan device, five queues, five fences and an allocator created; next stop is the console command-list interface |
 | First rendered frame | Not verified |
 
 The scanner candidate is not counted as a shader translation failure. Generated data and full logs are private and stored outside the authoring repository. No game assets have been added to Git.
@@ -58,3 +58,6 @@ The named Xbox file interface now preserves the documented `GetHandle` contract.
 ## Heap-properties calling convention
 
 The slot-26 adapter, adapted from sennecools' upstream PR #6964, passes the console return buffer and device in the measured order while retaining the PC method form. The new synthetic regression reproduces the old access violation; all six mock test modes pass with the fix. The authoring build also passed `device_proxy`, `device_proxy_trace` and `xs_proxy_mock` in 0.26 seconds (CPU/WARP). The next offline RTX 5080 run clears the access violation, creates two command queues and one fence, then receives `E_INVALIDARG` for another Xbox queue description. Its D3D12 trace contains four successful calls and one failed call; no draw or presentation is observed.
+## Xbox queue descriptions
+
+The Xbox-only queue route now accepts the four observed option values as ordinary host queues, retaining backend errors and refusing unobserved bits. This is bounded empirical compatibility, not a verified console engine/affinity model; [BLOCKERS.md](docs/BLOCKERS.md) records that distinction. PC queue calls retain their existing validation. The new regression fails before adaptation; six CPU mock modes pass afterward. The authoring build passes three focused proxy CTests in 0.37 seconds (CPU/WARP). The next offline run on RTX 5080 creates five queues, five fences and one command allocator. It then refuses the console command-list interface at device slot 73. The D3D12 trace records 12 successful calls and one failed call, with no draw or presentation.

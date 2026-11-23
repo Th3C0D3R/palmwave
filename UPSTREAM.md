@@ -38,6 +38,14 @@ The `GetCustomHeapProperties` ABI adapter and synthetic proxy regression are ada
 
 Palmwave strengthens the synthetic regression with a native C++ call through `ID3D12Device::GetCustomHeapProperties` for the PC convention. The console call checks truncation of the two 32-bit arguments, untouched surrounding bytes, one backend call and preserved proxy identity and reference counts. With the old forwarder this regression raised `0xC0000005`; after the fix all six `xs_proxy_mock` CTests passed in 0.20 seconds with MSVC 19.51 on CPU only. No GPU or game rendering validation is implied. The adaptation and local validation were assisted by OpenAI Codex.
 
+## Xbox queue compatibility
+
+The Xbox queue adapter is adapted from sneylol (Patrick R)'s [Leonida PR #7037](https://github.com/ItsNotRexed/Leonida/pull/7037), revision `16e3cb677c16227aeb6e23894909a5dc186da83b`, under GPL-3.0. That PR's own report and independent boot reports identify field +8 values 0, 1, 2 and 3; they do not establish a public console engine/affinity contract. The PR was closed in favor of #6954, whose different treatment of value 1 is not adopted here. PR #8258 (`bb8c1291e67455697cf33300fb041901df9c2140`, Koro4e, GPL-3.0) and its reviews were consulted for null-description and PC-route pitfalls; no implementation from it is imported.
+
+Palmwave limits the mapping to values 0..3 and the configured Xbox queue route (default slot 48). It creates ordinary host queues with `Flags=NONE`, preserves the other prefix fields, refuses unobserved bits, and leaves PC slot 8 unchanged. It does not interpret console value 1 as permission to disable the host GPU timeout. Diagnostics identify this as empirical compatibility with unverified console engine/affinity semantics; [docs/BLOCKERS.md](docs/BLOCKERS.md) records the remaining contract gap.
+
+The synthetic regression snapshots the backend description, exercises all four values, preserves the caller's bytes, checks distinct backend queue objects, rejects unknown bits before backend calls, and checks PC flags, capability queries and backend failures. The regression fails with the old forwarder; all six `xs_proxy_mock` CTests pass after the adaptation in 0.20 seconds with MSVC 19.51 on CPU only. No GPU execution or new rendered frame is claimed by this test. The bounded adaptation and tests were assisted by OpenAI Codex.
+
 ## Project identity and tools
 
 Palmwave is developed under [Moon AI](https://realmoon.ai), the AI platform created by Stellarr Studio. The maintainer account is [fablinoo](https://github.com/fablinoo). The initial setup was AI-assisted with OpenAI Codex and OpenAI image generation; Claude Code was assigned a read-only source review. This records the actual tool provenance.

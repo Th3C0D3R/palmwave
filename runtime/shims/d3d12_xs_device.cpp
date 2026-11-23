@@ -1148,6 +1148,31 @@ HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_
     return wrap_child<ChildKind::queue>(static_cast<IUnknown*>(created), self, riid, out);
 }
 
+// Xbox queue route (default slot 48). Adapted from upstream #7037 (GPL-3.0): only
+// field +8 values 0..3 have been observed. Their console engine/affinity meaning is
+// unverified, so this bounded compatibility mapping requests ordinary host queues.
+// In particular, console value 1 is not permission to disable the host GPU timeout.
+// Keep PC slot 8 strict and never silently discard an unobserved bit. See docs/BLOCKERS.md.
+HRESULT proxy_create_command_queue_x(DeviceProxy* self, const D3D12_COMMAND_QUEUE_DESC* desc, const IID* riid,
+                                     void** out) {
+    if (out) *out = nullptr;
+    if (!riid) return E_POINTER;
+    if (!desc) return E_INVALIDARG;
+    const auto value = static_cast<std::uint32_t>(desc->Flags);
+    if (value & ~0x3u) {
+        std::fprintf(stderr, "[rt] d3d12_xs: CreateCommandQueueX refused unsupported field+8=0x%x\n", value);
+        return E_INVALIDARG;
+    }
+    D3D12_COMMAND_QUEUE_DESC pc_desc = *desc;
+    pc_desc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+    static std::atomic<std::uint32_t> logged{0};
+    const std::uint32_t bit = 1u << value;
+    if ((logged.fetch_or(bit, std::memory_order_relaxed) & bit) == 0)
+        std::fprintf(stderr, "[rt] d3d12_xs: CreateCommandQueueX compatibility: field+8=0x%x -> host Flags=NONE; "
+                             "console engine/affinity semantics unverified\n", value);
+    return proxy_create_command_queue(self, &pc_desc, riid, out);
+}
+
 // Xbox device slot 78 (public HLE): SetFrameIntervalX(output, interval_us, latency, flags). The output and flags are
 // not used before a presenter exists. The period is a vblank period in microseconds in the public samples (16667 for
 // 60 Hz), and latency is the allowed frames in flight. S_OK even for 0: a boot must not abort here, and nothing paces.
@@ -1574,9 +1599,9 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         }
         if (Slot == routes.queue_x) {
             log_xbox_route_once(Slot, "CreateCommandQueueX", a1, a2, a3, a4, a5);
-            return hr_to_u64(proxy_create_command_queue(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
-                                                        reinterpret_cast<const IID*>(a2),
-                                                        reinterpret_cast<void**>(a3)));
+            return hr_to_u64(proxy_create_command_queue_x(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
+                                                          reinterpret_cast<const IID*>(a2),
+                                                          reinterpret_cast<void**>(a3)));
         }
         if (Slot == routes.list_x) {
             log_xbox_route_once(Slot, "CreateCommandListX", a1, a2, a3, a4, a5);

@@ -90,6 +90,9 @@ struct Mock {
     bool create_null;        // device: creation returns create_result with no object
     HRESULT create_result;   // device: what creation returns (S_OK makes the object)
     Mock* last_child;        // device: the object its last creation or open made
+    bool validate_queue_desc;  // device: opt in to the PC queue-description contract
+    bool has_queue_desc;
+    D3D12_COMMAND_QUEUE_DESC last_queue_desc;  // snapshot before a forwarded local copy expires
     unsigned calls[kMockSlots];
     std::uint64_t args[kMockSlots][5];
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
@@ -188,7 +191,16 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
     const std::uint64_t a1 = words[0], a2 = words[1], a3 = words[2], a4 = words[3];
     if (m->kind == Kind::device) {
         switch (slot) {
-            case 8: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a2, a3));    // CreateCommandQueue
+            case 8: {  // CreateCommandQueue: capture values, never retain a temporary description.
+                m->has_queue_desc = a1 != 0;
+                if (a1) m->last_queue_desc = *reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1);
+                if (m->validate_queue_desc &&
+                    (!a1 || (m->last_queue_desc.Flags & ~D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT))) {
+                    if (a3) *reinterpret_cast<void**>(a3) = nullptr;
+                    return static_cast<std::uint32_t>(E_INVALIDARG);
+                }
+                return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a2, a3));
+            }
             case 9: return static_cast<std::uint32_t>(mock_create(m, Kind::allocator, a2, a3));  // CreateCmdAllocator
             case 75: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a3, a4));   // CreateCommandQueue1
             case 36: return static_cast<std::uint32_t>(mock_create(m, Kind::fence, a3, a4));   // CreateFence
@@ -729,7 +741,8 @@ int check_xbox_slots() {
     void* queue = nullptr;
     EXPECT(hr_of(raw(device, 48, word(&kQueueDesc), word(&kQueueIid), word(&queue))) == S_OK);
     EXPECT(xs::is_queue_proxy(queue) && mock->calls[48] == 0 && mock->calls[8] == 1);
-    EXPECT(mock->args[8][0] == word(&kQueueDesc));
+    EXPECT(mock->has_queue_desc &&
+           std::memcmp(&mock->last_queue_desc, &kQueueDesc, sizeof(kQueueDesc)) == 0);
 
     // 73 CreateCommandListX(desc, allocator, initialState, riid, out): the type is desc's first word, the allocator
     // proxy is unwrapped, the node mask is 0 and the PC six-argument CreateCommandList (slot 12) is reached.
@@ -829,6 +842,71 @@ int run_env_slots(bool valid) {
     EXPECT(release(device) == 0 && mock->refs == 0);
     std::printf("%s: environment slot overrides %s\n", g_label,
                 valid ? "move all five routes" : "outside 3..127 are ignored");
+    return 0;
+}
+
+// Xbox queue field +8 has no established public engine/affinity contract. Only the observed
+// values 0..3 have a bounded mapping to ordinary host queues; PC slot 8 remains strict.
+int check_xbox_queue_descriptions() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 0, true);
+    EXPECT(device);
+    mock->validate_queue_desc = true;
+    void* queues[4]{};
+    Mock* real_queues[4]{};
+    for (UINT value = 0; value < 4; ++value) {
+        const D3D12_COMMAND_QUEUE_DESC desc{D3D12_COMMAND_LIST_TYPE_COMPUTE,
+            value == 3 ? D3D12_COMMAND_QUEUE_PRIORITY_HIGH : D3D12_COMMAND_QUEUE_PRIORITY_NORMAL,
+            static_cast<D3D12_COMMAND_QUEUE_FLAGS>(value), value == 0 ? 1u : 0u};
+        const auto original = desc;
+        EXPECT(hr_of(raw(device, 48, word(&desc), word(&kQueueIid), word(&queues[value]))) == S_OK);
+        EXPECT(xs::is_queue_proxy(queues[value]) && mock->calls[8] == value + 1 && mock->calls[48] == 0);
+        EXPECT(mock->has_queue_desc && mock->last_queue_desc.Flags == D3D12_COMMAND_QUEUE_FLAG_NONE);
+        EXPECT(mock->last_queue_desc.Type == desc.Type && mock->last_queue_desc.Priority == desc.Priority &&
+               mock->last_queue_desc.NodeMask == desc.NodeMask);
+        EXPECT(std::memcmp(&desc, &original, sizeof(desc)) == 0);
+        real_queues[value] = mock->last_child;
+        EXPECT(xs::queue_proxy_real_queue(queues[value]) == reinterpret_cast<ID3D12CommandQueue*>(real_queues[value]));
+        for (UINT prior = 0; prior < value; ++prior)
+            EXPECT(queues[prior] != queues[value] && real_queues[prior] != real_queues[value]);
+    }
+    for (UINT value = 0; value < 4; ++value) {
+        EXPECT(release(queues[value]) == 0 && real_queues[value]->refs == 0);
+    }
+
+    // Unobserved bits must fail before any backend call, with a cleared output and no source mutation.
+    const unsigned before = mock->calls[8];
+    for (UINT value : {4u, 0x80000002u}) {
+        const D3D12_COMMAND_QUEUE_DESC desc{D3D12_COMMAND_LIST_TYPE_COMPUTE, 0,
+            static_cast<D3D12_COMMAND_QUEUE_FLAGS>(value), 0};
+        const auto original = desc;
+        void* out = reinterpret_cast<void*>(1);
+        EXPECT(hr_of(raw(device, 48, word(&desc), word(&kQueueIid), word(&out))) == E_INVALIDARG && !out);
+        EXPECT(mock->calls[8] == before && std::memcmp(&desc, &original, sizeof(desc)) == 0);
+    }
+    void* out = reinterpret_cast<void*>(1);
+    EXPECT(hr_of(raw(device, 48, 0, word(&kQueueIid), word(&out))) == E_INVALIDARG && !out);
+    EXPECT(mock->calls[8] == before);
+
+    // The same bit 2 at the PC entry point is forwarded unchanged and rejected by the strict backend.
+    D3D12_COMMAND_QUEUE_DESC pc{D3D12_COMMAND_LIST_TYPE_COMPUTE, 0,
+        static_cast<D3D12_COMMAND_QUEUE_FLAGS>(2), 0};
+    out = reinterpret_cast<void*>(1);
+    EXPECT(hr_of(raw(device, 8, word(&pc), word(&kQueueIid), word(&out))) == E_INVALIDARG && !out);
+    EXPECT(mock->calls[8] == before + 1 && mock->last_queue_desc.Flags == pc.Flags);
+    pc.Flags = D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT;
+    EXPECT(hr_of(raw(device, 8, word(&pc), word(&kQueueIid), word(&out))) == S_OK);
+    EXPECT(mock->last_queue_desc.Flags == D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT && xs::is_queue_proxy(out));
+    EXPECT(release(out) == 0);
+
+    // Capability queries and host creation failures retain their real answers through the Xbox adapter.
+    pc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(3);
+    EXPECT(hr_of(raw(device, 48, word(&pc), word(&kQueueIid), 0)) == S_FALSE);
+    mock->create_result = E_OUTOFMEMORY;
+    out = reinterpret_cast<void*>(1);
+    EXPECT(hr_of(raw(device, 48, word(&pc), word(&kQueueIid), word(&out))) == E_OUTOFMEMORY && !out);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: bounded Xbox queue values create distinct backend queues; PC flags and failures preserved\n", g_label);
     return 0;
 }
 
@@ -1004,7 +1082,8 @@ int main(int argc, char** argv) {
     }
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
-        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_custom_heap_properties())
+        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_xbox_queue_descriptions() ||
+        check_custom_heap_properties())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;
