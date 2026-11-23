@@ -1276,6 +1276,9 @@ Loader::~Loader() {
             entry(m.base, DLL_PROCESS_DETACH, nullptr);  // explicit unload; the return value is ignored
         }
     }
+    // Detach handlers could still free descriptor heaps through the title's hooks; nothing may call them once the
+    // images are unmapped below. A heap released later skips its free (xmem_free_with_hooks).
+    shims::remove_xmem_allocation_hooks(this);
     shims::remove_bundled_loader(this);
     shims::remove_module_lookup(this);
     for (auto* m : order_) {
@@ -1680,6 +1683,11 @@ Module& Loader::map_image(const std::filesystem::path& path, const std::string& 
     // installed here, before bind_imports can return control to the caller and before any image code can run.
     initialize_tls(*m);
     parse_exports(*m);
+    // A title's __XMemAllocationHooks__ (upstream PR #7021, GPL-3.0): registered after relocation, so its pointers are
+    // final; parse_exports already refused an export RVA outside the image, and the registry checks that the whole
+    // struct fits. ~Loader removes it after process detach and before unmapping.
+    if (auto it = m->exports.find("__XMemAllocationHooks__"); it != m->exports.end())
+        shims::add_xmem_allocation_hooks(this, m->base, m->size, it->second);
     return *m;
 }
 

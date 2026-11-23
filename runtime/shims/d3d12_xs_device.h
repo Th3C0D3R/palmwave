@@ -32,6 +32,8 @@
 // be moved with PALMWAVE_XS_QUEUE_X_SLOT, PALMWAVE_XS_LIST_X_SLOT, PALMWAVE_XS_FRAME_INTERVAL_SLOT,
 // PALMWAVE_XS_SCHEDULE_EVENT_SLOT and PALMWAVE_XS_WAIT_EVENT_SLOT (3..127; anything else is logged once and ignored).
 // The device table has 192 entries; slot 133 clears its output on refusal and never creates a stand-in resource.
+// Device slots 17..24 and console list slots 50..54 translate title-backed CPU descriptor handles; slot 51
+// (ClearDepthStencilView) has a typed thunk so FLOAT Depth stays in XMM3 (see "Title-backed descriptor heaps").
 // Only the existing routes are configurable; their 3..127 range is unchanged.
 // The measured slots 9/10 (GetCPU/GPUDescriptorHandleForHeapStart) are ID3D12DescriptorHeap methods, not device
 // methods: the PC device's 9/10 are CreateCommandAllocator/CreateGraphicsPipelineState and are forwarded unchanged.
@@ -80,6 +82,7 @@
 
 #include <d3d12.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace rt::d3d12_xs {
@@ -114,6 +117,55 @@ void* device_proxy_primary(void* device);
 bool is_heap_proxy(const void* heap);
 ID3D12DescriptorHeap* heap_proxy_real_heap(const void* heap);
 
+// ---- Title-backed descriptor heaps (adapted from upstream PR #7021, Khuraie, 355201c5, GPL-3.0) ----
+//
+// PR #7021 reports that the title intercepts the console runtime's descriptor-heap allocation through its exported
+// __XMemAllocationHooks__ (attribute word 0x00800004: allocator 0x80 in bits 16..23, object type 4 in the low 14 bits;
+// size NumDescriptors * increment) and checks that heap slot 9 returns that address. A local offline probe also
+// observed this assertion before the adaptation and passed it afterwards (see UPSTREAM.md).
+//
+// Slot 14 asks the installed allocator for that backing after the real heap exists. Ready hooks: the heap proxy's slot
+// 9 returns the title's address, slot 10 still returns the real GPU start, and the range [custom, custom + size) maps to
+// the real CPU start. No hooks: the plain heap, as before. A null allocation (E_OUTOFMEMORY), invalid hooks, an increment
+// of 0, a range that wraps, or one that overlaps another tracked heap (E_FAIL) all release the real heap and any backing
+// and fail the call. The backing is freed by the same pair that allocated it, after the real heap, on the last Release.
+//
+// CPU handles passed to device slots 17..24 and to console list slots 50..54 are translated by translate_cpu_descriptor_
+// range. While no title-backed heap exists every handle passes through unchanged (the previous behaviour). While one
+// exists: a handle inside a title range is translated after its device, heap type, increment alignment and the whole
+// span are checked. All other handles pass through unchanged, including native heaps created directly on the
+// backend. Bounds outside registered custom ranges cannot be classified as custom; the backend validates them.
+// An invalid handle is never forwarded: device slots skip the void call, count it and log/trace "refused"; list slots
+// mark the list unsupported (Close fails, submission refused). The title's own CPU writes into its backing memory are
+// not seen by the real heap; only the API calls above are translated.
+inline constexpr std::uint64_t kXmemDescriptorHeapAttributes = 0x00800004ull;
+
+struct DescriptorHeapBacking {
+    void* address = nullptr;
+    std::uint64_t token = 0;     // opaque to the proxy: identifies the allocating hook registration
+    void* release_hook = nullptr;  // opaque to the proxy: the free routine captured with `address`
+};
+enum class DescriptorBackingStatus { not_hooked, allocated, out_of_memory, invalid_hooks };
+struct DescriptorHeapAllocator {
+    DescriptorBackingStatus (*allocate)(std::size_t byte_size, std::uint64_t attributes, DescriptorHeapBacking* out);
+    void (*release)(const DescriptorHeapBacking& backing, std::uint64_t attributes);
+};
+// The allocator slot 14 consults (copied). An explicit one (tests) wins; the default (D3D12XboxCreateDevice's bridge to
+// the shim registry's hooks) is installed only while no explicit one is set. Null clears the explicit allocator.
+void set_descriptor_heap_allocator(const DescriptorHeapAllocator* allocator);
+void set_default_descriptor_heap_allocator(const DescriptorHeapAllocator* allocator);
+
+enum class DescriptorHandleTranslation { unchanged, translated, invalid };
+// Translates the span of `count` descriptors (0 counts as 1) of heap type `type` starting at `start`, as the rules
+// above say. `device` is the device proxy (or its DXGI pointer); *out is `start` unless translated.
+DescriptorHandleTranslation translate_cpu_descriptor_range(const void* device, D3D12_CPU_DESCRIPTOR_HANDLE start,
+                                                           std::uint64_t count, D3D12_DESCRIPTOR_HEAP_TYPE type,
+                                                           D3D12_CPU_DESCRIPTOR_HANDLE* out);
+// Test helpers: live title-backed ranges, live tracked heaps, and device-slot calls refused for an invalid handle.
+std::size_t title_descriptor_range_count();
+std::size_t tracked_descriptor_heap_count();
+std::uint64_t refused_descriptor_handle_calls();
+
 // Number of PC vtable slots the proxy forwards (detected from the interfaces the PC device supports).
 unsigned device_proxy_slot_count(const void* device);
 
@@ -146,9 +198,9 @@ using PlacedAtVaHandler = HRESULT (*)(ID3D12Device* real, void* va, const D3D12_
 void set_placed_at_va_handler(PlacedAtVaHandler handler);
 
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
-// proxies), 9 (allocator proxies), 14, 26 (the console's struct-return form), 31/34/35/45/46/50 (proxies unwrapped),
-// 32 and 36 (fence proxies), 48/73 and 78/79/80 (the Xbox slots above, at their configured indices), 62, 67, 76
-// and 133.
+// proxies), 9 (allocator proxies), 14, 17-24 (CPU descriptor handles translated), 26 (the console's struct-return
+// form), 31/34/35/45/46/50 (proxies unwrapped),
+// 32 and 36 (fence proxies), 48/73 and 78/79/80 (the Xbox slots above, at their configured indices), 62, 67, 76 and 133.
 // Slot 10 is intentionally false: the measured 9/10 handle conversion is on the heap proxy, and device slot 9 is
 // CreateCommandAllocator, which the proxy handles for the allocator proxy.
 bool device_slot_overridden(unsigned slot);

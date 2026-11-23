@@ -10,11 +10,15 @@
 //   slot 8/36 CreateCommandQueue/CreateFence (return queue and fence proxies that run GPU work)
 // Slot 9 on the device is CreateCommandAllocator on the PC vtable and must still forward, which proves the handle
 // getters were not wedged into the device slots. Console output also shows the proxy's first-call slot log.
+// It also registers this executable as a synthetic title image with __XMemAllocationHooks__ (registry bounds and
+// cleanup), creates title-backed heaps through slot 14, and clears a title-handle RTV to (255, 0, 128, 255) and DSV to
+// Depth 0.25 through console list slots 50/51/52 with a readback on WARP. That is a synthetic check, not a title frame.
 #include <windows.h>
 #include <d3d12.h>
 #include <d3dcompiler.h>
 #include <dxgi1_4.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -84,6 +88,106 @@ D3D12_HEAP_PROPERTIES default_heap() {
     heap.CreationNodeMask = 1;
     heap.VisibleNodeMask = 1;
     return heap;
+}
+
+// ---- A synthetic title's __XMemAllocationHooks__ (registration and slot 14 backing, upstream PR #7021 adapted) ----
+//
+// The routines and the struct live in this executable, which is registered as the "title image" below, so the
+// registry's in-image checks hold for them. Each allocation hands out `next` (null: the hook has no memory) and records
+// what it was asked; each free is recorded.
+struct TitleHookState {
+    std::uint8_t cbv[4096];  // the title's backings: only their addresses are used, never their bytes
+    std::uint8_t rtv[1024];
+    std::uint8_t dsv[1024];
+    void* next;
+    std::size_t next_capacity;
+    int allocations;
+    std::size_t last_size;
+    std::uint64_t last_attributes;
+    int frees;
+    void* last_freed;
+    std::uint64_t last_free_attributes;
+};
+TitleHookState g_title;
+
+void* title_alloc(std::size_t size, std::uint64_t attributes) {
+    ++g_title.allocations;
+    g_title.last_size = size;
+    g_title.last_attributes = attributes;
+    return size <= g_title.next_capacity ? g_title.next : nullptr;
+}
+
+void title_free(void* address, std::uint64_t attributes) {
+    ++g_title.frees;
+    g_title.last_freed = address;
+    g_title.last_free_attributes = attributes;
+}
+
+// Mutable, as a title's exported struct is: the checks below rewrite it.
+rt::shims::XMemAllocationHooks g_title_hooks{&title_alloc, &title_free};
+
+void hand_out(void* memory, std::size_t capacity) {
+    g_title.next = memory;
+    g_title.next_capacity = capacity;
+}
+
+void this_image(const void*& base, std::uint64_t& size) {
+    const auto* b = reinterpret_cast<const std::uint8_t*>(GetModuleHandleW(nullptr));
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(b);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(b + dos->e_lfanew);
+    base = b;
+    size = nt->OptionalHeader.SizeOfImage;
+}
+
+// Registration bounds and cleanup in the shim registry (no device needed).
+void check_hook_registration() {
+    using rt::shims::XMemHooksState;
+    const void* base = nullptr;
+    std::uint64_t size = 0;
+    this_image(base, size);
+    const void* const owner = &g_title;
+    const void* const other_owner = &g_title_hooks;
+    check(rt::shims::xmem_allocation_hooks().state == XMemHooksState::None, "no __XMemAllocationHooks__ registered");
+
+    check(rt::shims::add_xmem_allocation_hooks(owner, base, size, &g_title_hooks), "hooks inside the image register");
+    auto snapshot = rt::shims::xmem_allocation_hooks();
+    check(snapshot.state == XMemHooksState::Ready && snapshot.alloc == &title_alloc && snapshot.free == &title_free &&
+              snapshot.generation != 0,
+          "the registered hooks are ready with their own pair");
+    const std::uint64_t generation = snapshot.generation;
+    check(!rt::shims::add_xmem_allocation_hooks(other_owner, base, size, &g_title_hooks) &&
+              rt::shims::xmem_allocation_hooks().generation == generation,
+          "a second exporting image is refused while one registration is active");
+    g_title_hooks = {nullptr, nullptr};
+    check(rt::shims::xmem_allocation_hooks().state == XMemHooksState::None, "a struct of two nulls installs no hook");
+    g_title_hooks = {&title_alloc, nullptr};
+    check(rt::shims::xmem_allocation_hooks().state == XMemHooksState::Invalid, "a half-filled struct is invalid");
+    g_title_hooks = {&title_alloc,
+                     reinterpret_cast<rt::shims::XMemFreeHookFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
+                                                                                "Sleep"))};
+    check(rt::shims::xmem_allocation_hooks().state == XMemHooksState::Invalid,
+          "a routine outside the registering image is invalid");
+    g_title_hooks = {&title_alloc, &title_free};
+    rt::shims::remove_xmem_allocation_hooks(other_owner);  // not the active owner: nothing changes
+    check(rt::shims::xmem_allocation_hooks().state == XMemHooksState::Ready, "removing another owner keeps the hooks");
+    rt::shims::remove_xmem_allocation_hooks(owner);
+    check(rt::shims::xmem_allocation_hooks().state == XMemHooksState::None, "removing the owner unregisters");
+    const int frees = g_title.frees;
+    check(!rt::shims::xmem_free_with_hooks(generation, &title_free, g_title.cbv, 4) && g_title.frees == frees,
+          "a free after unregistration does not call the routine");
+
+    const auto* image_end = static_cast<const std::uint8_t*>(base) + size;
+    check(!rt::shims::add_xmem_allocation_hooks(owner, base, size, image_end - 8) &&
+              rt::shims::xmem_allocation_hooks().state == XMemHooksState::Invalid,
+          "a struct running past the image end registers as invalid");
+    rt::shims::remove_xmem_allocation_hooks(owner);
+    check(!rt::shims::add_xmem_allocation_hooks(owner, base, size, nullptr) &&
+              rt::shims::xmem_allocation_hooks().state == XMemHooksState::None,
+          "a null struct registers nothing");
+    check(rt::shims::add_xmem_allocation_hooks(owner, base, size, &g_title_hooks) &&
+              rt::shims::xmem_allocation_hooks().generation > generation,
+          "a new registration gets a new generation");
+    rt::shims::remove_xmem_allocation_hooks(owner);
 }
 
 bool load_compute_shader(ComPtr<ID3DBlob>& bytecode) {
@@ -511,6 +615,243 @@ int main(int argc, char** argv) {
             check(SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(owner.GetAddressOf()))) && owner.Get() == device.Get(),
                   "the queue proxy's GetDevice is the device the shim returned");
         }
+    }
+
+    // Title-backed descriptor heaps on WARP (upstream PRs #7021 and #7880, adapted). The device came from
+    // D3D12XboxCreateDevice, so slot 14 consults the registry's hooks; this executable plays the title image.
+    check_hook_registration();
+    {
+        using T = rt::d3d12_xs::DescriptorHandleTranslation;
+        using GetCpuOutFn = void(WINAPI*)(ID3D12DescriptorHeap*, D3D12_CPU_DESCRIPTOR_HANDLE*);
+        using GetGpuOutFn = void(WINAPI*)(ID3D12DescriptorHeap*, D3D12_GPU_DESCRIPTOR_HANDLE*);
+        const void* image = nullptr;
+        std::uint64_t image_size = 0;
+        this_image(image, image_size);
+        g_title_hooks = {&title_alloc, &title_free};
+        check(rt::shims::add_xmem_allocation_hooks(&g_title, image, image_size, &g_title_hooks),
+              "the synthetic title image registers its hooks");
+        const UINT cbv_inc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        D3D12_DESCRIPTOR_HEAP_DESC cbv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
+                                            D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+
+        // Failures: a hook without memory and an invalid struct both fail slot 14 with a null output.
+        ComPtr<ID3D12DescriptorHeap> refused;
+        hand_out(nullptr, 0);
+        hr = device->CreateDescriptorHeap(&cbv_desc, IID_PPV_ARGS(refused.GetAddressOf()));
+        check(hr == E_OUTOFMEMORY && !refused && g_title.allocations == 1,
+              "slot 14 fails with E_OUTOFMEMORY when the title's hook returns no memory");
+        g_title_hooks.free = nullptr;
+        hr = device->CreateDescriptorHeap(&cbv_desc, IID_PPV_ARGS(refused.GetAddressOf()));
+        check(hr == E_FAIL && !refused && g_title.allocations == 1, "slot 14 fails for half-filled hooks");
+        g_title_hooks.free = &title_free;
+
+        // A title-backed heap: the hook is asked for NumDescriptors * increment with 0x00800004.
+        hand_out(g_title.cbv, sizeof(g_title.cbv));
+        ComPtr<ID3D12DescriptorHeap> hooked;
+        hr = device->CreateDescriptorHeap(&cbv_desc, IID_PPV_ARGS(hooked.GetAddressOf()));
+        check(SUCCEEDED(hr) && hooked && g_title.allocations == 2 && g_title.last_size == 4u * cbv_inc &&
+                  g_title.last_attributes == 0x00800004,
+              "slot 14 asks __XMemAllocationHooks__ for the heap's bytes with the D3D descriptor-heap attributes");
+        if (hooked) {
+            void** vtbl = *reinterpret_cast<void***>(hooked.Get());
+            ID3D12DescriptorHeap* real_hooked = rt::d3d12_xs::heap_proxy_real_heap(hooked.Get());
+            void** real_vtbl_h = *reinterpret_cast<void***>(real_hooked);
+            D3D12_CPU_DESCRIPTOR_HANDLE real_cpu{};
+            D3D12_GPU_DESCRIPTOR_HANDLE real_gpu{};
+            reinterpret_cast<GetCpuOutFn>(real_vtbl_h[9])(real_hooked, &real_cpu);
+            reinterpret_cast<GetGpuOutFn>(real_vtbl_h[10])(real_hooked, &real_gpu);
+            const auto base = reinterpret_cast<SIZE_T>(g_title.cbv);
+            check(reinterpret_cast<GetCpuHandleFn>(vtbl[9])(hooked.Get()).ptr == base,
+                  "heap slot 9 returns the title's backing address");
+            check(reinterpret_cast<GetGpuHandleFn>(vtbl[10])(hooked.Get()).ptr == real_gpu.ptr && real_gpu.ptr,
+                  "heap slot 10 keeps the genuine GPU start");
+            D3D12_CPU_DESCRIPTOR_HANDLE out{};
+            check(rt::d3d12_xs::translate_cpu_descriptor_range(device.Get(), {base + cbv_inc}, 3,
+                                                                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                                                                &out) == T::translated &&
+                      out.ptr == real_cpu.ptr + cbv_inc,
+                  "a title handle translates to the real heap at the same offset");
+            check(rt::d3d12_xs::translate_cpu_descriptor_range(device.Get(), {base + cbv_inc}, 4,
+                                                                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                                                                &out) == T::invalid,
+                  "a span past the title heap's end is invalid");
+            // The plain heap made before the hooks keeps its genuine handles.
+            if (heap) {
+                const SIZE_T plain = reinterpret_cast<GetCpuHandleFn>((*reinterpret_cast<void***>(heap.Get()))[9])(
+                                         heap.Get()).ptr;
+                check(rt::d3d12_xs::translate_cpu_descriptor_range(device.Get(), {plain}, 1,
+                                                                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                                                                    &out) == T::unchanged && out.ptr == plain,
+                      "a normal PC heap handle stays valid and unchanged");
+                const std::uint64_t refused_before = rt::d3d12_xs::refused_descriptor_handle_calls();
+                D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{};
+                cbv.SizeInBytes = 256;
+                device->CreateConstantBufferView(&cbv, {plain});
+                device->CreateConstantBufferView(&cbv, {base + cbv_inc});  // translated, WARP writes the real heap
+                check(rt::d3d12_xs::refused_descriptor_handle_calls() == refused_before,
+                      "slot 17 forwards plain and title handles on WARP");
+                device->CreateConstantBufferView(&cbv, {base + 1});            // misaligned custom handle
+                device->CreateConstantBufferView(&cbv, {base + cbv_inc / 2});  // between descriptors
+                check(rt::d3d12_xs::refused_descriptor_handle_calls() == refused_before + 2,
+                      "slot 17 refuses invalid title pointers instead of handing them to WARP");
+            }
+        }
+        const int frees = g_title.frees;
+        hooked.Reset();
+        check(g_title.frees == frees + 1 && g_title.last_freed == g_title.cbv &&
+                  g_title.last_free_attributes == 0x00800004,
+              "the last Release frees the backing once through the title's free hook");
+
+        // A synthetic GPU check through the console list: title-backed RTV and DSV heaps, OMSetRenderTargets (50),
+        // ClearRenderTargetView (52) with (1, 0, 128/255, 1) and ClearDepthStencilView (51) with Depth 0.25, then a
+        // copy to a readback buffer. This exercises the translation and the typed slot 51 on WARP; it is not a
+        // title frame.
+        ComPtr<ID3D12DescriptorHeap> rtv_heap, dsv_heap;
+        hand_out(g_title.rtv, sizeof(g_title.rtv));
+        D3D12_DESCRIPTOR_HEAP_DESC rtv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        HRESULT hr_rtv = device->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(rtv_heap.GetAddressOf()));
+        hand_out(g_title.dsv, sizeof(g_title.dsv));
+        D3D12_DESCRIPTOR_HEAP_DESC dsv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        HRESULT hr_dsv = device->CreateDescriptorHeap(&dsv_desc, IID_PPV_ARGS(dsv_heap.GetAddressOf()));
+        check(SUCCEEDED(hr_rtv) && SUCCEEDED(hr_dsv) && rtv_heap && dsv_heap, "title-backed RTV and DSV heaps");
+
+        D3D12_HEAP_PROPERTIES readback_heap = default_heap();
+        readback_heap.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC rt_desc = texture_desc();
+        rt_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        rt_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        D3D12_RESOURCE_DESC ds_desc = rt_desc;
+        ds_desc.Format = DXGI_FORMAT_D32_FLOAT;
+        ds_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        D3D12_RESOURCE_DESC rb_desc = buffer_desc();
+        rb_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ComPtr<ID3D12Resource> rt_tex, ds_tex, rb_buf;
+        const HRESULT hr_rt = device->CreateCommittedResource(&heap_properties, D3D12_HEAP_FLAG_NONE, &rt_desc,
+                                                              D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                              IID_PPV_ARGS(rt_tex.GetAddressOf()));
+        const HRESULT hr_ds = device->CreateCommittedResource(&heap_properties, D3D12_HEAP_FLAG_NONE, &ds_desc,
+                                                              D3D12_RESOURCE_STATE_DEPTH_WRITE, nullptr,
+                                                              IID_PPV_ARGS(ds_tex.GetAddressOf()));
+        const HRESULT hr_rb = device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &rb_desc,
+                                                              D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                              IID_PPV_ARGS(rb_buf.GetAddressOf()));
+        check(SUCCEEDED(hr_rt) && SUCCEEDED(hr_ds) && SUCCEEDED(hr_rb), "render target, depth and readback resources");
+
+        if (rtv_heap && dsv_heap && rt_tex && ds_tex && rb_buf) {
+            const UINT rtv_inc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+            const UINT dsv_inc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+            const auto rtv_base = reinterpret_cast<GetCpuHandleFn>((*reinterpret_cast<void***>(rtv_heap.Get()))[9])(
+                rtv_heap.Get());
+            const auto dsv_base = reinterpret_cast<GetCpuHandleFn>((*reinterpret_cast<void***>(dsv_heap.Get()))[9])(
+                dsv_heap.Get());
+            check(rtv_base.ptr == reinterpret_cast<SIZE_T>(g_title.rtv) &&
+                      dsv_base.ptr == reinterpret_cast<SIZE_T>(g_title.dsv),
+                  "RTV and DSV heaps report the title's addresses");
+            const D3D12_CPU_DESCRIPTOR_HANDLE rtv{rtv_base.ptr + rtv_inc};
+            const D3D12_CPU_DESCRIPTOR_HANDLE dsv{dsv_base.ptr + dsv_inc};
+            device->CreateRenderTargetView(rt_tex.Get(), nullptr, rtv);  // slot 20, translated
+            device->CreateDepthStencilView(ds_tex.Get(), nullptr, dsv);  // slot 21, translated
+
+            using CreateQueueFn = HRESULT(WINAPI*)(void*, const D3D12_COMMAND_QUEUE_DESC*, const IID*, void**);
+            using CreateListXFn = HRESULT(WINAPI*)(void*, const void*, ID3D12CommandAllocator*, ID3D12PipelineState*,
+                                                   const IID*, void**);
+            using CloseFn = HRESULT(WINAPI*)(void*);
+            using BarrierFn = void(WINAPI*)(void*, UINT, const D3D12_RESOURCE_BARRIER*);
+            using CopyTextureFn = void(WINAPI*)(void*, const D3D12_TEXTURE_COPY_LOCATION*, UINT, UINT, UINT,
+                                                const D3D12_TEXTURE_COPY_LOCATION*, const D3D12_BOX*);
+            using OmSetFn = void(WINAPI*)(void*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL,
+                                          const D3D12_CPU_DESCRIPTOR_HANDLE*);
+            using ClearRtvFn = void(WINAPI*)(void*, D3D12_CPU_DESCRIPTOR_HANDLE, const FLOAT*, UINT, const D3D12_RECT*);
+            using ClearDsvFn = void(WINAPI*)(void*, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CLEAR_FLAGS, FLOAT, UINT8, UINT,
+                                             const D3D12_RECT*);
+            const D3D12_COMMAND_QUEUE_DESC queue_desc{};
+            const IID iid_queue = __uuidof(ID3D12CommandQueue);
+            ComPtr<ID3D12CommandQueue> queue;
+            hr = reinterpret_cast<CreateQueueFn>(proxy_vtbl[8])(device.Get(), &queue_desc, &iid_queue,
+                                                                reinterpret_cast<void**>(queue.GetAddressOf()));
+            ComPtr<ID3D12CommandAllocator> list_allocator;
+            const HRESULT hr_alloc = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                                    IID_PPV_ARGS(list_allocator.GetAddressOf()));
+            struct {
+                UINT Type;
+                UINT NodeMask;
+            } list_desc{D3D12_COMMAND_LIST_TYPE_DIRECT, 0};
+            const IID iid_list = rt::d3d12_xs::kCommandListIidPairs[0].console;
+            ComPtr<IUnknown> list;
+            const HRESULT hr_list = SUCCEEDED(hr_alloc)
+                                        ? reinterpret_cast<CreateListXFn>(proxy_vtbl[73])(
+                                              device.Get(), &list_desc, list_allocator.Get(), nullptr, &iid_list,
+                                              reinterpret_cast<void**>(list.GetAddressOf()))
+                                        : hr_alloc;
+            ComPtr<ID3D12Fence> fence;
+            const HRESULT hr_fence = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence.GetAddressOf()));
+            check(SUCCEEDED(hr) && SUCCEEDED(hr_list) && SUCCEEDED(hr_fence) && queue && list && fence &&
+                      rt::d3d12_xs::is_list_proxy(list.Get()),
+                  "queue, console list proxy and fence for the clear check");
+
+            if (queue && list && fence) {
+                void** lv = *reinterpret_cast<void***>(list.Get());
+                const FLOAT color[4] = {1.0f, 0.0f, 128.0f / 255.0f, 1.0f};
+                reinterpret_cast<OmSetFn>(lv[50])(list.Get(), 1, &rtv, FALSE, &dsv);
+                reinterpret_cast<ClearRtvFn>(lv[52])(list.Get(), rtv, color, 0, nullptr);
+                reinterpret_cast<ClearDsvFn>(lv[51])(list.Get(), dsv, D3D12_CLEAR_FLAG_DEPTH, 0.25f, 0, 0, nullptr);
+                D3D12_RESOURCE_BARRIER barriers[2]{};
+                barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barriers[0].Transition = {rt_tex.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                          D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE};
+                barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barriers[1].Transition = {ds_tex.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                          D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE};
+                reinterpret_cast<BarrierFn>(lv[26])(list.Get(), 2, barriers);
+                D3D12_TEXTURE_COPY_LOCATION rt_dst{}, rt_src{}, ds_dst{}, ds_src{};
+                rt_dst.pResource = rb_buf.Get();
+                rt_dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                rt_dst.PlacedFootprint = {0, {DXGI_FORMAT_R8G8B8A8_UNORM, 4, 4, 1, 256}};
+                rt_src.pResource = rt_tex.Get();
+                rt_src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                ds_dst.pResource = rb_buf.Get();
+                ds_dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                ds_dst.PlacedFootprint = {1536, {DXGI_FORMAT_R32_TYPELESS, 4, 4, 1, 256}};
+                ds_src.pResource = ds_tex.Get();
+                ds_src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                reinterpret_cast<CopyTextureFn>(lv[16])(list.Get(), &rt_dst, 0, 0, 0, &rt_src, nullptr);
+                reinterpret_cast<CopyTextureFn>(lv[16])(list.Get(), &ds_dst, 0, 0, 0, &ds_src, nullptr);
+                check(rt::d3d12_xs::list_proxy_unsupported_slot(list.Get()) == 0 &&
+                          reinterpret_cast<CloseFn>(lv[9])(list.Get()) == S_OK,
+                      "the console list records the title-handle clears and closes");
+
+                ID3D12CommandList* const lists[] = {static_cast<ID3D12CommandList*>(static_cast<void*>(list.Get()))};
+                queue->ExecuteCommandLists(1, lists);
+                HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                const bool done = event && SUCCEEDED(queue->Signal(fence.Get(), 1)) &&
+                                  SUCCEEDED(fence->SetEventOnCompletion(1, event)) &&
+                                  WaitForSingleObject(event, 5000) == WAIT_OBJECT_0;
+                if (event) CloseHandle(event);
+                check(done, "the clear commands complete on WARP");
+                void* mapped = nullptr;
+                const D3D12_RANGE read{0, 4096};
+                if (done && SUCCEEDED(rb_buf->Map(0, &read, &mapped)) && mapped) {
+                    const auto* bytes = static_cast<const std::uint8_t*>(mapped);
+                    float depth = -1.0f;
+                    std::memcpy(&depth, bytes + 1536, sizeof(depth));
+                    std::printf("readback RGBA %u %u %u %u, depth %.7f\n", bytes[0], bytes[1], bytes[2], bytes[3],
+                                static_cast<double>(depth));
+                    check(bytes[0] == 255 && bytes[1] == 0 && bytes[2] == 128 && bytes[3] == 255,
+                          "console slot 52 clears the title-handle RTV to (255, 0, 128, 255)");
+                    check(depth == 0.25f, "console slot 51 clears the title-handle DSV to Depth 0.25 (XMM3 kept)");
+                    const D3D12_RANGE written{0, 0};
+                    rb_buf->Unmap(0, &written);
+                } else {
+                    check(false, "the readback buffer maps");
+                }
+            }
+        }
+        const int frees_before_heaps = g_title.frees;
+        rtv_heap.Reset();
+        dsv_heap.Reset();
+        check(g_title.frees == frees_before_heaps + 2, "both clear-check heaps free their title backing once");
+        rt::shims::remove_xmem_allocation_hooks(&g_title);
+        check(rt::d3d12_xs::title_descriptor_range_count() == 0, "no title range outlives its heap");
     }
 
     // Hold a reference to the PC device so the final check can prove the proxy's Release balances its own.

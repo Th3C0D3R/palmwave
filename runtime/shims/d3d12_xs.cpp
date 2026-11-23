@@ -117,6 +117,36 @@ HRESULT WINAPI create_root_signature_deserializer(const void* data, SIZE_T size,
     return fn(data, size, iid, out);
 }
 
+// The descriptor-heap allocator the device proxy consults at slot 14, bridged to the title's registered
+// __XMemAllocationHooks__ (adapted from upstream PR #7021, Khuraie, GPL-3.0). The bridge lives here so the standalone
+// d3d12_xs_device test targets need no registry. The free routine is captured with the allocation and checked against
+// its live registration before it is called; after the image is unregistered the backing is reported, not freed.
+namespace xs = rt::d3d12_xs;
+
+xs::DescriptorBackingStatus xmem_descriptor_allocate(std::size_t byte_size, std::uint64_t attributes,
+                                                     xs::DescriptorHeapBacking* out) {
+    const rt::shims::XMemHooksSnapshot hooks = rt::shims::xmem_allocation_hooks();
+    if (hooks.state == rt::shims::XMemHooksState::None) return xs::DescriptorBackingStatus::not_hooked;
+    if (hooks.state != rt::shims::XMemHooksState::Ready || !out) return xs::DescriptorBackingStatus::invalid_hooks;
+    void* const address = hooks.alloc(byte_size, attributes);  // the title's code, called with no lock held
+    if (!address) return xs::DescriptorBackingStatus::out_of_memory;
+    out->address = address;
+    out->token = hooks.generation;
+    out->release_hook = reinterpret_cast<void*>(hooks.free);
+    return xs::DescriptorBackingStatus::allocated;
+}
+
+void xmem_descriptor_release(const xs::DescriptorHeapBacking& backing, std::uint64_t attributes) {
+    const auto free_fn = reinterpret_cast<rt::shims::XMemFreeHookFn>(backing.release_hook);
+    if (!rt::shims::xmem_free_with_hooks(backing.token, free_fn, backing.address, attributes))
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: descriptor-heap backing %p not freed: the image whose hooks allocated it is no "
+                     "longer registered\n", backing.address);
+}
+
+constexpr xs::DescriptorHeapAllocator kXmemDescriptorHeapAllocator{&xmem_descriptor_allocate,
+                                                                   &xmem_descriptor_release};
+
 // Measured shape: D3D12XboxCreateDevice(adapter, params, riid, out), where params is a 24-word block that is only
 // logged and not used to create the device. The struct's total size is unknown, so the log reads 24 x 32-bit words
 // (96 bytes) and no more. The PC D3D12CreateDevice needs a minimum feature level instead, so 12_0 is used as the
@@ -124,6 +154,8 @@ HRESULT WINAPI create_root_signature_deserializer(const void* data, SIZE_T size,
 HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, const IID* riid, void** out) {
     constexpr auto method = "D3D12XboxCreateDevice";
     using rt::d3d12_trace::result;
+    // Slot 14 of every device proxy consults the title's hooks from now on (an explicit test allocator still wins).
+    rt::d3d12_xs::set_default_descriptor_heap_allocator(&kXmemDescriptorHeapAllocator);
     if (!out) return result(method, E_POINTER);
     *out = nullptr;
     if (!riid) return result(method, E_POINTER);

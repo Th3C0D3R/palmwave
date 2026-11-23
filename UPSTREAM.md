@@ -109,3 +109,65 @@ by OpenAI Codex. Its trace marker was corrected to the single-token `experimenta
 and the experimental GPU-copy case passed in 0.51 seconds on RTX 5080 / 621.14 with Vulkan validation and no errors.
 The separate local RW/WC discriminator and the subsequent offline retail progress are recorded in `STATUS.md`;
 none of those observations proves the unknown console flag's semantics or a rendered frame.
+
+## Title-backed descriptor heaps and CPU descriptor handles
+
+The `__XMemAllocationHooks__` registration, the slot-14 title backing and the device slot 17..24 handle translation are adapted from Khuraie's [Leonida PR #7021](https://github.com/ItsNotRexed/Leonida/pull/7021), revision `355201c51e6aba95c582e2df344782b22e97bb31`, under GPL-3.0. The console command-list hunks for slots 50..54, including the typed `ClearDepthStencilView` thunk, are adapted from alexander-src's [Leonida PR #7880](https://github.com/ItsNotRexed/Leonida/pull/7880), revision `0aba6c3611541f169c25f0e3a1de90db25bdd2d4`, under GPL-3.0. #7880's diff is stacked on older changes. Only its descriptor-handle hunks in `ListProxy` and the matching test ideas were used. Its other hunks, test boilerplate, shader and CMake changes, documentation and `check_tiny_frame.py` were not imported, and no whole file was replaced.
+
+The hook layout and allocation attribute word `0x00800004` come from #7021's public source report. A local offline Xbox Series executable probe also observed the heap CPU-handle assertion before this change. With these hooks, that assertion is passed and SRV, UAV and CBV creation are reached. The next observed stop is an access violation through device slot 70. This does not establish its console contract, shader-visible descriptor-byte synchronization or a rendered frame.
+
+### What Palmwave changed
+
+- **Registration.** The loader registers the export after relocation. `~Loader` removes the registration after process detach and before unmapping. The registry requires the whole struct to lie inside the exporting image, and it checks both routine pointers on every snapshot, because the title may fill the struct at run time. Only one registration can be active, and a second exporting image is refused. A struct that does not fit its image registers as invalid. Two null pointers mean no hook. One null pointer, or a pointer outside the image, makes the hooks invalid. Each registration gets a generation number.
+- **Allocation.** Slot 14 calls the hooks after the real heap exists. If the hook returns null, slot 14 fails with `E_OUTOFMEMORY`. #7021 fell back to the plain heap in that case. Slot 14 fails with `E_FAIL` in these cases:
+  - the hooks are invalid;
+  - the increment is 0;
+  - the real start is unknown;
+  - the address range wraps;
+  - the new range overlaps a live title range, or overlaps a live real range in either direction.
+
+  In every failure path the real heap is released first and then the backing, exactly once, through the pair that allocated it. Heap slot 9 returns the title address, and slot 10 keeps the genuine GPU start.
+- **Translation.** While no title-backed heap exists, every handle passes through unchanged, as before. While one exists, a handle inside a title range is translated only if its device and heap type match, it lies on a descriptor boundary, and its whole span fits. The span covers `CopyDescriptors` range sizes, `CopyDescriptorsSimple` counts and the single-range form of `OMSetRenderTargets`. All handles outside registered custom ranges pass unchanged, including native heaps created directly on the backend. Range ends, freed ranges and other untracked addresses cannot be classified as custom; the backend remains responsible for those handles. A mixed native/custom regression covers this boundary.
+- **Invalid handles.** Device slots 17..24 are void. They do not forward an invalid handle. They count it (`refused_descriptor_handle_calls`), log it and trace it as `refused`. List slots 50..54 mark the list with the existing unsupported state, so `Close` fails and the queue refuses the submission until `Reset`. #7880 forwarded more than 8 render targets untranslated. Palmwave refuses that call.
+- **Slot 51.** `ClearDepthStencilView` has its own typed `WINAPI` thunk, so `FLOAT Depth` stays in XMM3. The UAV clears translate only the CPU handle, and the GPU handle passes through unchanged.
+
+### New fields
+
+- **`HeapProxy`:** `custom_cpu_start` (0 for a plain heap), `backing` and `release_backing`. The backing and its free routine are captured at creation and owned by the proxy after a successful creation.
+- **Descriptor-range table:** one `DescriptorRange` per heap made by slot 14. Each holds the device, the heap, `real_start`, `custom_start`, `byte_size`, `increment` and `type`.
+- **`DescriptorHeapBacking`:** `address`, plus an opaque `token` and `release_hook`. Through the bridge in `d3d12_xs.cpp`, these hold the registration generation and the title's free routine.
+
+### Lock and lifetime strategy
+
+The range table, the allocator configuration and the hook registry each have their own immortal mutex. None of them is held while the title's routines run.
+
+On a heap's last `Release`, teardown runs in this order:
+1. Remove its range.
+2. Delete the proxy.
+3. Release the real heap.
+4. Release the device proxy.
+5. Free the backing.
+
+Translation copies its result while holding the table lock. Using a heap's handles while it is being released is the caller's error, as on the PC. A backing released after its image was unregistered is reported and not freed, because the routine's code may be gone.
+
+### Remaining limitations
+
+- The title's own CPU reads and writes in its backing memory are not mirrored into the real heap. Only the API calls above are translated.
+- Other CPU-handle consumers are not translated. These include `CreateSampler2`, `CreateSamplerFeedbackUnorderedAccessView` and any console-only slot.
+- Untracked native CPU handles pass unchanged, including heaps created directly on the backend. Only a handle inside a registered custom range can be validated as custom; addresses outside those ranges remain the backend's responsibility.
+- Increments come from the host device through slot 15. Code that assumes console increment constants is not covered.
+- Hook routines in a module other than the exporting image are refused.
+- Which image the console runtime consults when several export the struct is not known. Palmwave uses the first registration.
+- The synthetic mock checks the typed slot-51 path. It cannot show that the old integer thunk lost Depth, because XMM3 can survive it by chance. The WARP readback checks the value end to end.
+- An out-of-memory failure of the range table itself is handled in code but not injected by a test.
+
+### Tests and validation status
+
+New synthetic tests were written in these files:
+- `runtime/test/xs_proxy_mock_test.cpp`: `check_descriptor_heaps` and `check_list_descriptor_handles`.
+- `runtime/test/device_proxy_test.cpp`: registry bounds and cleanup, hooked WARP heaps, and an RTV (255, 0, 128, 255) and DSV Depth 0.25 clear with readback through console slots 50, 51 and 52.
+- `runtime/test/loader_test.cpp`: export registration, refusal and cleanup.
+
+Validation on Windows/MSVC 19.51: four focused CTests pass (`loader`, `device_proxy`, `device_proxy_trace`, `xs_proxy_mock`) in 11.74 seconds. The two device tests use WARP and read back RGBA (255, 0, 128, 255) and depth 0.25; they are not NVIDIA Vulkan tests. The offline RTX 5080 / 621.14 probe records 1,800 D3D12 events and no draw, submission or presentation. Both existing flush and host-import experiments were enabled for that diagnostic probe. No retail frame is claimed.
+
+The adaptation, tests and this note were written with Claude Code (Claude Opus 5.5) as a Moon AI project contribution. OpenAI Codex reviewed the adaptation, corrected the native-handle boundary and unpaired-allocator guard, and built and tested the change.

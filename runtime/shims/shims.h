@@ -80,6 +80,42 @@ void* load_bundled_module_w(const std::wstring& basename, uint32_t flags, bool& 
 void* get_bundled_proc_address(void* module, const std::string& sym, bool& owns_handle);
 bool owns_bundled_module_handle(void* module);
 
+// Title-exported __XMemAllocationHooks__ (the retail executable exports this one symbol, docs/xmem_exe_calls.md).
+// The two-pointer layout {alloc(size, attributes), free(address, attributes)} is adopted from upstream PR #7021
+// (Khuraie, 355201c51e6aba95c582e2df344782b22e97bb31, GPL-3.0); it is that PR's reading of the GDK export, not a
+// Palmwave measurement. x64 has one calling convention, so no convention keyword is needed.
+using XMemAllocHookFn = void* (*)(size_t size, uint64_t attributes);
+using XMemFreeHookFn = void (*)(void* address, uint64_t attributes);
+struct XMemAllocationHooks {
+    XMemAllocHookFn alloc;
+    XMemFreeHookFn free;
+};
+static_assert(sizeof(XMemAllocationHooks) == 16, "two x64 function pointers");
+
+// Registration: Loader::map_image registers an image's export, ~Loader removes every registration it owns after the
+// process-detach notifications and before any image is unmapped. `hooks` and both function pointers it holds must lie
+// inside [image_base, image_base + image_size): the struct is checked here, the pointers on every snapshot (the title
+// may fill the struct at run time). Only one registration is active: while one exists, another image's export is
+// refused and logged (false). A struct that does not fit its image is kept as an INVALID registration (false), so
+// descriptor-heap creation fails instead of acting as if the title had no hooks. Null owner or hooks: nothing kept.
+bool add_xmem_allocation_hooks(const void* owner, const void* image_base, uint64_t image_size, const void* hooks);
+void remove_xmem_allocation_hooks(const void* owner);
+
+// What the active registration holds now. None: no registration, or both pointers null (the title installs no hook).
+// Invalid: one pointer null, a pointer outside the registering image, or an invalid registration. Ready: both
+// pointers inside the image. `generation` identifies the registration (never reused) for xmem_free_with_hooks.
+enum class XMemHooksState { None, Ready, Invalid };
+struct XMemHooksSnapshot {
+    XMemHooksState state = XMemHooksState::None;
+    XMemAllocHookFn alloc = nullptr;
+    XMemFreeHookFn free = nullptr;
+    uint64_t generation = 0;
+};
+XMemHooksSnapshot xmem_allocation_hooks();
+// Calls `free` (the routine captured with `generation` at allocation) when that registration is still active, and
+// returns true. False, without a call, after its image was unregistered: the routine's code may be gone.
+bool xmem_free_with_hooks(uint64_t generation, XMemFreeHookFn free, void* address, uint64_t attributes);
+
 // Test seam: called at the top of every unimplemented-import call with the address of rt_unimplemented's return
 // address slot (so a test can check stack alignment) and from inside the call (so it can walk the stack).
 using TestHook = void (*)(const void* return_address_slot);

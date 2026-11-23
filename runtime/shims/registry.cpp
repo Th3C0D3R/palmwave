@@ -8,6 +8,7 @@
 #include <cwchar>
 #include <map>
 #include <mutex>
+#include <new>
 #include <set>
 #include <string>
 #include <vector>
@@ -477,6 +478,124 @@ bool owns_bundled_module_handle(void* module) {
     for (const auto& entry : snapshot_bundled_loaders())
         if (entry.ops->owns_handle(entry.ctx, module)) return true;
     return false;
+}
+
+// ---- __XMemAllocationHooks__ (registration adapted from upstream PR #7021, Khuraie, GPL-3.0) ----
+//
+// One immortal mutex guards the list; late COM releases during teardown may still free through it. The title's
+// routines are never called under it (xmem_free_with_hooks checks, then calls), so a hook that re-enters the runtime
+// cannot deadlock here. ~Loader unregisters before unmapping and runs after mapped code has stopped (pe_loader.h), so
+// the struct read in a snapshot is mapped while the lock is held.
+namespace {
+
+struct XMemHooksEntry {
+    const void* owner;
+    std::uintptr_t image_begin;
+    std::uintptr_t image_end;  // exclusive
+    const XMemAllocationHooks* hooks;  // null for an invalid registration
+    uint64_t generation;
+};
+
+std::mutex& xmem_hooks_mutex() {
+    static auto* m = new std::mutex;
+    return *m;
+}
+
+std::vector<XMemHooksEntry>& xmem_hooks_entries() {
+    static auto* v = new std::vector<XMemHooksEntry>;
+    return *v;
+}
+
+uint64_t g_xmem_hooks_generation = 0;  // under xmem_hooks_mutex
+
+bool in_image(const XMemHooksEntry& e, const void* p) {
+    const auto at = reinterpret_cast<std::uintptr_t>(p);
+    return at >= e.image_begin && at < e.image_end;
+}
+
+}  // namespace
+
+bool add_xmem_allocation_hooks(const void* owner, const void* image_base, uint64_t image_size, const void* hooks) {
+    if (!owner || !hooks) return false;
+    const auto begin = reinterpret_cast<std::uintptr_t>(image_base);
+    const auto at = reinterpret_cast<std::uintptr_t>(hooks);
+    const bool fits = begin && image_size && image_size <= UINTPTR_MAX - begin && at >= begin &&
+                      at - begin <= image_size && image_size - (at - begin) >= sizeof(XMemAllocationHooks);
+    std::lock_guard lock(xmem_hooks_mutex());
+    auto& list = xmem_hooks_entries();
+    if (!list.empty()) {
+        std::fprintf(stderr,
+                     "[rt] __XMemAllocationHooks__ at %p refused: a registration from another image is active "
+                     "(one title hook pair at a time)\n", hooks);
+        return false;
+    }
+    try {
+        list.push_back({owner, begin, fits ? begin + static_cast<std::uintptr_t>(image_size) : begin,
+                        fits ? static_cast<const XMemAllocationHooks*>(hooks) : nullptr, ++g_xmem_hooks_generation});
+    } catch (const std::bad_alloc&) {
+        std::fprintf(stderr, "[rt] __XMemAllocationHooks__ at %p not registered: out of memory\n", hooks);
+        return false;
+    }
+    if (!fits) {
+        std::fprintf(stderr,
+                     "[rt] __XMemAllocationHooks__ at %p does not fit its image (%p, 0x%llx bytes); registered as "
+                     "invalid, descriptor-heap creation will fail\n",
+                     hooks, image_base, static_cast<unsigned long long>(image_size));
+        return false;
+    }
+    std::fprintf(stderr, "[rt] __XMemAllocationHooks__ registered at %p\n", hooks);
+    return true;
+}
+
+void remove_xmem_allocation_hooks(const void* owner) {
+    std::lock_guard lock(xmem_hooks_mutex());
+    auto& list = xmem_hooks_entries();
+    for (auto it = list.begin(); it != list.end();) {
+        if (it->owner == owner)
+            it = list.erase(it);
+        else
+            ++it;
+    }
+}
+
+XMemHooksSnapshot xmem_allocation_hooks() {
+    XMemHooksSnapshot snapshot;
+    std::lock_guard lock(xmem_hooks_mutex());
+    const auto& list = xmem_hooks_entries();
+    if (list.empty()) return snapshot;
+    const XMemHooksEntry& e = list.front();
+    snapshot.generation = e.generation;
+    if (!e.hooks) {
+        snapshot.state = XMemHooksState::Invalid;
+        return snapshot;
+    }
+    // Volatile reads: the title may write the struct at run time; each snapshot reads it once.
+    const auto alloc_fn = *reinterpret_cast<XMemAllocHookFn const volatile*>(&e.hooks->alloc);
+    const auto free_fn = *reinterpret_cast<XMemFreeHookFn const volatile*>(&e.hooks->free);
+    if (!alloc_fn && !free_fn) return snapshot;  // None: the title installs no hook
+    if (!alloc_fn || !free_fn || !in_image(e, reinterpret_cast<const void*>(alloc_fn)) ||
+        !in_image(e, reinterpret_cast<const void*>(free_fn))) {
+        snapshot.state = XMemHooksState::Invalid;
+        return snapshot;
+    }
+    snapshot.state = XMemHooksState::Ready;
+    snapshot.alloc = alloc_fn;
+    snapshot.free = free_fn;
+    return snapshot;
+}
+
+bool xmem_free_with_hooks(uint64_t generation, XMemFreeHookFn free_fn, void* address, uint64_t attributes) {
+    if (!free_fn || !generation) return false;
+    bool live = false;
+    {
+        std::lock_guard lock(xmem_hooks_mutex());
+        for (const auto& e : xmem_hooks_entries())
+            if (e.generation == generation && e.hooks && in_image(e, reinterpret_cast<const void*>(free_fn)))
+                live = true;
+    }
+    if (!live) return false;
+    free_fn(address, attributes);
+    return true;
 }
 
 Table::Table(const Entry* entries, size_t count) {

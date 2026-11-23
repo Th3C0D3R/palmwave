@@ -83,7 +83,7 @@ namespace xs = rt::d3d12_xs;
 // command_list answers ID3D12GraphicsCommandList only; list answers the whole chain through
 // ID3D12GraphicsCommandList8 (the Vulkan layer's shape), so the console IID's ID3D12GraphicsCommandList6 and the
 // GCL7 Barrier are reachable.
-enum class Kind { device, queue, fence, resource, allocator, command_list, list };
+enum class Kind { device, queue, fence, resource, allocator, command_list, list, heap };
 
 constexpr unsigned kMockSlots = 192;
 constexpr std::uint64_t kMockGpuBase = 0x00007f0000000000ull;  // mock buffers' GPU addresses, unlike any CPU one
@@ -92,6 +92,10 @@ constexpr GUID kConsoleListIid{0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0x
 constexpr std::uint64_t kFenceHandle = 0x1000, kResourceHandle = 0x2000;  // the handles the mock device opens
 constexpr std::uint64_t kCompletedValue = 7;                            // what a mock fence's slot 8 returns
 constexpr UINT kHeapMarker = 0x26262626;  // the VisibleNodeMask a mock device's slot 26 answers
+// Mock descriptor heaps' real CPU/GPU starts (pool index << 24 apart) and the title backings handed out below: fake
+// addresses in disjoint regions, never dereferenced by the proxy.
+constexpr std::uint64_t kMockHeapCpuBase = 0x0000500000000000ull;
+constexpr std::uint64_t kMockHeapGpuBase = 0x0000580000000000ull;
 // {5d1e0c4a-2b7f-4e61-9a3d-8c4b2f1e6a70}: an interface the mock queue implements that the proxy does not model.
 constexpr GUID kExtraIid{0x5d1e0c4a, 0x2b7f, 0x4e61, {0x9a, 0x3d, 0x8c, 0x4b, 0x2f, 0x1e, 0x6a, 0x70}};
 
@@ -120,12 +124,19 @@ struct Mock {
     std::uint64_t barrier_groups;
     D3D12_BARRIER_GROUP barrier_group;
     D3D12_GLOBAL_BARRIER barrier_global;
+    // heap: what slots 9/10 answer (distinct per mock heap, never dereferenced). device slot 23: the first source
+    // handles of CopyDescriptors as received (its destinations go to array[23]). list slot 46: the DSV handle value
+    // behind OMSetRenderTargets' pointer, as received.
+    std::uint64_t heap_cpu;
+    std::uint64_t heap_gpu;
+    std::uint64_t copy_src[4];
+    std::uint64_t om_dsv;
     unsigned calls[kMockSlots];
     std::uint64_t args[kMockSlots][5];
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
 };
 
-Mock g_pool[256];
+Mock g_pool[512];
 unsigned g_pool_used = 0;
 
 void** mock_vtable();
@@ -191,6 +202,7 @@ bool mock_has(const Mock* m, REFIID iid) {
                 if (IsEqualIID(iid, list_iid)) return true;
             return false;
         }
+        case Kind::heap: return IsEqualIID(iid, __uuidof(ID3D12DescriptorHeap));
         default: return false;
     }
 }
@@ -223,8 +235,23 @@ HRESULT mock_create(Mock* device, Kind kind, std::uint64_t riid, std::uint64_t o
     Mock* child = new_mock(kind);
     child->fence1 = device->fence1;
     child->allocator_tag = device->allocator_tag;
+    if (kind == Kind::heap) {
+        const auto index = static_cast<std::uint64_t>(child - g_pool);
+        child->heap_cpu = kMockHeapCpuBase + (index << 24);
+        child->heap_gpu = kMockHeapGpuBase + (index << 24);
+    }
     device->last_child = child;
     return mock_query(child, reinterpret_cast<const IID*>(riid), out);
+}
+
+// What the mock device's GetDescriptorHandleIncrementSize (slot 15) answers: distinct per type, so a span checked
+// with the wrong type's increment shows.
+UINT mock_increment(std::uint64_t type) {
+    switch (static_cast<std::uint32_t>(type)) {
+        case D3D12_DESCRIPTOR_HEAP_TYPE_RTV: return 64;
+        case D3D12_DESCRIPTOR_HEAP_TYPE_DSV: return 16;
+        default: return 32;  // CBV_SRV_UAV and SAMPLER
+    }
 }
 
 void copy_array(Mock* m, unsigned slot, std::uint64_t objects, std::uint64_t count) {
@@ -248,6 +275,15 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
                 return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a2, a3));
             }
             case 9: return static_cast<std::uint32_t>(mock_create(m, Kind::allocator, a2, a3));  // CreateCmdAllocator
+            case 14: return static_cast<std::uint32_t>(mock_create(m, Kind::heap, a2, a3));      // CreateDescriptorHeap
+            case 15: return mock_increment(a1);                       // GetDescriptorHandleIncrementSize(type)
+            case 23: {  // CopyDescriptors(numDest, destStarts, destSizes, numSrc, srcStarts, ...): copies the proxy owns
+                copy_array(m, 23, a2, a1);
+                const auto* src = reinterpret_cast<const std::uint64_t*>(words[4]);
+                for (std::uint32_t i = 0; src && i < static_cast<std::uint32_t>(a4) && i < 4; ++i)
+                    m->copy_src[i] = src[i];
+                break;
+            }
             case 75: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a3, a4));   // CreateCommandQueue1
             case 36: return static_cast<std::uint32_t>(mock_create(m, Kind::fence, a3, a4));   // CreateFence
             case 32:                                                                          // OpenSharedHandle
@@ -271,6 +307,12 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         return S_OK;
     }
     if (m->kind == Kind::fence && slot == 8) return kCompletedValue;  // GetCompletedValue
+    if (m->kind == Kind::heap && (slot == 9 || slot == 10)) {
+        // GetCPU/GPUDescriptorHandleForHeapStart, the PC way: through the hidden return pointer (and in RAX too).
+        const std::uint64_t value = slot == 9 ? m->heap_cpu : m->heap_gpu;
+        if (a1) std::memcpy(reinterpret_cast<void*>(a1), &value, sizeof(value));
+        return value;
+    }
     if (m->kind == Kind::queue && slot == 10) copy_array(m, slot, a2, a1);  // ExecuteCommandLists(count, lists)
     if (m->kind == Kind::resource) {
         if (slot == 8) {  // Map(subresource, range, &data)
@@ -293,6 +335,12 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
             const auto* views = reinterpret_cast<const D3D12_STREAM_OUTPUT_BUFFER_VIEW*>(a3);
             m->array[slot][0] = views[0].BufferLocation;
             m->array[slot][1] = views[0].BufferFilledSizeLocation;
+        }
+        if (slot == 46) {                             // OMSetRenderTargets(count, rtvs, singleRange, dsv)
+            const auto count = static_cast<std::uint32_t>(a1);
+            const std::uint32_t entries = static_cast<std::uint32_t>(a3) ? 1 : count;
+            copy_array(m, slot, a2, entries);
+            m->om_dsv = a4 ? reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(a4)->ptr : 0;
         }
         if (slot == 80) {                             // GCL7 Barrier(groups, group): the caller's structs are temporary
             m->barrier_groups = a1;
@@ -387,6 +435,24 @@ HRESULT WINAPI mock_create_committed_resource(Mock* self, const D3D12_HEAP_PROPE
     return mock_query(child, riid, out);
 }
 
+// PC ID3D12GraphicsCommandList::ClearDepthStencilView(dsv, flags, FLOAT depth, UINT8 stencil, rectCount, rects) is
+// slot 47: depth is the fourth argument, so it arrives in XMM3. This typed entry reads it from there, as the real
+// method does, and records (dsv, flags, depth bits, stencil, rectCount) in args[47] and the rect pointer in
+// array[47][0]. The mocks share one table; no test calls slot 47 on another kind, which only counts the call.
+std::uint64_t WINAPI mock_clear_depth_stencil_view(Mock* self, std::uint64_t dsv, std::uint64_t flags, float depth,
+                                                   std::uint64_t stencil, std::uint64_t rect_count,
+                                                   std::uint64_t rects) {
+    ++self->calls[47];
+    if (self->kind != Kind::list && self->kind != Kind::command_list) return S_OK;
+    std::uint32_t depth_bits = 0;
+    std::memcpy(&depth_bits, &depth, sizeof(depth_bits));
+    const std::uint64_t words[] = {dsv, static_cast<std::uint32_t>(flags), depth_bits, stencil & 0xff,
+                                   static_cast<std::uint32_t>(rect_count)};
+    std::memcpy(self->args[47], words, sizeof(words));
+    self->array[47][0] = rects;
+    return 0;
+}
+
 template <std::size_t... I>
 void fill_mock_vtable(void** vtable, std::index_sequence<I...>) {
     ((vtable[I] = reinterpret_cast<void*>(&mock_slot<static_cast<unsigned>(I)>)), ...);
@@ -398,6 +464,7 @@ void** mock_vtable() {
         fill_mock_vtable(table, std::make_index_sequence<kMockSlots>{});
         table[12] = reinterpret_cast<void*>(&mock_create_command_list);
         table[27] = reinterpret_cast<void*>(&mock_create_committed_resource);
+        table[47] = reinterpret_cast<void*>(&mock_clear_depth_stencil_view);
         return true;
     }();
     (void)filled;
@@ -1959,6 +2026,471 @@ int check_custom_heap_properties() {
     return 0;
 }
 
+// ---- 9b. Title-backed descriptor heaps and CPU descriptor handles (upstream PRs #7021 and #7880, adapted) ----
+//
+// A synthetic allocator stands in for the bridge to __XMemAllocationHooks__ (d3d12_xs.cpp; its registry side is in
+// device_proxy_test and loader_test). Its answer is set per call; every allocation and release is recorded, so each
+// failure path can show that the backing is released exactly once, by the pair that allocated it, after the real heap.
+
+struct BackingState {
+    xs::DescriptorBackingStatus status = xs::DescriptorBackingStatus::allocated;
+    std::uint64_t next = 0;  // the address the next allocation returns
+    int allocations = 0;
+    std::size_t last_size = 0;
+    std::uint64_t last_attributes = 0;
+    int releases = 0;
+    void* last_released = nullptr;
+    std::uint64_t last_release_attributes = 0;
+    std::uint64_t last_release_token = 0;
+    void* last_release_hook = nullptr;
+    long real_refs_at_release = -1;  // the released heap's real mock references when its backing was freed
+    Mock* watch = nullptr;           // the real heap whose references are sampled at release
+} g_backing;
+
+constexpr std::uint64_t kBackingTokenBase = 0x7000;
+void* const kReleaseHookTag = reinterpret_cast<void*>(0x5150);
+
+xs::DescriptorBackingStatus mock_backing_allocate(std::size_t size, std::uint64_t attributes,
+                                                  xs::DescriptorHeapBacking* out) {
+    ++g_backing.allocations;
+    g_backing.last_size = size;
+    g_backing.last_attributes = attributes;
+    if (g_backing.status != xs::DescriptorBackingStatus::allocated) return g_backing.status;
+    out->address = reinterpret_cast<void*>(g_backing.next);
+    out->token = kBackingTokenBase + static_cast<std::uint64_t>(g_backing.allocations);
+    out->release_hook = kReleaseHookTag;
+    return xs::DescriptorBackingStatus::allocated;
+}
+
+void mock_backing_release(const xs::DescriptorHeapBacking& backing, std::uint64_t attributes) {
+    ++g_backing.releases;
+    g_backing.last_released = backing.address;
+    g_backing.last_release_attributes = attributes;
+    g_backing.last_release_token = backing.token;
+    g_backing.last_release_hook = backing.release_hook;
+    g_backing.real_refs_at_release = g_backing.watch ? g_backing.watch->refs : -1;
+}
+
+const xs::DescriptorHeapAllocator kMockBackingAllocator{&mock_backing_allocate, &mock_backing_release};
+
+const IID kHeapIid = __uuidof(ID3D12DescriptorHeap);
+
+// Device slot 14 called the console way; the new heap proxy (or null) and the result.
+HRESULT make_heap(void* device, D3D12_DESCRIPTOR_HEAP_TYPE type, UINT count, void** heap, const IID& iid = kHeapIid) {
+    D3D12_DESCRIPTOR_HEAP_DESC desc{};
+    desc.Type = type;
+    desc.NumDescriptors = count;
+    desc.Flags = type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ? D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE
+                                                                : D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    *heap = reinterpret_cast<void*>(1);
+    return hr_of(raw(device, 14, word(&desc), word(&iid), word(heap)));
+}
+
+Mock* real_heap_of(void* heap) { return reinterpret_cast<Mock*>(xs::heap_proxy_real_heap(heap)); }
+
+xs::DescriptorHandleTranslation translate(void* device, std::uint64_t ptr, std::uint64_t count,
+                                          D3D12_DESCRIPTOR_HEAP_TYPE type, std::uint64_t* out = nullptr) {
+    D3D12_CPU_DESCRIPTOR_HANDLE translated{};
+    const auto result = xs::translate_cpu_descriptor_range(device, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(ptr)},
+                                                           count, type, &translated);
+    if (out) *out = translated.ptr;
+    return result;
+}
+
+int check_descriptor_heaps() {
+    using T = xs::DescriptorHandleTranslation;
+    constexpr auto kCbv = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    g_backing = {};
+    xs::set_descriptor_heap_allocator(nullptr);
+    xs::set_default_descriptor_heap_allocator(nullptr);
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);
+    EXPECT(device);
+    const unsigned long device_refs = xs::device_proxy_ref_count(device);
+    const std::size_t tracked_before = xs::tracked_descriptor_heap_count();
+    EXPECT(xs::title_descriptor_range_count() == 0);
+    EXPECT(xs::device_slot_overridden(17) && xs::device_slot_overridden(23) && xs::device_slot_overridden(24));
+
+    // No allocator: a plain heap, slot 9 the real start, and every handle passes through unchanged (the previous
+    // behaviour) while no title-backed heap exists, an unknown pointer included.
+    void* plain = nullptr;
+    EXPECT(make_heap(device, kCbv, 4, &plain) == S_OK && xs::is_heap_proxy(plain));
+    Mock* const plain_real = real_heap_of(plain);
+    EXPECT(raw(plain, 9) == plain_real->heap_cpu && raw(plain, 10) == plain_real->heap_gpu);
+    EXPECT(xs::tracked_descriptor_heap_count() == tracked_before + 1 && xs::title_descriptor_range_count() == 0);
+    raw(device, 17, 0x11, 0x4242000);
+    EXPECT(mock->calls[17] == 1 && mock->args[17][0] == 0x11 && mock->args[17][1] == 0x4242000);
+    EXPECT(translate(device, 0x4242000, 1, kCbv) == T::unchanged);
+
+    // The capability check (no output) asks the real device and allocates nothing.
+    xs::set_descriptor_heap_allocator(&kMockBackingAllocator);
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC desc{kCbv, 8, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        EXPECT(hr_of(raw(device, 14, word(&desc), word(&kHeapIid), 0)) == S_FALSE && g_backing.allocations == 0);
+    }
+
+    // A title-backed heap: one allocation of NumDescriptors * increment with the D3D attribute word; slot 9 is the
+    // title's address and slot 10 still the real GPU start.
+    constexpr std::uint64_t kCustom = 0x0000610000000000ull;
+    constexpr std::uint64_t kInc = 32;
+    g_backing.next = kCustom;
+    void* heap = nullptr;
+    EXPECT(make_heap(device, kCbv, 8, &heap) == S_OK && xs::is_heap_proxy(heap));
+    Mock* const heap_real = real_heap_of(heap);
+    EXPECT(g_backing.allocations == 1 && g_backing.last_size == 8 * kInc);
+    EXPECT(g_backing.last_attributes == xs::kXmemDescriptorHeapAttributes && xs::kXmemDescriptorHeapAttributes == 0x00800004);
+    EXPECT(raw(heap, 9) == kCustom && raw(heap, 10) == heap_real->heap_gpu);
+    EXPECT(xs::title_descriptor_range_count() == 1 && xs::device_proxy_ref_count(device) == device_refs + 2);
+    const std::uint64_t real0 = heap_real->heap_cpu;
+
+    // Range endpoints and overflow, through the public translator.
+    std::uint64_t out = 0;
+    EXPECT(translate(device, kCustom, 1, kCbv, &out) == T::translated && out == real0);
+    EXPECT(translate(device, kCustom, 8, kCbv, &out) == T::translated && out == real0);
+    EXPECT(translate(device, kCustom + 7 * kInc, 1, kCbv, &out) == T::translated && out == real0 + 7 * kInc);
+    EXPECT(translate(device, kCustom, 0, kCbv, &out) == T::translated);  // 0 counts as one descriptor
+    EXPECT(translate(device, kCustom, 9, kCbv, &out) == T::invalid && out == kCustom);
+    EXPECT(translate(device, kCustom + 7 * kInc, 2, kCbv) == T::invalid);
+    EXPECT(translate(device, kCustom + kInc, ~0ull, kCbv) == T::invalid);
+    EXPECT(translate(device, kCustom + 8 * kInc, 1, kCbv) == T::unchanged);  // outside registered custom ranges
+    EXPECT(translate(device, kCustom - kInc, 1, kCbv) == T::unchanged);
+    EXPECT(translate(device, kCustom + kInc / 2, 1, kCbv) == T::invalid);  // not on a descriptor boundary
+    EXPECT(translate(device, kCustom, 1, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) == T::invalid);  // wrong heap type
+    EXPECT(translate(device, 0, 1, kCbv, &out) == T::unchanged && out == 0);
+    // A normal PC heap's handle stays valid and unchanged; a real start of the title heap too (never handed out).
+    EXPECT(translate(device, plain_real->heap_cpu + 3 * kInc, 1, kCbv, &out) == T::unchanged &&
+           out == plain_real->heap_cpu + 3 * kInc);
+    EXPECT(translate(device, real0, 1, kCbv) == T::unchanged);
+    EXPECT(translate(device, 0x4242000, 1, kCbv) == T::unchanged);  // untracked native handles remain valid
+    // A heap created directly on the backend is absent from the proxy registry. Its native handles must remain
+    // usable while a custom heap is live, including a mixed native/custom descriptor copy.
+    {
+        void* native_heap = nullptr;
+        const auto tracked = xs::tracked_descriptor_heap_count();
+        EXPECT(make_heap(mock, kCbv, 4, &native_heap) == S_OK && !xs::is_heap_proxy(native_heap));
+        const auto native_start = static_cast<Mock*>(native_heap)->heap_cpu;
+        EXPECT(xs::tracked_descriptor_heap_count() == tracked);
+        EXPECT(translate(device, native_start, 1, kCbv, &out) == T::unchanged && out == native_start);
+        const unsigned before = mock->calls[17];
+        raw(device, 17, 0x11, native_start);
+        EXPECT(mock->calls[17] == before + 1 && mock->args[17][1] == native_start);
+        const unsigned copies = mock->calls[24];
+        raw(device, 24, 1, native_start, kCustom, 0);
+        EXPECT(mock->calls[24] == copies + 1 && mock->args[24][1] == native_start && mock->args[24][2] == real0);
+        EXPECT(release(native_heap) == 0);
+        mock->calls[17] = before;
+        mock->calls[24] = copies;
+    }
+    // The handle belongs to this device only.
+    Mock* other_mock = nullptr;
+    void* other = make_device(other_mock, 9, true);
+    EXPECT(other && translate(other, kCustom, 1, kCbv) == T::invalid);
+
+    // Device slots 17..24 forward translated handles.
+    raw(device, 17, 0x11, kCustom + 3 * kInc);
+    EXPECT(mock->calls[17] == 2 && mock->args[17][0] == 0x11 && mock->args[17][1] == real0 + 3 * kInc);
+    raw(device, 18, 0x22, 0x33, kCustom + 3 * kInc);
+    EXPECT(mock->calls[18] == 1 && mock->args[18][0] == 0x22 && mock->args[18][2] == real0 + 3 * kInc);
+    raw(device, 19, 0x22, 0x44, 0x33, kCustom + 7 * kInc);
+    EXPECT(mock->calls[19] == 1 && mock->args[19][1] == 0x44 && mock->args[19][3] == real0 + 7 * kInc);
+    g_backing.next = 0x0000620000000000ull;
+    void* rtv_heap = nullptr;
+    EXPECT(make_heap(device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 4, &rtv_heap) == S_OK && g_backing.last_size == 4 * 64);
+    raw(device, 20, 0x22, 0x33, 0x0000620000000000ull + 2 * 64);
+    EXPECT(mock->calls[20] == 1 && mock->args[20][2] == real_heap_of(rtv_heap)->heap_cpu + 2 * 64);
+    g_backing.next = 0x0000630000000000ull;
+    void* dsv_heap = nullptr;
+    EXPECT(make_heap(device, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 2, &dsv_heap) == S_OK && g_backing.last_size == 2 * 16);
+    raw(device, 21, 0x22, 0x33, 0x0000630000000000ull + 16);
+    EXPECT(mock->calls[21] == 1 && mock->args[21][2] == real_heap_of(dsv_heap)->heap_cpu + 16);
+    g_backing.next = 0x0000640000000000ull;
+    void* sampler_heap = nullptr;
+    EXPECT(make_heap(device, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 2, &sampler_heap) == S_OK);
+    raw(device, 22, 0x55, 0x0000640000000000ull + 32);
+    EXPECT(mock->calls[22] == 1 && mock->args[22][1] == real_heap_of(sampler_heap)->heap_cpu + 32);
+    {
+        // CopyDescriptors (type word 0 = CBV_SRV_UAV): each range over its size, in copies; sizes pass unchanged.
+        const D3D12_CPU_DESCRIPTOR_HANDLE dests[2] = {{static_cast<SIZE_T>(kCustom + 3 * kInc)},
+                                                      {static_cast<SIZE_T>(plain_real->heap_cpu)}};
+        const UINT dest_sizes[2] = {2, 1};
+        const D3D12_CPU_DESCRIPTOR_HANDLE srcs[1] = {{static_cast<SIZE_T>(kCustom + 5 * kInc)}};
+        const UINT src_sizes[1] = {3};
+        raw(device, 23, 2, word(dests), word(dest_sizes), 1, word(srcs), word(src_sizes));
+        EXPECT(mock->calls[23] == 1 && mock->array[23][0] == real0 + 3 * kInc &&
+               mock->array[23][1] == plain_real->heap_cpu && mock->copy_src[0] == real0 + 5 * kInc);
+        EXPECT(mock->args[23][2] == word(dest_sizes) && dests[0].ptr == kCustom + 3 * kInc);  // caller not written
+        // Null size arrays mean ranges of one.
+        raw(device, 23, 1, word(dests), 0, 1, word(srcs), 0);
+        EXPECT(mock->calls[23] == 2 && mock->array[23][0] == real0 + 3 * kInc);
+        // A source range running past the heap's end: nothing is forwarded.
+        const UINT too_long[1] = {4};
+        const std::uint64_t refused = xs::refused_descriptor_handle_calls();
+        raw(device, 23, 2, word(dests), word(dest_sizes), 1, word(srcs), word(too_long));
+        EXPECT(mock->calls[23] == 2 && xs::refused_descriptor_handle_calls() == refused + 1);
+        // More than 16 entries take the allocated copy; its allocation failing refuses the call.
+        D3D12_CPU_DESCRIPTOR_HANDLE many[20];
+        for (auto& h : many) h.ptr = static_cast<SIZE_T>(kCustom);
+        raw(device, 23, 20, word(many), 0, 1, word(srcs), 0);
+        EXPECT(mock->calls[23] == 3 && mock->array[23][3] == real0);
+        g_fail_news = 1;
+        raw(device, 23, 20, word(many), 0, 1, word(srcs), 0);
+        g_fail_news = 0;
+        EXPECT(mock->calls[23] == 3 && xs::refused_descriptor_handle_calls() == refused + 2);
+    }
+    raw(device, 24, 2, kCustom + kInc, kCustom + 5 * kInc, 0);
+    EXPECT(mock->calls[24] == 1 && mock->args[24][0] == 2 && mock->args[24][1] == real0 + kInc &&
+           mock->args[24][2] == real0 + 5 * kInc);
+
+    // Invalid handles are never forwarded: counted and refused.
+    {
+        const std::uint64_t refused = xs::refused_descriptor_handle_calls();
+        const unsigned before17 = mock->calls[17], before20 = mock->calls[20], before24 = mock->calls[24];
+        raw(device, 17, 0x11, kCustom + 1);                            // misaligned custom handle
+        raw(device, 17, 0x11, kCustom + 2);                            // another misaligned custom handle
+        raw(device, 20, 0x22, 0x33, kCustom);                          // a CBV heap's handle for an RTV
+        raw(device, 24, 3, kCustom + 6 * kInc, kCustom, 0);            // destination span past the end
+        raw(device, 24, 1, kCustom, kCustom + kInc / 2, 0);            // misaligned source
+        EXPECT(mock->calls[17] == before17 && mock->calls[20] == before20 && mock->calls[24] == before24);
+        EXPECT(xs::refused_descriptor_handle_calls() == refused + 5);
+        // The plain heap's genuine handle still goes through.
+        raw(device, 17, 0x11, plain_real->heap_cpu + kInc);
+        EXPECT(mock->calls[17] == before17 + 1 && mock->args[17][1] == plain_real->heap_cpu + kInc);
+    }
+
+    // QueryInterface lifetime: a second reference keeps the heap and its range; the last Release frees the backing
+    // once, after the real heap, through the allocating pair.
+    {
+        void* same = nullptr;
+        EXPECT(hr_of(raw(heap, 0, word(&kHeapIid), word(&same))) == S_OK && same == heap);
+        const int releases = g_backing.releases;
+        EXPECT(release(same) == 1 && g_backing.releases == releases);
+        EXPECT(translate(device, kCustom, 1, kCbv) == T::translated);
+        g_backing.watch = heap_real;
+        const std::uint64_t token = kBackingTokenBase + 1;  // the heap's allocation was the first
+        EXPECT(release(heap) == 0 && g_backing.releases == releases + 1);
+        EXPECT(g_backing.last_released == reinterpret_cast<void*>(kCustom) && g_backing.last_release_token == token &&
+               g_backing.last_release_hook == kReleaseHookTag &&
+               g_backing.last_release_attributes == xs::kXmemDescriptorHeapAttributes);
+        EXPECT(g_backing.real_refs_at_release == 0 && heap_real->refs == 0);
+        g_backing.watch = nullptr;
+        EXPECT(xs::title_descriptor_range_count() == 3);  // RTV, DSV and sampler heaps remain
+        EXPECT(translate(device, kCustom, 1, kCbv) == T::unchanged);  // no longer classified as custom
+    }
+
+    // Failures: each releases the real heap and any backing exactly once, hands out nothing, and leaves the device's
+    // references and the range table as they were.
+    const auto expect_refused = [&](HRESULT want, int want_releases, const IID& iid = kHeapIid) {
+        const unsigned long refs = xs::device_proxy_ref_count(device);
+        const std::size_t ranges = xs::title_descriptor_range_count();
+        const std::size_t tracked = xs::tracked_descriptor_heap_count();
+        const int releases = g_backing.releases;
+        void* refused = nullptr;
+        const HRESULT hr = make_heap(device, kCbv, 4, &refused, iid);
+        return hr == want && refused == nullptr && mock->last_child->kind == Kind::heap &&
+               mock->last_child->refs == 0 && g_backing.releases == releases + want_releases &&
+               xs::device_proxy_ref_count(device) == refs && xs::title_descriptor_range_count() == ranges &&
+               xs::tracked_descriptor_heap_count() == tracked;
+    };
+    // Never invoke an allocator that cannot release its result.
+    {
+        const xs::DescriptorHeapAllocator unpaired{&mock_backing_allocate, nullptr};
+        const int allocations = g_backing.allocations;
+        xs::set_descriptor_heap_allocator(&unpaired);
+        EXPECT(expect_refused(E_FAIL, 0) && g_backing.allocations == allocations);
+        xs::set_descriptor_heap_allocator(&kMockBackingAllocator);
+    }
+    g_backing.status = xs::DescriptorBackingStatus::out_of_memory;
+    EXPECT(expect_refused(E_OUTOFMEMORY, 0));  // the hook returned no memory: the heap fails, nothing to free
+    g_backing.status = xs::DescriptorBackingStatus::invalid_hooks;
+    EXPECT(expect_refused(E_FAIL, 0));
+    g_backing.status = xs::DescriptorBackingStatus::allocated;
+    g_backing.next = 0;
+    EXPECT(expect_refused(E_FAIL, 0));  // "allocated" with a null address
+    g_backing.next = ~0ull - 16;
+    EXPECT(expect_refused(E_FAIL, 1) && g_backing.last_released == reinterpret_cast<void*>(~0ull - 16));  // wraps
+    g_backing.next = 0x0000620000000000ull + 64;  // inside the live RTV heap's title range
+    EXPECT(expect_refused(E_FAIL, 1));
+    g_backing.next = plain_real->heap_cpu;  // aliases a live real range
+    EXPECT(expect_refused(E_FAIL, 1));
+    g_backing.next = 0x0000650000000000ull;
+    EXPECT(expect_refused(E_NOINTERFACE, 1, kExtraIid));  // QueryInterface refused after registration
+    EXPECT(g_backing.last_released == reinterpret_cast<void*>(0x0000650000000000ull));
+    g_fail_news = 1;  // the heap proxy's own allocation
+    EXPECT(expect_refused(E_OUTOFMEMORY, 1));
+    g_fail_news = 0;
+    EXPECT(translate(device, 0x0000650000000000ull, 1, kCbv) == T::unchanged);  // no range was left behind
+
+    // A heap of zero descriptors asks the hooks for nothing.
+    {
+        const int allocations = g_backing.allocations;
+        void* empty = nullptr;
+        EXPECT(make_heap(device, kCbv, 0, &empty) == S_OK && g_backing.allocations == allocations);
+        EXPECT(raw(empty, 9) == real_heap_of(empty)->heap_cpu && release(empty) == 0);
+    }
+    // The hooks answering "not hooked": a plain heap even while title heaps exist; its handles pass unchanged.
+    {
+        g_backing.status = xs::DescriptorBackingStatus::not_hooked;
+        void* unhooked = nullptr;
+        EXPECT(make_heap(device, kCbv, 2, &unhooked) == S_OK);
+        Mock* const unhooked_real = real_heap_of(unhooked);
+        EXPECT(raw(unhooked, 9) == unhooked_real->heap_cpu);
+        EXPECT(translate(device, unhooked_real->heap_cpu + kInc, 1, kCbv) == T::unchanged);
+        EXPECT(release(unhooked) == 0 && unhooked_real->refs == 0);
+        g_backing.status = xs::DescriptorBackingStatus::allocated;
+    }
+    // An explicit allocator wins over the default; clearing it restores the default.
+    {
+        constexpr xs::DescriptorHeapAllocator kNever{
+            [](std::size_t, std::uint64_t, xs::DescriptorHeapBacking*) {
+                return xs::DescriptorBackingStatus::not_hooked;
+            },
+            [](const xs::DescriptorHeapBacking&, std::uint64_t) {}};
+        xs::set_default_descriptor_heap_allocator(&kMockBackingAllocator);
+        xs::set_descriptor_heap_allocator(&kNever);
+        const int allocations = g_backing.allocations;
+        void* explicit_heap = nullptr;
+        EXPECT(make_heap(device, kCbv, 2, &explicit_heap) == S_OK && g_backing.allocations == allocations);
+        EXPECT(release(explicit_heap) == 0);
+        xs::set_descriptor_heap_allocator(nullptr);
+        g_backing.next = 0x0000660000000000ull;
+        void* default_heap = nullptr;
+        EXPECT(make_heap(device, kCbv, 2, &default_heap) == S_OK && g_backing.allocations == allocations + 1);
+        EXPECT(raw(default_heap, 9) == 0x0000660000000000ull && release(default_heap) == 0);
+        xs::set_default_descriptor_heap_allocator(nullptr);
+    }
+
+    // Teardown: every backing freed once; the table back to where it started.
+    const int releases = g_backing.releases;
+    EXPECT(release(rtv_heap) == 0 && release(dsv_heap) == 0 && release(sampler_heap) == 0);
+    EXPECT(g_backing.releases == releases + 3 && xs::title_descriptor_range_count() == 0);
+    EXPECT(release(plain) == 0 && plain_real->refs == 0);
+    EXPECT(xs::tracked_descriptor_heap_count() == tracked_before);
+    EXPECT(xs::device_proxy_ref_count(device) == device_refs);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    EXPECT(release(other) == 0 && other_mock->refs == 0);
+    xs::set_descriptor_heap_allocator(nullptr);
+    std::printf("%s: slot 14 title backing (size, attributes, slot 9/10, every failure releases once), slots 17-24 "
+                "translate checked spans and refuse invalid handles, plain heap handles pass unchanged\n", g_label);
+    return 0;
+}
+
+// Console list slots 50..54 with title-backed RTV/DSV/UAV heaps: translated copies, single-range spans, the typed
+// slot 51 (FLOAT Depth in XMM3), the genuine GPU handle of the UAV clears, and invalid handles marking the list.
+int check_list_descriptor_handles() {
+    const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
+    const std::uint32_t direct_desc[4] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 0, 0, 0};
+    g_backing = {};
+    xs::set_descriptor_heap_allocator(&kMockBackingAllocator);
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true, true, true);
+    EXPECT(device);
+    void* allocator = nullptr;
+    EXPECT(hr_of(raw(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, word(&allocator_iid), word(&allocator))) == S_OK);
+    void* list = nullptr;
+    EXPECT(hr_of(raw(device, 73, word(direct_desc), word(allocator), 0, word(&kConsoleListIid), word(&list))) == S_OK);
+    Mock* const real = mock->last_child;
+    EXPECT(xs::is_list_proxy(list) && real->kind == Kind::list);
+
+    constexpr std::uint64_t kRtv = 0x0000710000000000ull, kDsv = 0x0000720000000000ull, kUav = 0x0000730000000000ull;
+    void* rtv_heap = nullptr;
+    void* dsv_heap = nullptr;
+    void* uav_heap = nullptr;
+    void* plain_rtv = nullptr;
+    g_backing.next = kRtv;
+    EXPECT(make_heap(device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 4, &rtv_heap) == S_OK);
+    g_backing.next = kDsv;
+    EXPECT(make_heap(device, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 2, &dsv_heap) == S_OK);
+    g_backing.next = kUav;
+    EXPECT(make_heap(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, &uav_heap) == S_OK);
+    g_backing.status = xs::DescriptorBackingStatus::not_hooked;
+    EXPECT(make_heap(device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, &plain_rtv) == S_OK);
+    g_backing.status = xs::DescriptorBackingStatus::allocated;
+    const std::uint64_t rtv_real = real_heap_of(rtv_heap)->heap_cpu, dsv_real = real_heap_of(dsv_heap)->heap_cpu;
+    const std::uint64_t uav_real = real_heap_of(uav_heap)->heap_cpu, plain_real = real_heap_of(plain_rtv)->heap_cpu;
+
+    // Console 50 -> PC 46, an array: each entry translated into a copy (a plain heap's entry unchanged), the DSV too.
+    D3D12_CPU_DESCRIPTOR_HANDLE rtvs[3] = {{static_cast<SIZE_T>(kRtv + 64)}, {static_cast<SIZE_T>(plain_real)},
+                                           {static_cast<SIZE_T>(kRtv + 3 * 64)}};
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv{static_cast<SIZE_T>(kDsv + 16)};
+    raw(list, 50, 3, word(rtvs), 0, word(&dsv));
+    EXPECT(real->calls[46] == 1 && real->args[46][0] == 3 && real->args[46][2] == 0);
+    EXPECT(real->array[46][0] == rtv_real + 64 && real->array[46][1] == plain_real &&
+           real->array[46][2] == rtv_real + 3 * 64 && real->om_dsv == dsv_real + 16);
+    EXPECT(real->args[46][1] != word(rtvs) && real->args[46][3] != word(&dsv));  // copies, not the caller's arrays
+    EXPECT(rtvs[0].ptr == kRtv + 64 && dsv.ptr == kDsv + 16);
+    // A single range: only [0] is read, and its whole span of `count` descriptors is checked.
+    D3D12_CPU_DESCRIPTOR_HANDLE range_start{static_cast<SIZE_T>(kRtv)};
+    raw(list, 50, 4, word(&range_start), 1, 0);
+    EXPECT(real->calls[46] == 2 && real->array[46][0] == rtv_real && real->args[46][2] == 1 &&
+           real->args[46][3] == 0 && real->om_dsv == 0);
+    // No render targets and no DSV: forwarded as it is.
+    raw(list, 50, 0, 0, 0, 0);
+    EXPECT(real->calls[46] == 3 && real->args[46][1] == 0 && real->args[46][3] == 0);
+
+    // Console 52 -> PC 48 ClearRenderTargetView: the handle translated, the color pointer unchanged.
+    const FLOAT color[4] = {1.0f, 0.0f, 128.0f / 255.0f, 1.0f};
+    raw(list, 52, kRtv + 2 * 64, word(color), 0, 0);
+    EXPECT(real->calls[48] == 1 && real->args[48][0] == rtv_real + 2 * 64 && real->args[48][1] == word(color));
+    // Console 53/54 -> PC 49/50: the GPU handle is the genuine one and passes unchanged; the CPU handle is translated.
+    const UINT uint_values[4] = {1, 2, 3, 4};
+    const FLOAT float_values[4] = {0.5f, 0.5f, 0.5f, 0.5f};
+    constexpr std::uint64_t kGpuHandle = 0x0000580000abc000ull;
+    raw(list, 53, kGpuHandle, kUav + 32, 0x1234, word(uint_values), 0, 0);
+    EXPECT(real->calls[49] == 1 && real->args[49][0] == kGpuHandle && real->args[49][1] == uav_real + 32 &&
+           real->args[49][2] == 0x1234 && real->args[49][3] == word(uint_values));
+    raw(list, 54, kGpuHandle, kUav + 3 * 32, 0x1234, word(float_values), 0, 0);
+    EXPECT(real->calls[50] == 1 && real->args[50][0] == kGpuHandle && real->args[50][1] == uav_real + 3 * 32);
+
+    // Console 51 -> PC 47 through the typed thunk: Depth arrives in XMM3 and is forwarded there, bit for bit.
+    using ClearDsvFn = void(WINAPI*)(void*, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CLEAR_FLAGS, FLOAT, UINT8, UINT,
+                                     const D3D12_RECT*);
+    const auto clear_dsv = reinterpret_cast<ClearDsvFn>((*reinterpret_cast<void* const* const*>(list))[51]);
+    const D3D12_RECT rect{0, 0, 2, 2};
+    clear_dsv(list, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(kDsv + 16)},
+              D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.25f, 7, 1, &rect);
+    EXPECT(real->calls[47] == 1 && real->args[47][0] == dsv_real + 16 &&
+           real->args[47][1] == (D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL));
+    EXPECT(real->args[47][2] == 0x3e800000u && real->args[47][3] == 7 && real->args[47][4] == 1 &&
+           real->array[47][0] == word(&rect));  // 0.25f
+    clear_dsv(list, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(kDsv)}, D3D12_CLEAR_FLAG_DEPTH, 0.75f, 0, 0,
+              nullptr);
+    EXPECT(real->calls[47] == 2 && real->args[47][0] == dsv_real && real->args[47][2] == 0x3f400000u);  // 0.75f
+    EXPECT(xs::list_proxy_unsupported_slot(list) == 0 && hr_of(raw(list, 9)) == S_OK);
+
+    // Invalid handles mark the list instead of reaching the real one; Close fails until Reset.
+    const auto expect_marked = [&](unsigned slot, auto&& call, unsigned pc) {
+        if (hr_of(raw(list, 139, word(allocator), 0)) != S_OK) return false;
+        const unsigned before = real->calls[pc];
+        call();
+        return real->calls[pc] == before && xs::list_proxy_unsupported_slot(list) == slot &&
+               hr_of(raw(list, 9)) == E_NOTIMPL;
+    };
+    D3D12_CPU_DESCRIPTOR_HANDLE past_end{static_cast<SIZE_T>(kRtv + 3 * 64)};
+    EXPECT(expect_marked(50, [&] { raw(list, 50, 2, word(&past_end), 1, 0); }, 46));  // single range past the end
+    D3D12_CPU_DESCRIPTOR_HANDLE nine[9] = {};
+    EXPECT(expect_marked(50, [&] { raw(list, 50, 9, word(nine), 0, 0); }, 46));  // more than 8 targets
+    D3D12_CPU_DESCRIPTOR_HANDLE wrong_type{static_cast<SIZE_T>(kUav)};
+    EXPECT(expect_marked(50, [&] { raw(list, 50, 1, word(rtvs), 0, word(&wrong_type)); }, 46));  // a UAV as DSV
+    EXPECT(expect_marked(52, [&] { raw(list, 52, kRtv + 1, word(color), 0, 0); }, 48));  // misaligned custom pointer
+    EXPECT(expect_marked(53, [&] { raw(list, 53, kGpuHandle, kUav + 16, 0x1234, word(uint_values), 0, 0); }, 49));
+    EXPECT(expect_marked(54, [&] { raw(list, 54, kGpuHandle, kRtv, 0x1234, word(float_values), 0, 0); }, 50));
+    EXPECT(expect_marked(51, [&] {
+        clear_dsv(list, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(kDsv + 8)}, D3D12_CLEAR_FLAG_DEPTH, 0.5f, 0, 0,
+                  nullptr);
+    }, 47));
+    EXPECT(hr_of(raw(list, 139, word(allocator), 0)) == S_OK && hr_of(raw(list, 9)) == S_OK);
+
+    EXPECT(release(list) == 0 && real->refs == 0 && release(allocator) == 0);
+    const int releases = g_backing.releases;
+    EXPECT(release(rtv_heap) == 0 && release(dsv_heap) == 0 && release(uav_heap) == 0 && release(plain_rtv) == 0);
+    EXPECT(g_backing.releases == releases + 3 && xs::title_descriptor_range_count() == 0);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    xs::set_descriptor_heap_allocator(nullptr);
+    std::printf("%s: console list slots 50-54 translate title-backed CPU handles in copies, keep the GPU handle and "
+                "FLOAT Depth (XMM3), and mark the list for an invalid handle\n", g_label);
+    return 0;
+}
+
 // ---- 10. The refused tail and the guard region ----
 
 int check_tail(bool want_guarded) {
@@ -2094,7 +2626,7 @@ int main(int argc, char** argv) {
     if (check_placed_resource_refusal() || check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_xbox_queue_descriptions() ||
         check_lists() || check_shared_base_list() || check_experimental_flush() ||
-        check_custom_heap_properties())
+        check_custom_heap_properties() || check_descriptor_heaps() || check_list_descriptor_handles())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;

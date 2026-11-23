@@ -9,7 +9,8 @@
 // RDX), 62, 76 and 133 (CreatePlacedResourceX, handed to the device's registered handler), plus the heap proxy's 9/10 conversion from the PC hidden-pointer form to the Xbox RAX form. Slots
 // 8/75 (command queues), 36 (fences) and 32 (a shared fence) wrap what they create in queue and fence proxies built
 // the same way, and slots 31/34/35/45/46/50 hand the real objects behind heap, queue and fence proxies to the real
-// device (see the command queue and fence section).
+// device (see the command queue and fence section). Slots 17..24 translate title-backed CPU descriptor handles
+// (adapted from upstream PR #7021; see "Descriptor ranges and title-backed heaps").
 //
 // A thunk declares 14 argument words, but the title passes only as many as the method takes, so the caller's frame
 // may end right after the four register homes. The compiler owns a function's incoming stack-argument slots and may
@@ -39,10 +40,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <limits>
 #include <mutex>
 #include <new>
 #include <memory>
 #include <utility>
+#include <vector>
 
 #include "d3d12_xs_command_list_iid.h"
 
@@ -92,6 +95,13 @@ struct HeapProxy {
     DeviceProxy* device;    // keeps the Xbox-ABI device alive; GetDevice returns it
     void** real_vtable;
     std::atomic<unsigned long> refs;
+    // Title backing (upstream PR #7021, adapted). custom_cpu_start is 0 for a plain heap. Otherwise slot 9 returns it,
+    // and the descriptor-range table maps [custom_cpu_start, + byte_size) to the real heap's CPU start. `backing` and
+    // `release_backing` are the allocation and the routine that frees it, both captured at creation and owned by the
+    // proxy from a successful creation on: the last Release frees through that same pair, after the real heap.
+    SIZE_T custom_cpu_start;
+    DescriptorHeapBacking backing;
+    void (*release_backing)(const DescriptorHeapBacking&, std::uint64_t);
 };
 
 std::atomic<std::uint64_t> g_hits[kMaxSlots];
@@ -140,6 +150,14 @@ const char* slot_name(unsigned slot) {
         case 11: return "CreateComputePipelineState (PC slot 11)";
         case 14: return "CreateDescriptorHeap";
         case 16: return "CreateRootSignature";
+        case 17: return "CreateConstantBufferView (CPU handle translated)";
+        case 18: return "CreateShaderResourceView (CPU handle translated)";
+        case 19: return "CreateUnorderedAccessView (CPU handle translated)";
+        case 20: return "CreateRenderTargetView (CPU handle translated)";
+        case 21: return "CreateDepthStencilView (CPU handle translated)";
+        case 22: return "CreateSampler (CPU handle translated)";
+        case 23: return "CopyDescriptors (CPU handles translated)";
+        case 24: return "CopyDescriptorsSimple (CPU handles translated)";
         case 25: return "GetResourceAllocationInfo";
         case 26: return "GetCustomHeapProperties";
         case 27: return "CreateCommittedResource (PC slot 27)";
@@ -491,20 +509,193 @@ void** get_dxgi_vtable() {
     return table;
 }
 
+// ---- Descriptor ranges and title-backed heaps (adapted from upstream PR #7021, Khuraie, GPL-3.0) ----
+//
+// Every heap slot 14 creates gets one entry: its real CPU range and, for a title-backed heap, the title's range of the
+// same size. Entries are added before the heap proxy is handed out and removed on its last Release before the real heap
+// is released, so a handle translated under the lock always names a live real heap (using a heap's handles while it is
+// being destroyed is the caller's error, as on the PC). The table and its mutex are immortal: a late COM Release during
+// process teardown may still unregister. g_title_range_count lets every call skip the lock while no title-backed heap
+// exists, which keeps the plain path exactly as before. The title's allocator and free routines are never called under
+// this lock or the allocator lock.
+//
+// Aliasing is refused at registration: a title range may overlap no other range, and a real range may overlap no title
+// range, so a handle has at most one meaning. Ranges never wrap (checked before registration), so the overlap test
+// below cannot overflow.
+struct DescriptorRange {
+    const DeviceProxy* device;
+    const HeapProxy* heap;
+    SIZE_T real_start;    // 0: not tracked (unknown start); never matched
+    SIZE_T custom_start;  // 0: no title backing
+    SIZE_T byte_size;     // NumDescriptors * increment, the size of both ranges
+    UINT increment;
+    D3D12_DESCRIPTOR_HEAP_TYPE type;
+};
+
+std::mutex& descriptor_range_mutex() {
+    static auto* m = new std::mutex;
+    return *m;
+}
+
+std::vector<DescriptorRange>& descriptor_ranges() {
+    static auto* v = new std::vector<DescriptorRange>;
+    return *v;
+}
+
+std::atomic<std::size_t> g_title_range_count{0};
+std::atomic<std::uint64_t> g_refused_handle_calls{0};
+
+bool ranges_overlap(SIZE_T a, SIZE_T a_size, SIZE_T b, SIZE_T b_size) {
+    return a_size && b_size && a < b + b_size && b < a + a_size;
+}
+
+enum class RangeRegistration { ok, out_of_memory, aliased };
+
+RangeRegistration register_descriptor_range(const DescriptorRange& range) {
+    std::lock_guard lock(descriptor_range_mutex());
+    auto& ranges = descriptor_ranges();
+    if (range.custom_start && range.real_start &&
+        ranges_overlap(range.custom_start, range.byte_size, range.real_start, range.byte_size))
+        return RangeRegistration::aliased;
+    for (const DescriptorRange& other : ranges) {
+        if (range.custom_start &&
+            (ranges_overlap(range.custom_start, range.byte_size, other.custom_start, other.custom_start ? other.byte_size : 0) ||
+             ranges_overlap(range.custom_start, range.byte_size, other.real_start, other.real_start ? other.byte_size : 0)))
+            return RangeRegistration::aliased;
+        if (range.real_start && other.custom_start &&
+            ranges_overlap(range.real_start, range.byte_size, other.custom_start, other.byte_size))
+            return RangeRegistration::aliased;
+    }
+    try {
+        ranges.push_back(range);
+    } catch (const std::bad_alloc&) {
+        return RangeRegistration::out_of_memory;
+    }
+    if (range.custom_start) g_title_range_count.fetch_add(1, std::memory_order_release);
+    return RangeRegistration::ok;
+}
+
+void unregister_descriptor_range(const HeapProxy* heap) {
+    std::lock_guard lock(descriptor_range_mutex());
+    auto& ranges = descriptor_ranges();
+    for (auto it = ranges.begin(); it != ranges.end();) {
+        if (it->heap != heap) {
+            ++it;
+            continue;
+        }
+        if (it->custom_start) g_title_range_count.fetch_sub(1, std::memory_order_release);
+        it = ranges.erase(it);
+    }
+}
+
+// Under descriptor_range_mutex. The rules are in d3d12_xs_device.h ("Title-backed descriptor heaps").
+DescriptorHandleTranslation translate_locked(const DeviceProxy* device, SIZE_T ptr, std::uint64_t count,
+                                             D3D12_DESCRIPTOR_HEAP_TYPE type, SIZE_T& out) {
+    out = ptr;
+    if (!ptr) return DescriptorHandleTranslation::unchanged;  // a null handle: the backend answers as on the PC
+    const std::uint64_t need = count ? count : 1;
+    for (const DescriptorRange& r : descriptor_ranges()) {
+        if (r.custom_start && ptr >= r.custom_start && ptr - r.custom_start < r.byte_size) {
+            const SIZE_T offset = ptr - r.custom_start;
+            if (r.device != device || r.type != type || offset % r.increment != 0 ||
+                need > (r.byte_size - offset) / r.increment)
+                return DescriptorHandleTranslation::invalid;
+            out = r.real_start + offset;
+            return DescriptorHandleTranslation::translated;
+        }
+    }
+    // An untracked handle can belong to a native heap created directly on the backend.
+    return DescriptorHandleTranslation::unchanged;
+}
+
+DescriptorHandleTranslation translate_handle(const DeviceProxy* device, SIZE_T ptr, std::uint64_t count,
+                                             D3D12_DESCRIPTOR_HEAP_TYPE type, SIZE_T& out) {
+    out = ptr;
+    if (g_title_range_count.load(std::memory_order_acquire) == 0) return DescriptorHandleTranslation::unchanged;
+    std::lock_guard lock(descriptor_range_mutex());
+    return translate_locked(device, ptr, count, type, out);
+}
+
+// A copy of a CPU-handle array with each range translated, for CopyDescriptors. Nothing throws (a thunk must not
+// unwind into the title): 16 entries inline, more with new (std::nothrow). One lock covers the whole array.
+class TranslatedHandles {
+public:
+    // False on allocation failure or an invalid range; nothing is forwarded then.
+    bool fill(const DeviceProxy* device, const D3D12_CPU_DESCRIPTOR_HANDLE* in, const UINT* sizes, UINT n,
+              D3D12_DESCRIPTOR_HEAP_TYPE type) {
+        if (!in || !n) return true;
+        D3D12_CPU_DESCRIPTOR_HANDLE* copy = inline_;
+        if (n > std::size(inline_)) {
+            heap_.reset(new (std::nothrow) D3D12_CPU_DESCRIPTOR_HANDLE[n]);
+            if (!heap_) return false;
+            copy = heap_.get();
+        }
+        std::lock_guard lock(descriptor_range_mutex());
+        for (UINT i = 0; i < n; ++i)
+            if (translate_locked(device, in[i].ptr, sizes ? sizes[i] : 1, type, copy[i].ptr) ==
+                DescriptorHandleTranslation::invalid)
+                return false;
+        data_ = copy;
+        return true;
+    }
+    const D3D12_CPU_DESCRIPTOR_HANDLE* data(const D3D12_CPU_DESCRIPTOR_HANDLE* fallback) const {
+        return data_ ? data_ : fallback;
+    }
+
+private:
+    D3D12_CPU_DESCRIPTOR_HANDLE inline_[16];
+    std::unique_ptr<D3D12_CPU_DESCRIPTOR_HANDLE[]> heap_;
+    const D3D12_CPU_DESCRIPTOR_HANDLE* data_ = nullptr;
+};
+
+// A device slot 17..24 call with an invalid handle: not forwarded (the methods are void, so the title cannot be told),
+// counted, logged on the first call per slot (every call with XS_TRACE) and traced "refused".
+void refuse_descriptor_call(unsigned slot, SIZE_T ptr) {
+    g_refused_handle_calls.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<bool> warned[25];
+    if ((slot < std::size(warned) && first_call(warned[slot])) || trace_enabled())
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: device slot %u (%s) refused: CPU descriptor handle 0x%llx is not a live span of "
+                     "this device's heap of that type; the call is not forwarded\n",
+                     slot, slot_name(slot), static_cast<unsigned long long>(ptr));
+    d3d12_trace::record(slot_name(slot), "refused");
+}
+
+// The allocator slot 14 consults: an explicit one (tests) before the default (D3D12XboxCreateDevice's bridge).
+std::mutex& heap_allocator_mutex() {
+    static auto* m = new std::mutex;
+    return *m;
+}
+DescriptorHeapAllocator g_explicit_heap_allocator{};
+bool g_has_explicit_heap_allocator = false;
+DescriptorHeapAllocator g_default_heap_allocator{};
+
+DescriptorHeapAllocator current_heap_allocator() {
+    std::lock_guard lock(heap_allocator_mutex());
+    return g_has_explicit_heap_allocator ? g_explicit_heap_allocator : g_default_heap_allocator;
+}
+
 unsigned long heap_add_ref(HeapProxy* self) {
     note_heap_slot(1);
     return self->refs.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
+// The last Release: the range goes first (no translation can name this heap afterwards), then the proxy, the real
+// heap and the device reference, and the title's backing last, through the pair that allocated it.
 unsigned long heap_release(HeapProxy* self) {
     note_heap_slot(2);
     const unsigned long refs = self->refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
     if (refs == 0) {
+        unregister_descriptor_range(self);
         ID3D12DescriptorHeap* real = self->real;
         DeviceProxy* device = self->device;
+        const DescriptorHeapBacking backing = self->backing;
+        const auto release_backing = self->release_backing;
+        const bool backed = self->custom_cpu_start != 0;
         delete self;
         if (real) real->Release();
         if (device) proxy_release(device);
+        if (backed && release_backing) release_backing(backing, kXmemDescriptorHeapAttributes);
     }
     return refs;
 }
@@ -539,15 +730,21 @@ HRESULT heap_get_device(HeapProxy* self, const IID* riid, void** out) {
 // The PC methods write through the hidden return pointer (RDX) on the measured runtime; the Xbox ABI wants the
 // 8-byte value in RAX. Call with both conventions and keep whichever produced a value, so a runtime that really
 // returns in RAX also works. The extra register is harmless when the callee ignores it.
-D3D12_CPU_DESCRIPTOR_HANDLE heap_get_cpu_handle(HeapProxy* self) {
-    note_heap_slot(9);
+D3D12_CPU_DESCRIPTOR_HANDLE raw_heap_get_cpu_handle(ID3D12DescriptorHeap* real, void** real_vtable) {
     constexpr SIZE_T kUnset = ~static_cast<SIZE_T>(0);
     D3D12_CPU_DESCRIPTOR_HANDLE handle{};
     handle.ptr = kUnset;
     using Fn = D3D12_CPU_DESCRIPTOR_HANDLE(WINAPI*)(ID3D12DescriptorHeap*, D3D12_CPU_DESCRIPTOR_HANDLE*);
-    const D3D12_CPU_DESCRIPTOR_HANDLE returned =
-        reinterpret_cast<Fn>(self->real_vtable[9])(self->real, &handle);
+    const D3D12_CPU_DESCRIPTOR_HANDLE returned = reinterpret_cast<Fn>(real_vtable[9])(real, &handle);
     return handle.ptr != kUnset ? handle : returned;
+}
+
+// A title-backed heap answers with the title's address (PR #7021: the title checks it); slot 10 keeps the real GPU
+// start, so the title's gpu - cpu delta still lands on the real shader-visible heap.
+D3D12_CPU_DESCRIPTOR_HANDLE heap_get_cpu_handle(HeapProxy* self) {
+    note_heap_slot(9);
+    if (self->custom_cpu_start) return D3D12_CPU_DESCRIPTOR_HANDLE{self->custom_cpu_start};
+    return raw_heap_get_cpu_handle(self->real, self->real_vtable);
 }
 
 D3D12_GPU_DESCRIPTOR_HANDLE heap_get_gpu_handle(HeapProxy* self) {
@@ -605,7 +802,21 @@ void** get_heap_vtable() {
     return vtable;
 }
 
-HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFIID riid, void** out) {
+// What slot 14 learned about the new heap. byte_size 0 or real_cpu_start 0: the real range is not tracked.
+struct HeapCreation {
+    D3D12_DESCRIPTOR_HEAP_TYPE type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    UINT increment = 0;
+    SIZE_T byte_size = 0;
+    SIZE_T real_cpu_start = 0;
+    SIZE_T custom_cpu_start = 0;  // 0: no title backing
+    DescriptorHeapBacking backing{};
+    void (*release_backing)(const DescriptorHeapBacking&, std::uint64_t) = nullptr;
+};
+
+// On failure the caller keeps `real` and the backing in `creation` and must release both; on success the proxy owns
+// them. The range is registered before QueryInterface can hand the proxy out, and removed again if that fails.
+HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFIID riid, void** out,
+                          const HeapCreation& creation) {
     if (!real || !device) return E_POINTER;
     if (!out) return E_POINTER;
     *out = nullptr;
@@ -617,11 +828,35 @@ HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFII
     proxy->device = device;
     proxy->real_vtable = *reinterpret_cast<void***>(real);
     proxy->refs.store(1, std::memory_order_relaxed);
+    proxy->custom_cpu_start = creation.custom_cpu_start;
+    proxy->backing = creation.backing;
+    proxy->release_backing = creation.release_backing;
     proxy_add_ref(device);  // the heap keeps its Xbox-ABI device alive for GetDevice
+
+    if (creation.byte_size && (creation.real_cpu_start || creation.custom_cpu_start)) {
+        const DescriptorRange range{device,          proxy,
+                                    creation.real_cpu_start, creation.custom_cpu_start,
+                                    creation.byte_size,      creation.increment,
+                                    creation.type};
+        const RangeRegistration registered = register_descriptor_range(range);
+        if (registered != RangeRegistration::ok) {
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: descriptor heap refused: %s (title 0x%llx, real 0x%llx, 0x%llx bytes)\n",
+                         registered == RangeRegistration::aliased ? "its range overlaps a live heap's range"
+                                                                  : "out of memory for its range entry",
+                         static_cast<unsigned long long>(creation.custom_cpu_start),
+                         static_cast<unsigned long long>(creation.real_cpu_start),
+                         static_cast<unsigned long long>(creation.byte_size));
+            delete proxy;
+            proxy_release(device);
+            return registered == RangeRegistration::aliased ? E_FAIL : E_OUTOFMEMORY;
+        }
+    }
 
     const HRESULT hr = heap_query_interface(proxy, &riid, out);
     if (FAILED(hr)) {
-        // No reference escaped, and the caller still owns its references to `real` and `device`.
+        // No reference escaped, and the caller still owns `real`, the backing and its reference to `device`.
+        unregister_descriptor_range(proxy);
         delete proxy;
         proxy_release(device);
         return hr;
@@ -1174,6 +1409,10 @@ HRESULT wrap_child(IUnknown* created, DeviceProxy* device, const IID* riid, void
 // 60 is EndEvent (PC 58), 61 ExecuteIndirect (PC 59), 139 Reset(allocator, pso) (PC 10, measured on the retail
 // executable), 146 the enhanced Barrier (PC GCL7 80) and 148 AllocateUploadMemory (the arena below).
 //
+// Console slots 50..54 (OMSetRenderTargets, ClearDepthStencilView, ClearRenderTargetView, ClearUnorderedAccessView*)
+// translate their CPU descriptor handles like device slots 17..24; an invalid handle marks the list as below. Slot 51
+// has a typed thunk for its FLOAT argument.
+//
 // Every other slot is unsupported: it is logged with its first argument words, traced "unsupported", returns
 // E_NOTIMPL and marks the list. A marked list still closes its real list, but Close returns E_NOTIMPL and the
 // queue refuses to submit it, so a partial list never executes as if it were complete. Reset clears the mark.
@@ -1185,6 +1424,12 @@ constexpr unsigned kListNotForwarded = ~0u;
 constexpr unsigned kConsoleListClose = 9;
 constexpr unsigned kConsoleExecuteBundle = 31;
 constexpr unsigned kConsoleSetDescriptorHeaps = 32;
+// CPU-descriptor-handle slots (adapted from upstream PR #7880, alexander-src, 0aba6c36, GPL-3.0): PC 46..50.
+constexpr unsigned kConsoleOMSetRenderTargets = 50;
+constexpr unsigned kConsoleClearDepthStencilView = 51;
+constexpr unsigned kConsoleClearRenderTargetView = 52;
+constexpr unsigned kConsoleClearUavUint = 53;
+constexpr unsigned kConsoleClearUavFloat = 54;
 constexpr unsigned kConsoleListResetX = 139;
 constexpr unsigned kConsoleListBarrier = 146;
 constexpr unsigned kConsoleAllocateUpload = 148;
@@ -1383,6 +1628,11 @@ const char* list_trace_name(unsigned slot) {
                                  : s == kConsoleAllocateUpload   ? "AllocateUploadMemory"
                                  : s == kConsoleExecuteBundle    ? "ExecuteBundle"
                                  : s == kConsoleSetDescriptorHeaps ? "SetDescriptorHeaps"
+                                 : s == kConsoleOMSetRenderTargets ? "OMSetRenderTargets"
+                                 : s == kConsoleClearDepthStencilView ? "ClearDepthStencilView"
+                                 : s == kConsoleClearRenderTargetView ? "ClearRenderTargetView"
+                                 : s == kConsoleClearUavUint     ? "ClearUnorderedAccessViewUint"
+                                 : s == kConsoleClearUavFloat    ? "ClearUnorderedAccessViewFloat"
                                                                    : nullptr;
             if (method)
                 std::snprintf(storage[s], sizeof(storage[s]), "XboxID3D12GraphicsCommandList::%s", method);
@@ -1420,7 +1670,8 @@ HRESULT list_unsupported(ListProxy* self, unsigned slot, unsigned pc) {
             std::snprintf(reason, sizeof(reason), "maps to PC slot %u, past the real list's %u slots", pc,
                           self->pc_slot_count);
         else
-            std::snprintf(reason, sizeof(reason), "could not pass its input on (incomplete bundle or no memory)");
+            std::snprintf(reason, sizeof(reason),
+                          "could not pass its input on (incomplete bundle, no memory or invalid CPU descriptor)");
         std::fprintf(stderr,
                      "[rt] d3d12_xs: list slot %u %s; not executed (E_NOTIMPL), the list's Close fails and its "
                      "submission is refused until Reset\n",
@@ -1587,6 +1838,13 @@ unsigned detect_list_slot_count(IUnknown* real) {
     return 60;
 }
 
+// A list's CPU descriptor handle, translated as device slots 17..24 do. False for an invalid one: the caller marks the
+// list (list_unsupported) instead of recording a command with a wrong descriptor.
+bool list_handle(ListProxy* self, SIZE_T ptr, std::uint64_t count, D3D12_DESCRIPTOR_HEAP_TYPE type,
+                 D3D12_CPU_DESCRIPTOR_HANDLE& out) {
+    return translate_handle(self->device, ptr, count, type, out.ptr) != DescriptorHandleTranslation::invalid;
+}
+
 using ListForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
                                              std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
                                              std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
@@ -1685,6 +1943,48 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 }
                 return fn(self->real, a1, a2, reinterpret_cast<std::uint64_t>(views), a4, a5, a6, a7, a8, a9, a10,
                           a11, a12, a13, a14);
+            } else if constexpr (Slot == kConsoleOMSetRenderTargets) {
+                // OMSetRenderTargets(count, rtvs, singleRange, dsv), PR #7880 adapted: translated into copies, the
+                // title's arrays are not written. A single range reads only rtvs[0] and checks all `count`
+                // descriptors of its span; more than 8 targets, or any invalid handle, is not forwarded.
+                const auto count = static_cast<std::uint32_t>(a1);
+                const bool single_range = static_cast<std::uint32_t>(a3) != 0;
+                if (count > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT)
+                    return hr_to_u64(list_unsupported(self, Slot, pc));
+                D3D12_CPU_DESCRIPTOR_HANDLE rtvs[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
+                std::uint64_t rtv_word = a2;
+                if (a2 && count) {
+                    const auto* in = reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(a2);
+                    const std::uint32_t entries = single_range ? 1 : count;
+                    for (std::uint32_t i = 0; i < entries; ++i)
+                        if (!list_handle(self, in[i].ptr, single_range ? count : 1, D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                                         rtvs[i]))
+                            return hr_to_u64(list_unsupported(self, Slot, pc));
+                    rtv_word = reinterpret_cast<std::uint64_t>(rtvs);
+                }
+                D3D12_CPU_DESCRIPTOR_HANDLE dsv{};
+                std::uint64_t dsv_word = a4;
+                if (a4) {
+                    if (!list_handle(self, reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(a4)->ptr, 1,
+                                     D3D12_DESCRIPTOR_HEAP_TYPE_DSV, dsv))
+                        return hr_to_u64(list_unsupported(self, Slot, pc));
+                    dsv_word = reinterpret_cast<std::uint64_t>(&dsv);
+                }
+                return fn(self->real, a1, rtv_word, a3, dsv_word, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+            } else if constexpr (Slot == kConsoleClearRenderTargetView) {
+                // ClearRenderTargetView(rtv, color, rectCount, rects): the color is a pointer, so the integer
+                // thunk is exact here.
+                D3D12_CPU_DESCRIPTOR_HANDLE rtv{};
+                if (!list_handle(self, static_cast<SIZE_T>(a1), 1, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, rtv))
+                    return hr_to_u64(list_unsupported(self, Slot, pc));
+                return fn(self->real, rtv.ptr, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+            } else if constexpr (Slot == kConsoleClearUavUint || Slot == kConsoleClearUavFloat) {
+                // ClearUnorderedAccessView*(gpuHandle, cpuHandle, resource, values, rectCount, rects): only the
+                // CPU handle is translated; the genuine GPU handle (from heap slot 10) goes on unchanged.
+                D3D12_CPU_DESCRIPTOR_HANDLE cpu{};
+                if (!list_handle(self, static_cast<SIZE_T>(a2), 1, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, cpu))
+                    return hr_to_u64(list_unsupported(self, Slot, pc));
+                return fn(self->real, a1, cpu.ptr, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
             } else {
                 return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
             }
@@ -1692,9 +1992,32 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
     }
 }
 
+// Console slot 51 -> PC 47, ClearDepthStencilView(dsv, flags, FLOAT depth, UINT8 stencil, rectCount, rects). Depth is
+// the fourth argument, so x64 passes it in XMM3, not R9: the integer list_slot thunk would forward R9 and leave Depth to
+// chance. This typed thunk (adapted from upstream PR #7880) receives and forwards every argument with its real type.
+void WINAPI list_clear_depth_stencil_view(ListProxy* self, D3D12_CPU_DESCRIPTOR_HANDLE dsv, D3D12_CLEAR_FLAGS flags,
+                                          FLOAT depth, UINT8 stencil, UINT rect_count, const D3D12_RECT* rects) {
+    std::uint32_t depth_bits = 0;
+    std::memcpy(&depth_bits, &depth, sizeof(depth_bits));
+    note_list_slot(kConsoleClearDepthStencilView, dsv.ptr, static_cast<std::uint64_t>(flags), depth_bits, stencil);
+    constexpr unsigned pc = console_to_pc_list_slot(kConsoleClearDepthStencilView);
+    static_assert(pc == 47, "console 51 is PC ClearDepthStencilView");
+    D3D12_CPU_DESCRIPTOR_HANDLE translated{};
+    if (pc >= self->pc_slot_count ||
+        !list_handle(self, dsv.ptr, 1, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, translated)) {
+        list_unsupported(self, kConsoleClearDepthStencilView, pc);  // void method: the list carries the failure
+        return;
+    }
+    using ClearDsvFn = void(WINAPI*)(ID3D12GraphicsCommandList*, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CLEAR_FLAGS, FLOAT,
+                                     UINT8, UINT, const D3D12_RECT*);
+    reinterpret_cast<ClearDsvFn>((*reinterpret_cast<void***>(self->real))[pc])(self->real, translated, flags, depth,
+                                                                               stencil, rect_count, rects);
+}
+
 template <std::size_t... I>
 void fill_list_vtable(void** vtable, std::index_sequence<I...>) {
     ((vtable[I] = reinterpret_cast<void*>(&list_slot<static_cast<unsigned>(I)>)), ...);
+    vtable[kConsoleClearDepthStencilView] = reinterpret_cast<void*>(&list_clear_depth_stencil_view);
 }
 
 void** get_list_vtable() {
@@ -2064,9 +2387,167 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     if (FAILED(hr) || !created) return FAILED(hr) ? hr : E_FAIL;
 
     ID3D12DescriptorHeap* heap = static_cast<ID3D12DescriptorHeap*>(created);
-    hr = create_heap_proxy(heap, self, *riid, out);
-    if (FAILED(hr)) heap->Release();
+    constexpr auto method = "XboxID3D12Device::CreateDescriptorHeap";
+    const auto refuse = [&](HRESULT code, const char* why) {
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 14 CreateDescriptorHeap refused (0x%08lx): %s\n",
+                     static_cast<unsigned long>(code), why);
+        heap->Release();
+        return d3d12_trace::result(method, code);
+    };
+
+    // Track real ranges for alias rejection; native heaps created directly on the backend are not registered.
+    // Translation only classifies handles inside a registered custom range (see translate_locked).
+    HeapCreation creation;
+    if (desc) {
+        creation.type = desc->Type;
+        creation.increment = self->real->GetDescriptorHandleIncrementSize(desc->Type);
+        creation.real_cpu_start = raw_heap_get_cpu_handle(heap, *reinterpret_cast<void***>(heap)).ptr;
+        constexpr SIZE_T kMax = (std::numeric_limits<SIZE_T>::max)();
+        if (creation.increment && desc->NumDescriptors <= kMax / creation.increment)
+            creation.byte_size = static_cast<SIZE_T>(desc->NumDescriptors) * creation.increment;
+        if (creation.real_cpu_start && creation.real_cpu_start > kMax - creation.byte_size)
+            return refuse(E_FAIL, "the real heap's CPU range wraps the address space");
+    }
+
+    // The title's backing (PR #7021): requested after the real heap exists, with NumDescriptors * increment bytes and
+    // the D3D descriptor-heap attribute word. A heap of zero descriptors asks for nothing.
+    const DescriptorHeapAllocator allocator = current_heap_allocator();
+    if (allocator.allocate && desc && desc->NumDescriptors > 0) {
+        if (!allocator.release) return refuse(E_FAIL, "the descriptor allocator has no paired release hook");
+        if (!creation.byte_size || !creation.real_cpu_start)
+            return refuse(E_FAIL, "no usable increment or real CPU start to map a title range onto");
+        DescriptorHeapBacking backing;
+        const DescriptorBackingStatus status =
+            allocator.allocate(creation.byte_size, kXmemDescriptorHeapAttributes, &backing);
+        if (status == DescriptorBackingStatus::out_of_memory)
+            return refuse(E_OUTOFMEMORY, "the title's allocation hook returned no memory");
+        if (status == DescriptorBackingStatus::invalid_hooks)
+            return refuse(E_FAIL, "the title's __XMemAllocationHooks__ are invalid");
+        if (status == DescriptorBackingStatus::allocated) {
+            const auto address = reinterpret_cast<SIZE_T>(backing.address);
+            if (!address || !allocator.release || address > (std::numeric_limits<SIZE_T>::max)() - creation.byte_size) {
+                if (address && allocator.release) allocator.release(backing, kXmemDescriptorHeapAttributes);
+                return refuse(E_FAIL, "the title's allocation is null, unreleasable or wraps the address space");
+            }
+            creation.custom_cpu_start = address;
+            creation.backing = backing;
+            creation.release_backing = allocator.release;
+        } else if (status != DescriptorBackingStatus::not_hooked) {
+            if (backing.address && allocator.release) allocator.release(backing, kXmemDescriptorHeapAttributes);
+            return refuse(E_FAIL, "the descriptor-heap allocator returned an unknown status");
+        }
+    }
+
+    hr = create_heap_proxy(heap, self, *riid, out, creation);
+    if (FAILED(hr)) {
+        heap->Release();  // the real heap first, then its title backing, as on the last Release
+        if (creation.custom_cpu_start) creation.release_backing(creation.backing, kXmemDescriptorHeapAttributes);
+    }
     return hr;
+}
+
+// Device slots 17..24 (PR #7021): the destination and source CPU handles are translated (rules in d3d12_xs_device.h).
+// Each helper takes the words in the positions the thunk received them, and the forwarded call keeps those positions.
+bool device_handle(DeviceProxy* self, unsigned slot, std::uint64_t word, D3D12_DESCRIPTOR_HEAP_TYPE type,
+                   D3D12_CPU_DESCRIPTOR_HANDLE& out) {
+    if (translate_handle(self, static_cast<SIZE_T>(word), 1, type, out.ptr) != DescriptorHandleTranslation::invalid)
+        return true;
+    refuse_descriptor_call(slot, static_cast<SIZE_T>(word));
+    return false;
+}
+
+void proxy_create_cbv(DeviceProxy* self, std::uint64_t desc, std::uint64_t dest) {
+    note_slot(17);
+    D3D12_CPU_DESCRIPTOR_HANDLE handle{};
+    if (!device_handle(self, 17, dest, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, handle)) return;
+    self->real->CreateConstantBufferView(reinterpret_cast<const D3D12_CONSTANT_BUFFER_VIEW_DESC*>(desc), handle);
+}
+
+void proxy_create_srv(DeviceProxy* self, std::uint64_t resource, std::uint64_t desc, std::uint64_t dest) {
+    note_slot(18);
+    D3D12_CPU_DESCRIPTOR_HANDLE handle{};
+    if (!device_handle(self, 18, dest, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, handle)) return;
+    self->real->CreateShaderResourceView(reinterpret_cast<ID3D12Resource*>(resource),
+                                         reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(desc), handle);
+}
+
+void proxy_create_uav(DeviceProxy* self, std::uint64_t resource, std::uint64_t counter, std::uint64_t desc,
+                      std::uint64_t dest) {
+    note_slot(19);
+    D3D12_CPU_DESCRIPTOR_HANDLE handle{};
+    if (!device_handle(self, 19, dest, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, handle)) return;
+    self->real->CreateUnorderedAccessView(reinterpret_cast<ID3D12Resource*>(resource),
+                                          reinterpret_cast<ID3D12Resource*>(counter),
+                                          reinterpret_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC*>(desc), handle);
+}
+
+void proxy_create_rtv(DeviceProxy* self, std::uint64_t resource, std::uint64_t desc, std::uint64_t dest) {
+    note_slot(20);
+    D3D12_CPU_DESCRIPTOR_HANDLE handle{};
+    if (!device_handle(self, 20, dest, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, handle)) return;
+    self->real->CreateRenderTargetView(reinterpret_cast<ID3D12Resource*>(resource),
+                                       reinterpret_cast<const D3D12_RENDER_TARGET_VIEW_DESC*>(desc), handle);
+}
+
+void proxy_create_dsv(DeviceProxy* self, std::uint64_t resource, std::uint64_t desc, std::uint64_t dest) {
+    note_slot(21);
+    D3D12_CPU_DESCRIPTOR_HANDLE handle{};
+    if (!device_handle(self, 21, dest, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, handle)) return;
+    self->real->CreateDepthStencilView(reinterpret_cast<ID3D12Resource*>(resource),
+                                       reinterpret_cast<const D3D12_DEPTH_STENCIL_VIEW_DESC*>(desc), handle);
+}
+
+void proxy_create_sampler(DeviceProxy* self, std::uint64_t desc, std::uint64_t dest) {
+    note_slot(22);
+    D3D12_CPU_DESCRIPTOR_HANDLE handle{};
+    if (!device_handle(self, 22, dest, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, handle)) return;
+    self->real->CreateSampler(reinterpret_cast<const D3D12_SAMPLER_DESC*>(desc), handle);
+}
+
+// CopyDescriptors(numDest, destStarts, destSizes, numSrc, srcStarts, srcSizes, type): each range is checked over its
+// whole size (a null size array means ranges of one), in copies; the caller's arrays are never written. With no
+// title-backed heap the call goes on untouched.
+void proxy_copy_descriptors(DeviceProxy* self, std::uint64_t num_dest, std::uint64_t dest_starts,
+                            std::uint64_t dest_sizes, std::uint64_t num_src, std::uint64_t src_starts,
+                            std::uint64_t src_sizes, std::uint64_t type_word) {
+    note_slot(23);
+    const auto type = static_cast<D3D12_DESCRIPTOR_HEAP_TYPE>(static_cast<std::uint32_t>(type_word));
+    const auto* dest = reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(dest_starts);
+    const auto* src = reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(src_starts);
+    const auto* dsizes = reinterpret_cast<const UINT*>(dest_sizes);
+    const auto* ssizes = reinterpret_cast<const UINT*>(src_sizes);
+    if (g_title_range_count.load(std::memory_order_acquire) == 0) {
+        self->real->CopyDescriptors(static_cast<UINT>(num_dest), dest, dsizes, static_cast<UINT>(num_src), src,
+                                    ssizes, type);
+        return;
+    }
+    TranslatedHandles dest_copy;
+    TranslatedHandles src_copy;
+    if (!dest_copy.fill(self, dest, dsizes, static_cast<UINT>(num_dest), type) ||
+        !src_copy.fill(self, src, ssizes, static_cast<UINT>(num_src), type)) {
+        refuse_descriptor_call(23, dest ? dest[0].ptr : 0);
+        return;
+    }
+    self->real->CopyDescriptors(static_cast<UINT>(num_dest), dest_copy.data(dest), dsizes,
+                                static_cast<UINT>(num_src), src_copy.data(src), ssizes, type);
+}
+
+// CopyDescriptorsSimple(num, destStart, srcStart, type): both spans of `num` descriptors.
+void proxy_copy_descriptors_simple(DeviceProxy* self, std::uint64_t num, std::uint64_t dest_start,
+                                   std::uint64_t src_start, std::uint64_t type_word) {
+    note_slot(24);
+    const auto count = static_cast<UINT>(num);
+    const auto type = static_cast<D3D12_DESCRIPTOR_HEAP_TYPE>(static_cast<std::uint32_t>(type_word));
+    D3D12_CPU_DESCRIPTOR_HANDLE dest{};
+    D3D12_CPU_DESCRIPTOR_HANDLE src{};
+    if (translate_handle(self, static_cast<SIZE_T>(dest_start), count, type, dest.ptr) ==
+            DescriptorHandleTranslation::invalid ||
+        translate_handle(self, static_cast<SIZE_T>(src_start), count, type, src.ptr) ==
+            DescriptorHandleTranslation::invalid) {
+        refuse_descriptor_call(24, static_cast<SIZE_T>(dest_start));
+        return;
+    }
+    self->real->CopyDescriptorsSimple(count, dest, src, type);
 }
 
 // The Xbox slot 62 takes two more words between the description and the IID: (desc, w2, w3, riid, out). Measured
@@ -2357,6 +2838,30 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return hr_to_u64(proxy_create_descriptor_heap(
             self, reinterpret_cast<const D3D12_DESCRIPTOR_HEAP_DESC*>(a1),
             reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3)));
+    } else if constexpr (Slot == 17) {
+        proxy_create_cbv(self, a1, a2);
+        return 0;  // void methods: the return register carries nothing
+    } else if constexpr (Slot == 18) {
+        proxy_create_srv(self, a1, a2, a3);
+        return 0;
+    } else if constexpr (Slot == 19) {
+        proxy_create_uav(self, a1, a2, a3, a4);
+        return 0;
+    } else if constexpr (Slot == 20) {
+        proxy_create_rtv(self, a1, a2, a3);
+        return 0;
+    } else if constexpr (Slot == 21) {
+        proxy_create_dsv(self, a1, a2, a3);
+        return 0;
+    } else if constexpr (Slot == 22) {
+        proxy_create_sampler(self, a1, a2);
+        return 0;
+    } else if constexpr (Slot == 23) {
+        proxy_copy_descriptors(self, a1, a2, a3, a4, a5, a6, a7);
+        return 0;
+    } else if constexpr (Slot == 24) {
+        proxy_copy_descriptors_simple(self, a1, a2, a3, a4);
+        return 0;
     } else if constexpr (Slot == 62) {
         return hr_to_u64(proxy_create_compute_pipeline_state(
             self, reinterpret_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(a1), a2, a3,
@@ -2550,6 +3055,36 @@ ID3D12DescriptorHeap* heap_proxy_real_heap(const void* heap) {
     return static_cast<const HeapProxy*>(heap)->real;
 }
 
+void set_descriptor_heap_allocator(const DescriptorHeapAllocator* allocator) {
+    std::lock_guard lock(heap_allocator_mutex());
+    g_has_explicit_heap_allocator = allocator != nullptr;
+    g_explicit_heap_allocator = allocator ? *allocator : DescriptorHeapAllocator{};
+}
+
+void set_default_descriptor_heap_allocator(const DescriptorHeapAllocator* allocator) {
+    std::lock_guard lock(heap_allocator_mutex());
+    g_default_heap_allocator = allocator ? *allocator : DescriptorHeapAllocator{};
+}
+
+DescriptorHandleTranslation translate_cpu_descriptor_range(const void* device, D3D12_CPU_DESCRIPTOR_HANDLE start,
+                                                           std::uint64_t count, D3D12_DESCRIPTOR_HEAP_TYPE type,
+                                                           D3D12_CPU_DESCRIPTOR_HANDLE* out) {
+    const auto* proxy = static_cast<const DeviceProxy*>(device_proxy_primary(const_cast<void*>(device)));
+    SIZE_T translated = start.ptr;
+    const DescriptorHandleTranslation result = translate_handle(proxy, start.ptr, count, type, translated);
+    if (out) out->ptr = translated;
+    return result;
+}
+
+std::size_t title_descriptor_range_count() { return g_title_range_count.load(std::memory_order_acquire); }
+
+std::size_t tracked_descriptor_heap_count() {
+    std::lock_guard lock(descriptor_range_mutex());
+    return descriptor_ranges().size();
+}
+
+std::uint64_t refused_descriptor_handle_calls() { return g_refused_handle_calls.load(std::memory_order_relaxed); }
+
 unsigned device_proxy_slot_count(const void* device) {
     if (!is_device_proxy(device)) return 0;
     return static_cast<const DeviceProxy*>(device)->slot_count;
@@ -2565,7 +3100,8 @@ void set_placed_at_va_handler(PlacedAtVaHandler handler) {
 }
 
 bool device_slot_overridden(unsigned slot) {
-    if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 26 || slot == 31 || slot == 32 || slot == 34 ||
+    if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || (slot >= 17 && slot <= 24) || slot == 26 ||
+        slot == 31 || slot == 32 || slot == 34 ||
         slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
         slot == 75 || slot == 76 || slot == 133)
         return true;

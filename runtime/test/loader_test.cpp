@@ -955,6 +955,106 @@ void test_failed_dependency_not_registered() {
     pass(what);
 }
 
+// An image exporting __XMemAllocationHooks__ (upstream PR #7021's registration, adapted): the struct at `struct_rva`
+// holds two absolute pointers, base + 0x1010 and base + 0x1020 (inside .text), or two outside the image. No code
+// runs: the registry only checks where the struct and the pointers lie.
+std::vector<uint8_t> make_hooks_image(uint64_t base_hint, uint32_t struct_rva, bool pointers_inside) {
+    auto img = make_image();
+    std::fill(img.begin() + 0x200, img.begin() + 0x400, uint8_t{0});
+    nt_of(img)->FileHeader.Characteristics |= IMAGE_FILE_DLL;
+    const uint64_t base = palmwave_test::free_image_base(base_hint);
+    nt_of(img)->OptionalHeader.ImageBase = base;
+    auto* ed = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(img.data() + 0x200);
+    ed->Base = 1;
+    ed->NumberOfFunctions = 1;
+    ed->AddressOfFunctions = 0x1100;
+    ed->NumberOfNames = 1;
+    ed->AddressOfNames = 0x1120;
+    ed->AddressOfNameOrdinals = 0x1140;
+    *reinterpret_cast<uint32_t*>(img.data() + 0x300) = struct_rva;
+    *reinterpret_cast<uint32_t*>(img.data() + 0x320) = 0x1180;
+    *reinterpret_cast<uint16_t*>(img.data() + 0x340) = 0;
+    std::memcpy(img.data() + 0x380, "__XMemAllocationHooks__", sizeof("__XMemAllocationHooks__"));
+    if (struct_rva >= 0x1000 && struct_rva + 16 <= 0x1200) {
+        const uint64_t pointers[2] = {pointers_inside ? base + 0x1010 : 0x1234,
+                                      pointers_inside ? base + 0x1020 : 0x5678};
+        std::memcpy(img.data() + 0x200 + (struct_rva - 0x1000), pointers, sizeof(pointers));
+    }
+    auto& dir = nt_of(img)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    dir.VirtualAddress = 0x1000;
+    dir.Size = sizeof(IMAGE_EXPORT_DIRECTORY);  // the struct at 0x11E0 is a data export, not a forwarder
+    return img;
+}
+
+void test_xmem_hooks_registration() {
+    using rt::shims::XMemHooksState;
+    {
+        const char* what = "an exported __XMemAllocationHooks__ is registered and removed with its loader";
+        auto p = write_image_as(make_hooks_image(0x190000000, 0x11E0, true), "hooks_a.dll");
+        try {
+            uint64_t generation = 0;
+            {
+                rt::Loader loader(g_dir);
+                rt::Module& m = loader.load(p);
+                const auto s = rt::shims::xmem_allocation_hooks();
+                if (s.state != XMemHooksState::Ready)
+                    return failed(what, "the hooks are not ready after the load");
+                if (reinterpret_cast<uint8_t*>(s.alloc) != m.base + 0x1010 ||
+                    reinterpret_cast<uint8_t*>(s.free) != m.base + 0x1020)
+                    return failed(what, "the snapshot does not hold the image's two pointers");
+                generation = s.generation;
+            }
+            if (rt::shims::xmem_allocation_hooks().state != XMemHooksState::None)
+                return failed(what, "the registration outlived its loader");
+            if (rt::shims::xmem_free_with_hooks(generation, reinterpret_cast<rt::shims::XMemFreeHookFn>(0x1), nullptr, 4))
+                return failed(what, "a free through an unregistered generation was attempted");
+            pass(what);
+        } catch (const std::exception& e) {
+            failed(what, e.what());
+        }
+    }
+    {
+        const char* what = "a second image exporting the hooks is refused while the first is registered";
+        auto a = write_image_as(make_hooks_image(0x190000000, 0x11E0, true), "hooks_a.dll");
+        auto b = write_image_as(make_hooks_image(0x1A0000000, 0x11E0, true), "hooks_b.dll");
+        try {
+            {
+                rt::Loader loader(g_dir);
+                rt::Module& first = loader.load(a);
+                loader.load(b);
+                const auto s = rt::shims::xmem_allocation_hooks();
+                if (s.state != XMemHooksState::Ready || reinterpret_cast<uint8_t*>(s.alloc) != first.base + 0x1010)
+                    return failed(what, "the active hooks are not the first image's");
+            }
+            if (rt::shims::xmem_allocation_hooks().state != XMemHooksState::None)
+                return failed(what, "a registration outlived its loader");
+            pass(what);
+        } catch (const std::exception& e) {
+            failed(what, e.what());
+        }
+    }
+    {
+        const char* what = "an exported struct running past the image, or pointing outside it, is invalid";
+        auto past = write_image_as(make_hooks_image(0x190000000, 0x1FF8, true), "hooks_past.dll");
+        auto outside = write_image_as(make_hooks_image(0x1A0000000, 0x11E0, false), "hooks_out.dll");
+        try {
+            for (const auto& path : {past, outside}) {
+                {
+                    rt::Loader loader(g_dir);
+                    loader.load(path);
+                    if (rt::shims::xmem_allocation_hooks().state != XMemHooksState::Invalid)
+                        return failed(what, path.filename().string() + " was not reported invalid");
+                }
+                if (rt::shims::xmem_allocation_hooks().state != XMemHooksState::None)
+                    return failed(what, "the invalid registration outlived its loader");
+            }
+            pass(what);
+        } catch (const std::exception& e) {
+            failed(what, e.what());
+        }
+    }
+}
+
 void test_forwarded_exports() {
     {
         const char* what = "a forwarded export binds to its target instead of into the string";
@@ -1350,6 +1450,7 @@ int main() {
         test_failed_dependency_not_registered();
         test_delay_descriptor_fields();
         test_forwarded_exports();
+        test_xmem_hooks_registration();
         test_export_bounds();
         test_tls_directory_count();
         test_unwind_registration();
