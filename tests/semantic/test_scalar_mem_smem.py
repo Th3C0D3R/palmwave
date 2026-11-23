@@ -472,6 +472,10 @@ class SmemBodyEvaluator:
             value = self._value(args[0]) & self._value(args[1])
         elif op == "OpBitFieldUExtract" and ty == "%uint":
             value = (self._value(args[0]) >> self._value(args[1])) & ((1 << self._value(args[2])) - 1)
+        elif op == "OpBitwiseXor" and ty == "%ulong":
+            value = (self._value(args[0]) ^ self._value(args[1])) & MASK64
+        elif op == "OpISub" and ty == "%ulong":
+            value = (self._value(args[0]) - self._value(args[1])) & MASK64
         elif op == "OpIAdd" and ty == "%uint":
             value = (self._value(args[0]) + self._value(args[1])) & MASK32
         elif op == "OpUConvert" and ty == "%ulong":

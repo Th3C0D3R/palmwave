@@ -1506,26 +1506,44 @@ views and root arguments that name it by VA find it through the VA index. A shad
 reason above. One address space covering both the arena and the title's pages (for example #5378's sparse arena) is
 separate work.
 
-Palmwave narrows the gap for the RAW buffer views the layer writes itself, without changing the translator, the
-title's VA or `heap_base` (`runtime/src/imported_view_address.h`, `CreateShaderResourceView` and
-`CreateUnorderedAccessView` in `runtime/shims/d3d12_vulkan_device.cpp`):
+Palmwave narrows the gap for the RAW buffer views the layer writes itself, without changing the title's VA or
+`heap_base` (`runtime/src/imported_view_address.h`, `CreateShaderResourceView` and `CreateUnorderedAccessView` in
+`runtime/shims/d3d12_vulkan_device.cpp`), under a normalized V# contract the translator and the runtime share:
 
-- **The contract read from the translator.** `tools/rdna2spirv.py` `buffer_address` builds the V# base as
-  `word0 | (word1 & 0xFFFF) << 32`, zero-extended to 64 bits, adds the 32-bit view offset (`OpUConvert`), and
-  `host_addr` adds `%heap_base`: the access reads `heap_base + zext64(base48) + o` (mod 2^64), and a RAW view
-  (OOB_SELECT 3) accesses byte `o` only when `o + bytes <= NUM_RECORDS`. The `s_buffer_load` path reads the same field
-  with its low two bits cleared.
-- **The encoding.** For a slot-133 buffer at device address `B`, a RAW view at byte `offset` of it gets
-  `base48 = (B - heap_base) + offset`. Every access then reads `B + offset + o`, the view's own byte, on the imported
-  allocation the CPU also writes: no copy, mirror or second `heap_base`. Arena resources in the same table keep their
-  console VAs, and `GetGPUVirtualAddress` still returns the title VA, so the VA index and every copy, root argument and
-  vertex/index view that names the buffer by VA are unchanged.
-- **When it is accepted.** `heap_base < B` (no underflow; `B == heap_base` is the arena's own address),
-  `B + width` below 2^64, the view inside the buffer, `(B - heap_base) + offset + size <= 2^47` with the base itself
-  below 2^47, and `B - heap_base` congruent to the title VA mod 4 (so `s_buffer_load`'s dword truncation selects the
-  bytes the console's V# would). The bound is 2^47 rather than 2^48 so that every reachable byte has bit 47 clear: the
-  field then means the same under zero-extension (this translator) and sign-extension (GFX10's canonical 48-bit VA),
-  and an in-view offset a shader adds to the base in SGPRs never carries into word1's STRIDE bits.
+- **The contract, signed48-v1.** This is Palmwave's normalized shader/runtime ABI; it is not a claim about how the
+  console treats high V# addresses, which has not been measured. `tools/rdna2spirv.py` builds the V# base as
+  `word0 | word1[15:0] << 32` and sign-extends it from bit 47 to 64 bits (`signed_vsharp_base`) before adding any
+  offset, in both V# readers: `buffer_address` (MUBUF/MTBUF loads and stores, buffer atomics) and the `s_buffer_load`
+  branch of `scalar_load` (after clearing the base's low two bits, as before). `host_addr` then adds `%heap_base` once:
+  the access reads `heap_base + sext64(base48) + o` (mod 2^64), and a RAW view (OOB_SELECT 3) accesses byte `o` only
+  when `o + bytes <= NUM_RECORDS`. Full 64-bit pointers (`s_load` pairs, root VAs, `global_*` addresses) are not V#
+  bases and keep their meaning. Arena VAs are below 2^32, where both extensions agree. Before this revision the
+  translator zero-extended the field, which made a buffer below `heap_base` unreachable.
+- **The encoding.** For a slot-133 buffer at device address `B`, a RAW view at byte `offset` of it gets the low 48 bits
+  of `(B - heap_base) + offset`, a signed value. Every access then reads `B + offset + o`, the view's own byte, on the
+  imported allocation the CPU also writes: no copy, mirror or second `heap_base`. Arena resources in the same table keep
+  their console VAs, and `GetGPUVirtualAddress` still returns the title VA, so the VA index and every copy, root
+  argument and vertex/index view that names the buffer by VA are unchanged.
+- **When it is accepted.** `B != heap_base` (the arena's own address), `B + width` below 2^64, the view inside the
+  buffer, and `B - heap_base` congruent to the title VA mod 4 (so `s_buffer_load`'s dword truncation selects the bytes
+  the console's V# would), and then by sign:
+  - above `heap_base`: `(B - heap_base) + offset + size <= 2^47` with the base itself below 2^47;
+  - below `heap_base`, with `distance = heap_base - B`: `distance <= 2^47`, `offset < distance` and
+    `offset + size <= distance`. The encoded base is `2^48 - (distance - offset)`, in `[2^47, 2^48)`, which
+    sign-extends to `-(distance - offset)` exactly.
+  An encoded view therefore lies wholly in `[-2^47, 0]` or wholly in `[0, 2^47]` and never crosses zero: every in-view
+  byte keeps the sign of the base, an in-view offset a shader adds to the base in SGPRs never carries into word1's
+  STRIDE bits, and the UAV clear recovers the view's byte offset by subtracting the encoded zero-offset base from the
+  encoded view base. `gfx10::encode` stores only the 48 field bits, so nothing leaks into STRIDE either. No address is
+  truncated, masked or repaired into range.
+- **Stale modules.** Descriptors with negative bases are only correct for modules translated under signed48-v1. Each
+  translated module's index entry records `"vsharp_addressing": "signed48-v1"`, and the Vulkan backend refuses to create
+  a compute or graphics pipeline (every stage) from a translated entry whose marker is missing or different, with a
+  message asking for the shaders to be translated again (`palmwave::vsharp_abi_compatible` in
+  `runtime/src/shader_library.h`; traced `refused`). A translated entry is one carrying the translator's `capabilities`
+  metadata; hand-written test fixtures without it are unversioned and accepted as before, and the non-executing
+  `ShaderLibrary` users (lookup, corpus counts) are unchanged. `make_game.py` already retranslates the corpus, FSPX and
+  BVH programs when the translator's source digest changes, so its own work folders do not reach the guard.
 - **Refused, not truncated.** A well-formed RAW view that fails an address-representability condition is refused before the slot is written: the slot keeps
   what it held (no null descriptor, no wild V#), the reason and addresses are printed once per reason and size
   (`[rt] d3d12: ...: RAW view of a slot-133 buffer refused`), and the D3D12 trace records the call as `refused`.
@@ -1534,16 +1552,14 @@ title's VA or `heap_base` (`runtime/src/imported_view_address.h`, `CreateShaderR
 - **The UAV clear.** `ClearUnorderedAccessView*` reads the V# back to find the view's offset. For a RAW V# it now
   subtracts the same base (`rt::d3d12::raw_buffer_view_base`), so a clear of an imported RAW view lands where the
   shader's writes do.
-- **Placement-dependent.** A synthetic RTX 5080 / 621.14 run placed both imports above the arena and passed the
-  shader test below. Whether `B` lies above `heap_base` for other allocations remains the driver's choice. The
-  D3D-53 measurement above found upload buffers, created after the arena, *below* it on both test GPUs. If imports land
-  the same way, every imported RAW view on that device is refused, and the runtime-only remedy covers nothing there.
-  Covering `B < heap_base` with this descriptor-only scheme would need a translator contract change: sign-extend V#
-  bit 47 (`B - heap_base` in
-  [-2^47, 2^47) becomes representable; arena VAs, below 2^32, are unaffected). That changes the base of every buffer
-  access (`buffer_address`, the `s_buffer_load` path and every other reader of word1[15:0]), so it needs the whole
-  corpus (26,503 shaders), translated and `spirv-val`-valid counts before and after, and a census of V# word1 values
-  with bit 15 set that shaders build themselves. It is not done here.
+- **Placement.** Where `B` lies relative to `heap_base` is the driver's choice. The positive-only revision's synthetic
+  RTX 5080 / 621.14 run placed both imports above the arena; the D3D-53 measurement above found upload buffers created
+  after the arena *below* it, and a later offline application probe placed a large import below it too. Signed48-v1
+  covers both sides within 2^47 of `heap_base`; views farther away, and any view whose bytes would cross `heap_base`,
+  are still refused. A side effect, not separately tested: a layer-written V# of an upload, readback or CUSTOM buffer
+  (whose console VA is its device address minus `heap_base`) now also reaches its bytes when that difference is within
+  2^47. V#s that title shader code builds itself with bit 47 set now read a sign-extended base; the complete corpus retains the same translated and SPIR-V-valid counts, as recorded below. That structural
+  validation is not a semantic oracle for title-authored V#s.
 - **Not covered.** Structured and typed views and UAV counters on slot-133 buffers (their V#s still hold the title
   VA), constant-buffer views (`CreateConstantBufferView` takes a VA, which for these buffers is the title's), V#s the
   title builds itself (bytes it writes into a heap, or a base it computes in shader code; a `CopyDescriptors` of a
@@ -1564,23 +1580,39 @@ title's VA or `heap_base` (`runtime/src/imported_view_address.h`, `CreateShaderR
   helper dispatches, which are not `Dispatch` commands; their host-visible results keep the existing tracking. A
   per-queue counter (`rt::d3d12::shader_host_read_barriers`) records each such submission for tests.
 - **Tests.** `imported_view_address_test` (CPU) encodes accepted bases into a V#, decodes them and checks the
-  translator's formula reaches `B + offset` for the first and last dword; it refuses underflow, `B == heap_base`, the
-  2^47 bound (exact edge, one byte past, an empty view at 2^47, a base at 2^48 - 4), wrap, malformed and misaligned
-  views with the output untouched. `d3d12_import_raw_view_test` (GPU) imports two 64 KiB ranges of a title
-  `VirtualAlloc`, writes non-uniform words into the original pages after the import, and runs the translated
-  `test/shaders/cs_import_raw.asm` over one table of an imported RAW SRV, an arena RAW SRV, an imported RAW UAV
-  (read-modify-write) and an arena RAW UAV. Its first submission holds only that dispatch (and a copy into a DEFAULT
-  arena buffer): no UAV clear, no copy into READBACK. The test checks that the queue recorded the shader host-read
-  dependency, waits for the fence, and compares every word of the 128 KiB range on the title's pages (results,
-  guards, untouched words). Only then does a second submission clear a second imported RAW UAV and copy to READBACK,
-  without moving that counter, and the range and the copies are compared again. A scope guard waits for queued work
-  before anything it uses is released. When the driver places an import where no base is representable, it checks
-  that the slots were left as they were and exits 77. `host_read_barrier_test` (CPU mocks) checks the barrier decision
-  on every queue kind and a mocked `Dispatch` submission with and without such a buffer registered. All three
-  focused CTests passed (0.85 seconds total); the GPU case took 0.69 seconds on RTX 5080 / 621.14 with validation and
-  synchronization validation enabled, 66,112 exact word comparisons and zero errors through device destruction.
-  A second device's SRV/UAV calls were also refused without changing any of the 32 descriptor bytes. These are
-  synthetic results on representable allocations, not a retail frame or general address-space coverage.
+  signed48-v1 formula reaches `B + offset` for the first and last dword, on both sides of `heap_base` (the synthetic
+  case `heap_base = 0x400000000`, `B = 0x20000000`, 64 KiB), and refuses `B == heap_base`, the ±2^47 bounds, a view
+  crossing zero, wrap, malformed and misaligned views with the output untouched. `tests/semantic/test_vsharp_signed48.py`
+  executes the emitted SPIR-V of MUBUF, MTBUF, store, atomic and `s_buffer_load` accesses with negative and positive
+  bases, scalar rounding before the offset, and full-64 `s_load`/`global_*` controls that must not be sign-extended.
+  `shader_vsharp_abi_test` (CPU) checks the stale-module guard on a synthetic index.
+  `d3d12_import_raw_view_test` (GPU) imports two 64 KiB ranges of a title `VirtualAlloc`, writes non-uniform words
+  into the original pages after the import, and runs the translated `test/shaders/cs_import_raw.asm` over one table of
+  an imported RAW SRV, an arena RAW SRV, an imported RAW UAV (read-modify-write) and an arena RAW UAV. The shader reads
+  the imported SRV through both V# readers: vector `buffer_load`, and three `s_buffer_load`s (an SGPR offset whose low
+  two bits are dropped, the view's last dword, and one dword past NUM_RECORDS, which reads 0) folded into every arena
+  output word, whose scalar part is also checked on its own. Its first submission holds only that dispatch (and a copy
+  into a DEFAULT arena buffer): no UAV clear, no copy into READBACK. The test checks that the queue recorded the shader
+  host-read dependency, waits for the fence, and compares every word of the 128 KiB range on the title's pages
+  (results, guards, untouched words). Only then does a second submission clear a second imported RAW UAV and copy to
+  READBACK, without moving that counter, and the range and the copies are compared again (66,112 word comparisons in
+  all, plus 256 scalar-path checks). It checks each imported V#'s 48-bit field and that `heap_base + sext64(field)`
+  reaches the view's first and last byte. A scope guard waits for queued work before anything it uses is released.
+  When the driver places an import where no base is representable, it checks that the slots were left as they were and
+  exits 77. Its `--below` mode (CTest `d3d12_import_raw_view_below`) makes genuine HOST_ALLOCATION imports
+  (two 64 KiB payloads plus 73 MiB of additional ranges) before the D3D12 device creates its arena,
+  frees them after the arena exists and before the imports, and then requires both imports' queried device addresses to
+  lie wholly below the actual `heap_base`, with bit 47 set in every imported view's field. Push constants, the shader
+  and the descriptors are not adjusted for the placement. When the driver places either import elsewhere, nothing
+  about negative bases ran: it prints the addresses and exits 77, which is not a pass. `host_read_barrier_test` (CPU
+  mocks) checks the barrier decision on every queue kind and a mocked `Dispatch` submission with and without such a
+  buffer registered.
+  Earlier measurement (the positive-only revision, before signed48-v1): all three focused CTests passed (0.85 seconds
+  total); the GPU case took 0.69 seconds on RTX 5080 / 621.14 with validation and synchronization validation enabled,
+  66,112 exact word comparisons and zero errors through device destruction, on a placement above `heap_base`. A second
+  device's SRV/UAV calls were also refused without changing any of the 32 descriptor bytes. **Signed48-v1 validation:** The complete semantic suite passed 5,969 tests across 448 files in 336 seconds. The main corpus retained 26,503/26,503 translated and SPIR-V-valid modules; BVH retained 52/52 and FSPX 29/29, with no missing, extra, source-hash or container-hash mismatches. These are CPU/tool checks, not rendering results. On RTX 5080 / driver 621.14 with Vulkan and synchronization validation, the D3D12 imported RAW regression passed in 0.68 seconds with positive relative addresses: 66,112 exact word comparisons and 256 scalar checks, including ClearUAV. Its `--below` mode returned 77 because both imports remained above the arena; it is not a negative-placement pass. The independent native `vk_import_signed48` test passed in 0.33 seconds with two real imports below the real arena: 98,304 original-memory word comparisons and 256 scalar checks, zero validation errors. It uses the standard translated shader and actual arena `heap_base`, and proves negative scalar/vector loads and stores without claiming the D3D12 descriptor or ClearUAV paths at negative placement. The CPU tests
+  `imported_view_address`, `shader_vsharp_abi` and `host_read_barrier` passed. These are synthetic results, not a
+  retail frame or general address-space coverage.
 
 Why one arena rather than several? Because the shader gets exactly one `heap_base` for buffer, descriptor-table and
 code accesses. A draw can reference a descriptor table in one heap and a vertex buffer in another; both must

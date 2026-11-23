@@ -311,3 +311,27 @@ GPU CTest passed in 0.87 s on RTX 5080 / 621.14, Vulkan and synchronization
 validation enabled, zero errors. This proves the synthetic imported-image
 contract and lifetime, not console DCC/tiling, a translated texture shader or
 a rendered executable frame.
+
+## Signed 48-bit buffer-view addresses
+
+Original Palmwave code, prepared with OpenAI Codex and Claude Code (Claude Opus 5.5); no third-party code was copied.
+The signed48-v1 marker and sign extension define this project's normalized translator/runtime contract, not a measured
+console rule. The translator sign-extends decoded V# bases before offsets in both vector and scalar readers. The
+runtime encodes representable imported RAW views on either side of the shader arena and refuses stale translated
+modules at pipeline creation. Full-width pointers and the original CPU address registry retain their meaning.
+
+Claude Code prepared the initial ABI-guard, runtime-fixture and documentation integration without shell, build or
+GPU access. OpenAI Codex reviewed the change, added the independent native negative-placement oracle and performed
+the recorded validation. The existing ClearUAV encoded-base subtraction is retained, with signed arithmetic tests.
+
+The complete semantic suite passed 5,969 tests across 448 files in 336 seconds. The main corpus retained 26,503/26,503 translated and SPIR-V-valid modules; BVH retained 52/52 and FSPX 29/29, with no missing, extra, source-hash or container-hash mismatches. These are CPU/tool checks, not rendering results.
+
+On RTX 5080 / driver 621.14 with Vulkan and synchronization validation, the D3D12 imported RAW regression passed in 0.68 seconds with positive relative addresses: 66,112 exact word comparisons and 256 scalar checks, including ClearUAV. Its `--below` mode returned 77 because both imports remained above the arena; it is not a negative-placement pass. The independent native `vk_import_signed48` test passed in 0.33 seconds with two real imports below the real arena: 98,304 original-memory word comparisons and 256 scalar checks, zero validation errors. It uses the standard translated shader and actual arena `heap_base`, and proves negative scalar/vector loads and stores without claiming the D3D12 descriptor or ClearUAV paths at negative placement.
+
+The combined integration preserves the separately committed JSON parser changes. The tests use synthetic source
+fixtures; no proprietary shader data, full traces or generated corpus is included. The full corpus and private
+validation report remain outside the repositories. No new executable startup or rendered frame is claimed.
+
+The combined runtime build passed. Its focused CTest run completed in 1.98 seconds with six passes and one explicit
+skip for D3D12 negative placement. It included the ABI marker, JSON loader, address arithmetic, host-read barrier,
+positive D3D12 import and native negative-address shader checks.

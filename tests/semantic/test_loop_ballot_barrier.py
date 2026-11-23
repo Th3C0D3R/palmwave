@@ -257,7 +257,8 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
                 wg_storage[name] = 0xDEADBEEF
 
     # PushConstant struct layout matches rdna2spirv: member 0 = array[32] of uint, members 1..4 = heap/code ptrs
-    pc_struct = [pc_words[:32], 0, 0, 0, 0]
+    # Preserve supplied heap/code-base tail words; old callers with 32 words still get a zero base.
+    pc_struct = [pc_words[:32]] + [pc_words[i] if i < len(pc_words) else 0 for i in range(32, 36)]
 
     # Per-invocation state
     class Inv:

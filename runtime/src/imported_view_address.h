@@ -1,41 +1,21 @@
 #pragma once
 
-// Palmwave: the V# base address of a RAW buffer view of an imported host buffer (Xbox device slot 133).
+// Palmwave normalized V# ABI, signed48-v1: API-created RAW views of imported host buffers.
+// A translated V# access is heap_base + sext64(base48) + byte_offset, modulo 2^64.
+// The two V# readers sign-extend before offsets; full-width s_load/root/global pointers are unchanged.
+// This is the runtime's normalized contract, not a claim about unmeasured console address behavior.
 //
-// The translator's buffer contract (tools/rdna2spirv.py: buffer_address, the s_load/s_buffer_load path and host_addr;
-// docs/d3d12_vulkan.md section 3.3). A MUBUF access to byte `o` of a V# reads the host device address
+// For a real VkBuffer at B, encode B - heap_base + view_offset only after proving its signed 48-bit
+// representability. A negative view stays wholly below zero; a positive view stays below +2^47.
+// Thus adding an in-view offset to the encoded descriptor never carries into word1's STRIDE bits.
+// All bytes must lie in the actual buffer, B + width must not wrap, and the displacement must preserve
+// the original CPU GPUVA's low two bits for scalar-load dword rounding. No address is repaired by truncation.
 //
-//     heap_base + zext64(base48) + o        (64-bit arithmetic, mod 2^64)
-//
-// where base48 = word0 | word1[15:0] << 32 is zero-extended, heap_base is the GPU address arena's device address (the
-// same push-constant value for every resource), and for a RAW view (stride 0, OOB_SELECT 3) `o` is a 32-bit offset
-// that is accessed only when o + bytes <= NUM_RECORDS. s_buffer_load reads the same field, with its low two bits
-// cleared (lo & ~3).
-//
-// A slot-133 buffer is its own VkBuffer at device address B, outside the arena. Its GPU VA (GetGPUVirtualAddress) is
-// the title's host address, which identifies it in the CPU-side VA index, but heap_base + that VA is not B. Writing
-//
-//     base48 = (B - heap_base) + view_offset
-//
-// makes every access of the view land on B + view_offset + o, the view's own byte, exactly, when:
-//
-//   1. heap_base != 0 and B != 0 (there is an arena and the buffer has a device address);
-//   2. the view [view_offset, view_offset + view_size) lies inside the buffer's width, and B + width does not pass 2^64;
-//   3. heap_base < B, so B - heap_base does not wrap (B == heap_base would be the arena's own first byte);
-//   4. (B - heap_base) + view_offset + view_size <= 2^47, and (B - heap_base) + view_offset < 2^47;
-//   5. (B - heap_base) and the resource's GPU VA agree in their low two bits, so s_buffer_load's dword truncation
-//      selects the same bytes the console's V# (base = GPU VA + view_offset) would.
-//
-// The bound in 4 is 2^47, not 2^48: every byte the view can reach then has address bit 47 clear, so the field means the
-// same whether a consumer zero-extends it (this translator) or sign-extends it (the GFX10 canonical 48-bit VA), and
-// a shader that adds an in-view offset to the base in SGPRs never carries into word1's STRIDE bits. Nothing is
-// truncated or wrapped: a view that fails any condition is refused, and `out` is left as it was.
-//
-// What this does NOT cover: B <= heap_base (a negative difference has no zero-extended 48-bit encoding; it would need
-// the translator to sign-extend bit 47, a contract change), structured and typed views, UAV counters, descriptors the
-// title writes itself, and root or other raw VAs a shader reads that hold the title's host address.
-//
-// Pure arithmetic, so it is tested without a GPU (imported_view_address_test).
+// GetGPUVirtualAddress and the VA registry retain the original CPU VA. ClearUAV subtracts the encoded
+// zero-offset base from the encoded view base: the no-cross-zero rule makes this exactly the byte offset
+// for either sign, without signed C++ overflow. Invalid cases leave out untouched.
+// Typed/structured views, counters, CPU-authored descriptors and CPU raw/root pointers remain out of scope.
+// Newly signed descriptors require newly translated signed48-v1 shaders; old unsigned modules are incompatible.
 
 #include <cstdint>
 
@@ -49,8 +29,8 @@ enum class ImportedViewAddress : std::uint8_t {
     no_device_address,  // 1: the buffer has no device address
     outside_buffer,     // 2: the view's bytes are not inside the buffer
     buffer_wraps,       // 2: B + width passes 2^64
-    below_heap_base,    // 3: B <= heap_base
-    past_limit,         // 4: the view reaches 2^47 or beyond
+    below_heap_base,    // B == heap_base: reserved arena origin
+    past_limit,         // outside signed 48 bits, or a negative encoded view carries through zero
     misaligned,         // 5: B - heap_base and the GPU VA differ in their low two bits
 };
 
@@ -64,13 +44,24 @@ inline ImportedViewAddress imported_view_address(std::uint64_t heap_base, std::u
     if (!device_address) return ImportedViewAddress::no_device_address;
     if (offset > width || size > width - offset) return ImportedViewAddress::outside_buffer;
     if (width > UINT64_MAX - device_address) return ImportedViewAddress::buffer_wraps;
-    if (device_address <= heap_base) return ImportedViewAddress::below_heap_base;
-    const std::uint64_t delta = device_address - heap_base;
-    if (delta >= kImportedViewLimit || offset >= kImportedViewLimit - delta ||
-        size > kImportedViewLimit - delta - offset)
-        return ImportedViewAddress::past_limit;
-    if ((delta ^ gpu_va) & 3) return ImportedViewAddress::misaligned;
-    out = delta + offset;
+    if (device_address == heap_base) return ImportedViewAddress::below_heap_base;
+    std::uint64_t encoded = 0;
+    if (device_address < heap_base) {
+        const std::uint64_t distance = heap_base - device_address;
+        if (distance > kImportedViewLimit || offset >= distance || size > distance - offset)
+            return ImportedViewAddress::past_limit;
+        // distance - offset is in [1, 2^47]. This constructs the exact two's-complement field;
+        // it never discards significant address bits or relies on signed arithmetic overflow.
+        encoded = (std::uint64_t(1) << 48) - (distance - offset);
+    } else {
+        const std::uint64_t delta = device_address - heap_base;
+        if (delta >= kImportedViewLimit || offset >= kImportedViewLimit - delta ||
+            size > kImportedViewLimit - delta - offset)
+            return ImportedViewAddress::past_limit;
+        encoded = delta + offset;
+    }
+    if (((device_address - heap_base) ^ gpu_va) & 3) return ImportedViewAddress::misaligned;
+    out = encoded;
     return ImportedViewAddress::ok;
 }
 
@@ -83,8 +74,8 @@ inline const char* imported_view_refusal(ImportedViewAddress result) {
         case ImportedViewAddress::outside_buffer: return "the view is not inside the buffer";
         case ImportedViewAddress::buffer_wraps: return "the buffer's device address range wraps 2^64";
         case ImportedViewAddress::below_heap_base:
-            return "the buffer's device address is at or below heap_base (a negative V# base is not representable)";
-        case ImportedViewAddress::past_limit: return "the view reaches 2^47 bytes past heap_base";
+            return "the buffer's device address equals the reserved arena origin";
+        case ImportedViewAddress::past_limit: return "the view exceeds signed 48-bit range or carries its encoded base through zero";
         case ImportedViewAddress::misaligned:
             return "the device address minus heap_base and the GPU VA differ in their low two bits";
     }

@@ -731,7 +731,32 @@ struct ShaderEntry {
     // against the device's maxMeshOutputVertices / maxMeshOutputPrimitives when a pipeline is created. 0: not given.
     std::uint32_t max_vertices = 0;
     std::uint32_t max_primitives = 0;
+    // Palmwave: the V# address contract the module was translated for (the index's vsharp_addressing; empty when the
+    // entry has none), and whether the entry carries tools/rdna2spirv.py's own metadata (its "capabilities" array,
+    // which shader_meta writes for every module it translates; hand-written test fixtures do not). See
+    // vsharp_abi_compatible below.
+    std::string vsharp_addressing;
+    bool translator_metadata = false;
 };
+
+// Palmwave: the normalized V# contract the runtime writes descriptors for (docs/design.md, "Normalized V# base").
+// A translated module reads a V# base as heap_base + sext64(base48) + offset; a module from an older translator
+// zero-extends base48 and would turn a negative imported-buffer base into a wild address. tools/rdna2spirv.py records
+// the contract in each index entry as "vsharp_addressing".
+inline constexpr std::string_view kVsharpAddressing = "signed48-v1";
+
+// Whether a pipeline may execute this module under the runtime's V# contract:
+//   - a translated module (its entry has the translator's metadata, or names any vsharp_addressing) must name exactly
+//     kVsharpAddressing; a missing or different value is a module from another translator revision, and the only
+//     remedy is to translate the shaders again (make_game.py's shaders stage, or tools/rdna2spirv.py);
+//   - an entry with neither (a hand-written test fixture whose module did not come from the translator) is not
+//     versioned and is accepted as before.
+// Only execution paths (pipeline creation) apply this; loading, lookup and the non-executing ShaderLibrary users
+// are unchanged.
+inline bool vsharp_abi_compatible(const ShaderEntry& entry) {
+    if (!entry.translator_metadata && entry.vsharp_addressing.empty()) return true;
+    return entry.vsharp_addressing == kVsharpAddressing;
+}
 
 class ShaderLibrary {
 public:
@@ -937,6 +962,13 @@ private:
             }
             e.max_vertices = u32(meta.find("max_vertices"));
             e.max_primitives = u32(meta.find("max_primitives"));
+            // Palmwave: the V# contract marker. A present but non-string value is recorded as an unknown contract
+            // (not as "missing"), so it is refused rather than mistaken for an unversioned fixture.
+            if (const Json* v = meta.find("vsharp_addressing"))
+                e.vsharp_addressing = v->kind != Json::Kind::string ? std::string("<not a string>")
+                                      : v->string.empty()           ? std::string("<empty>")
+                                                                    : v->string;
+            if (const Json* c = meta.find("capabilities"); c && c->kind == Json::Kind::array) e.translator_metadata = true;
             if (by_fspx) fspx_entries_[{e.stage, e.fspx_code_sha256}].push_back(e);
             if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
             if (by_fspx && prefix == "fspx/") ++fspx_count_;

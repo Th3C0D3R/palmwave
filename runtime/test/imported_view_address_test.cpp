@@ -1,6 +1,6 @@
 // Palmwave: the V# base of a RAW view of an imported host buffer (src/imported_view_address.h), without a GPU.
 // Synthetic addresses only; no game data. Each accepted case is encoded into a GFX10 V# (src/gfx10_descriptors.h),
-// decoded back, and pushed through the translator's address formula, heap_base + zext64(base48) + o
+// decoded back, and pushed through the translator's address formula, heap_base + sext64(base48) + o
 // (tools/rdna2spirv.py, buffer_address and host_addr), for the view's first and last dword: the result must be the
 // buffer's device address plus the view offset plus o. Each refused case must leave the output untouched.
 #include "../src/imported_view_address.h"
@@ -23,18 +23,20 @@ namespace {
 constexpr std::uint64_t kSentinel = 0xD1CEDA7A5EED0001ull;
 constexpr std::uint64_t kField48 = (std::uint64_t(1) << 48) - 1;
 
-// What a translated shader reads for byte `o` of a V# holding `base` (the field is 48 bits, zero-extended).
+// What a translated shader reads for byte `o` of a V# holding `base` (the field is 48 bits, sign-extended).
 std::uint64_t shader_address(std::uint64_t heap_base, const gfx10::BufferWords& words, std::uint64_t o) {
     gfx10::Buffer decoded{};
     if (!gfx10::decode(words, decoded)) return 0;
-    return heap_base + (decoded.address & kField48) + o;
+    const std::uint64_t address = decoded.address & kField48;
+    const std::uint64_t extended = address & (std::uint64_t(1) << 47) ? address | ~kField48 : address;
+    return heap_base + extended + o;
 }
 
 gfx10::BufferWords raw_view(std::uint64_t base, std::uint32_t bytes) {
     gfx10::Buffer buffer{};
     buffer.address = base;
     buffer.num_records = bytes;
-    buffer.format = gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
+    buffer.format = 0;  // an actual RAW V#, as ClearUAV recognizes with stride == 0
     buffer.oob_select = gfx10::OobSelect::raw;
     return gfx10::encode(buffer);
 }
@@ -102,19 +104,36 @@ int bounds() {
     return 0;
 }
 
-int underflow() {
-    const std::uint64_t heap_base = 0x0000008000000000ull;
+int negative() {
+    const std::uint64_t heap_base = 0x400000000ull, b = 0x20000000ull;
     const std::uint64_t va = 0x0000020000000000ull;
-    // Below heap_base: B - heap_base wraps. Truncated to the 48-bit field, the shader would read a wild address; the
-    // helper refuses instead (docs/d3d12_vulkan.md 3.3 measured exactly this for upload-heap V#s).
-    const std::uint64_t b = heap_base - 0x10000;
-    const std::uint64_t naive = (b - heap_base) & kField48;
-    CHECK(heap_base + naive != b);
-    CHECK(refused(ImportedViewAddress::below_heap_base, heap_base, b, va, 0x1000, 0, 0x1000));
-    // At heap_base: the arena's own first byte.
-    CHECK(refused(ImportedViewAddress::below_heap_base, heap_base, heap_base, va, 0x1000, 0, 0x1000));
-    // Far below (a host address range near zero).
-    CHECK(refused(ImportedViewAddress::below_heap_base, heap_base, 0x1000, va, 0x1000, 0, 4));
+    const std::uint64_t offset = 0x100, size = 0x400;
+    std::uint64_t out = kSentinel, base = kSentinel;
+    CHECK(imported_view_address(heap_base, b, va, 0x10000, offset, size, out) == ImportedViewAddress::ok);
+    CHECK(imported_view_address(heap_base, b, va, 0x10000, 0, 0, base) == ImportedViewAddress::ok);
+    CHECK((out & (std::uint64_t(1) << 47)) != 0);
+    CHECK(out <= kField48);
+    CHECK(heap_base + out != b + offset);  // the previous unsigned shader contract is demonstrably wrong
+    const auto words = raw_view(out, std::uint32_t(size));
+    CHECK(shader_address(heap_base, words, 0) == b + offset);
+    CHECK(shader_address(heap_base, words, size - 4) == b + offset + size - 4);
+    CHECK(out >= base && out - base == offset);  // ClearUAV's exact encoded-base subtraction
+    CHECK(words[1] >> 16 == 0);  // encoding did not contaminate STRIDE/control fields
+
+    // Lowest signed value is accepted, one dword below it is not. Both are real positive device addresses.
+    const std::uint64_t high_heap = kImportedViewLimit + 0x10000000;
+    CHECK(imported_view_address(high_heap, 0x10000000, va, 0x1000, 0, 0x1000, out) == ImportedViewAddress::ok);
+    CHECK(out == kImportedViewLimit);
+    CHECK(shader_address(high_heap, raw_view(out, 0x1000), 0xFFC) == 0x10000FFC);
+    CHECK(refused(ImportedViewAddress::past_limit, high_heap, 0x0FFFFFFC, va, 0x1000, 0, 4));
+    // Ending at zero is safe; crossing zero would carry into descriptor STRIDE when the base is adjusted in SGPRs.
+    CHECK(imported_view_address(heap_base, heap_base - 0x1000, va, 0x2000, 0, 0x1000, out) == ImportedViewAddress::ok);
+    CHECK(refused(ImportedViewAddress::past_limit, heap_base, heap_base - 0x1000, va, 0x2000, 0, 0x1004));
+    CHECK(refused(ImportedViewAddress::past_limit, heap_base, heap_base - 0x1000, va, 0x2000, 0x1000, 0));
+    CHECK(refused(ImportedViewAddress::below_heap_base, heap_base, heap_base, va, 0x1000, 0, 4));
+    CHECK(refused(ImportedViewAddress::misaligned, heap_base, b + 2, va, 0x1000, 0, 4));
+    CHECK(imported_view_address(heap_base, b + 2, va + 2, 0x1000, 0, 4, out) == ImportedViewAddress::ok);
+    CHECK(shader_address(heap_base, raw_view(out & ~3ull, 4), 0) == b);  // scalar base rounding
     return 0;
 }
 
@@ -142,13 +161,13 @@ int malformed() {
 }  // namespace
 
 int main() {
-    const int failures = representable() + bounds() + underflow() + malformed();
+    const int failures = representable() + bounds() + negative() + malformed();
     if (failures) {
         std::fprintf(stderr, "imported_view_address_test: %d group(s) failed\n", failures);
         return 1;
     }
     std::printf("imported_view_address_test: representable views reach B + offset through the 48-bit V# field; "
-                "underflow, 2^47 overflow, wrap, malformed and misaligned views are refused with the output "
+                "negative and positive bases are exact; signed-range overflow, zero crossing, wrap, malformed and misaligned views are refused with the output "
                 "untouched\n");
     return 0;
 }

@@ -1462,6 +1462,21 @@ class Gen:
     def modify_f(self, f, a):
         return self.tof(self.modify(self.tou(f), a))
 
+    def signed_vsharp_base(self, base48):
+        """Palmwave V# ABI: sign-extend only the decoded 48-bit buffer base, before any byte offset.
+
+        The runtime can encode a real imported buffer below heap_base as a bounded negative displacement.
+        Full-width s_load/root/global pointers retain their original 64-bit meaning; host_addr only adds the
+        arena base. This is our normalized runtime contract, not a claim about unmeasured console addresses.
+        """
+        toggled, signed = self.tmp(), self.tmp()
+        sign = self.cl(1 << 47)
+        # Exact sign extension for a masked 48-bit field, using core Int64 operations.
+        # OpBitFieldSExtract on 64 bits would require Vulkan maintenance9.
+        self.emit(f"{toggled} = OpBitwiseXor %ulong {base48} {sign}")
+        self.emit(f"{signed} = OpISub %ulong {toggled} {sign}")
+        return signed
+
     def host_addr(self, xbox_va):
         """Xbox GPU virtual address (ulong id) -> host buffer device address: heap base (push constant
         dwords 32..33) + VA. The runtime maps the console's GPU address window into one host buffer. The base is
@@ -3756,6 +3771,7 @@ class Gen:
         self.emit(f"{h64} = OpUConvert %ulong {hi}")
         self.emit(f"{sh} = OpShiftLeftLogical %ulong {h64} %c64_32")
         self.emit(f"{base} = OpBitwiseOr %ulong {sh} {l64}")
+        base = self.signed_vsharp_base(base)
         self.emit(f"{o64} = OpUConvert %ulong {total}")
         self.emit(f"{addr} = OpIAdd %ulong {base} {o64}")
         mode = None if lit3 is None else lit3 >> 28 & 3
@@ -11714,6 +11730,8 @@ class Gen:
         self.emit(f"{h64} = OpUConvert %ulong {hi}")
         self.emit(f"{sh} = OpShiftLeftLogical %ulong {h64} %c64_32")
         self.emit(f"{addr} = OpBitwiseOr %ulong {sh} {l64}")
+        if sbuf:
+            addr = self.signed_vsharp_base(addr)
         self.emit(f"{full} = OpIAdd %ulong {addr} {o64}")
         ptr = self.tmp()
         self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(full)}")
@@ -17573,6 +17591,7 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
              "DrawParameters": "shaderDrawParameters",
              }     # FMAKHR: shaderFmaFloat32 / shaderFmaFloat64 (VK_KHR_shader_fma) by the width used, below
     m = {"stage": g.stage, "wave64": bool(g.wave64), "control_flow": getattr(g, "control_flow", "straight line"),
+         "vsharp_addressing": "signed48-v1",
          # How fused multiply-adds were emitted. --fma khr is already implied by the FMAKHR capability,
          # but --fma exact has no capability to distinguish it from the default GLSL Fma (TEST-1147).
          "fma": "exact" if FMA_EXACT else "khr" if FMA_KHR else "glsl",

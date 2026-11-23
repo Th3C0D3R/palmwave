@@ -3416,6 +3416,31 @@ const palmwave::ShaderEntry* pick_entry(const std::vector<const palmwave::Shader
     return candidates.empty() ? nullptr : candidates.front();
 }
 
+// Palmwave: refuse to execute a translated module made for another V# address contract (src/shader_library.h,
+// vsharp_abi_compatible). The runtime writes signed48-v1 descriptors (negative bases for imported buffers placed
+// below heap_base); a stale zero-extending module would read a wild address instead. Reported once per module, traced
+// "refused"; the caller fails pipeline creation, so nothing of that module is ever dispatched or drawn.
+bool vsharp_abi_usable(const palmwave::ShaderEntry& entry, const char* method) {
+    if (palmwave::vsharp_abi_compatible(entry)) return true;
+    static std::mutex mutex;
+    static std::set<std::string> seen;
+    bool first = false;
+    {
+        std::lock_guard lock(mutex);
+        first = seen.insert(entry.name).second;
+    }
+    if (first)
+        std::fprintf(stderr,
+                     "[rt] d3d12: %s: translated shader %s was made for V# addressing \"%s\", not \"%.*s\"; it is "
+                     "refused. Translate the shaders again with this revision (make_game.py's shaders stage, or "
+                     "tools/rdna2spirv.py) instead of reusing older modules\n",
+                     method, entry.name.c_str(),
+                     entry.vsharp_addressing.empty() ? "(none recorded)" : entry.vsharp_addressing.c_str(),
+                     int(palmwave::kVsharpAddressing.size()), palmwave::kVsharpAddressing.data());
+    d3d12_trace::record(method, "refused");
+    return false;
+}
+
 // Whether the input layout has an element for every ordinary (non-system-value) input of the vertex shader.
 bool layout_feeds(const palmwave::ShaderEntry& vs, const D3D12_INPUT_LAYOUT_DESC& layout) {
     for (const auto& input : vs.input_signature) {
@@ -3990,6 +4015,9 @@ public:
                 std::fprintf(stderr, "[rt] d3d12: no translated %s for FSSM sha256 %s\n", stage.name, hash.c_str());
                 return E_INVALIDARG;
             }
+            // Palmwave: every stage of the pipeline (vertex or mesh, geometry, pixel) must use the runtime's V#
+            // contract; one stale stage refuses the whole pipeline.
+            if (!vsharp_abi_usable(*stage.entry, "ID3D12Device::CreateGraphicsPipelineState")) return E_FAIL;
             if (stage.entry->binding_count) {
                 if (!device_.bindless) {
                     std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; the device has no bindless set 0\n",
@@ -4463,6 +4491,8 @@ public:
                              palmwave::sha256_hex(program.bytes).c_str());
             return E_INVALIDARG;
         }
+        // Palmwave: a compute module (FSSM, FSPX or BVH builder) made for another V# contract is refused.
+        if (!vsharp_abi_usable(*entry, "ID3D12Device::CreateComputePipelineState")) return E_FAIL;
         // Set 0 (bindless images, samplers, the descriptor hash table): the device keeps it, and a pipeline whose
         // shader declares bindings has it in its layout and has it bound at every dispatch.
         if (entry->binding_count && !device_.bindless) {

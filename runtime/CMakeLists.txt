@@ -1025,6 +1025,9 @@ if(BUILD_TESTING)
   add_test(NAME descriptor_table COMMAND descriptor_table_test)
   add_executable(shader_library_test test/shader_library_test.cpp)
   add_test(NAME shader_library COMMAND shader_library_test)
+  # Palmwave: the stale-module V# ABI guard (src/shader_library.h, vsharp_abi_compatible) on a synthetic index.json.
+  add_executable(shader_vsharp_abi_test test/shader_vsharp_abi_test.cpp)
+  add_test(NAME shader_vsharp_abi COMMAND shader_vsharp_abi_test)
   add_executable(spirv_f16_halves_test test/spirv_f16_halves_test.cpp)
   add_test(NAME spirv_f16_halves COMMAND spirv_f16_halves_test)
   # Optional: skips unless PALMWAVE_SHADERS names a translated work folder (<work>/shaders/spirv).
@@ -2555,6 +2558,23 @@ if(TARGET Vulkan::Headers)
       target_link_options(d3d12_import_raw_view_test PRIVATE /OPT:NOREF)  # keep the self-registering shim tables
       add_test(NAME d3d12_import_raw_view COMMAND d3d12_import_raw_view_test)
       set_tests_properties(d3d12_import_raw_view PROPERTIES SKIP_RETURN_CODE 77
+                           FAIL_REGULAR_EXPRESSION "Validation Error;VUID-"
+                           ENVIRONMENT_MODIFICATION "PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT=unset:")
+      # Palmwave: runtime negative placement is optional: genuine host imports reserve address ranges before the
+      # arena and are released before the runtime imports; both imports' actual device addresses
+      # must then lie below the actual heap_base. Exit 77 (a skip, never a pass) when the driver placed them elsewhere.
+      # Independent native shader oracle: actual imports first, actual arena second; no D3D12 placement assumption.
+      add_executable(vk_import_signed48_test test/vk_import_signed48_test.cpp ${PALMWAVE_IMPORT_RAW_FILES})
+      target_link_libraries(vk_import_signed48_test PRIVATE Vulkan::Headers)
+      target_compile_definitions(vk_import_signed48_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 PALMWAVE_TEST_IMPORT_RAW_DIR="${PALMWAVE_IMPORT_RAW_DIR}")
+      target_compile_options(vk_import_signed48_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME vk_import_signed48 COMMAND vk_import_signed48_test)
+      set_tests_properties(vk_import_signed48 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60
+                           FAIL_REGULAR_EXPRESSION "Validation Error;VUID-;SYNC-HAZARD")
+
+      add_test(NAME d3d12_import_raw_view_below COMMAND d3d12_import_raw_view_test --below)
+      set_tests_properties(d3d12_import_raw_view_below PROPERTIES SKIP_RETURN_CODE 77
                            FAIL_REGULAR_EXPRESSION "Validation Error;VUID-"
                            ENVIRONMENT_MODIFICATION "PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT=unset:")
     else()

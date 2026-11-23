@@ -341,3 +341,21 @@ secondary-thread stop. Each trace records 24 startup events, four successful DLL
 no unimplemented import, and 2,251 D3D12 events (2,205 ok, 29 called, 14 experimental-hypothesis,
 one experimental, two refused negative-address RAW views). No Draw, ExecuteCommandLists,
 Present or game image was observed. The runtime remains experimental.
+
+## Signed relative addresses for imported RAW buffer views
+
+The signed48-v1 translator/runtime contract now represents supported imported RAW views both above and below the
+shader arena. Translated modules must carry the matching index marker; stale or unmarked translated entries are
+refused at pipeline creation. Shaders must therefore be retranslated with this revision before use. Typed or
+structured imported views, counters, CPU-authored descriptors and direct root pointers remain outside this path.
+
+The complete semantic suite passed 5,969 tests across 448 files in 336 seconds. The main corpus retained 26,503/26,503 translated and SPIR-V-valid modules; BVH retained 52/52 and FSPX 29/29, with no missing, extra, source-hash or container-hash mismatches. These are CPU/tool checks, not rendering results.
+
+On RTX 5080 / driver 621.14 with Vulkan and synchronization validation, the D3D12 imported RAW regression passed in 0.68 seconds with positive relative addresses: 66,112 exact word comparisons and 256 scalar checks, including ClearUAV. Its `--below` mode returned 77 because both imports remained above the arena; it is not a negative-placement pass. The independent native `vk_import_signed48` test passed in 0.33 seconds with two real imports below the real arena: 98,304 original-memory word comparisons and 256 scalar checks, zero validation errors. It uses the standard translated shader and actual arena `heap_base`, and proves negative scalar/vector loads and stores without claiming the D3D12 descriptor or ClearUAV paths at negative placement.
+
+The last executable startup measurement above predates this integration and still records two negative-address
+view refusals. No new executable run, successful negative-placement D3D12 submission, menu or frame is claimed.
+
+The combined runtime build passed. Its focused CTest run completed in 1.98 seconds with six passes and one explicit
+skip for D3D12 negative placement. It included the ABI marker, JSON loader, address arithmetic, host-read barrier,
+positive D3D12 import and native negative-address shader checks.
