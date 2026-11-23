@@ -43,7 +43,7 @@ The direct run records **25 startup events** and **2,341 D3D12 trace events**: 2
 
 ## Current stop and run configurations
 
-The direct run stopped on a guest breakpoint after pipeline creation. Follow-up tracing identified the third indirect command signature as the first call returning an error. The slot 41 adapter now accepts its measured 12-byte compute argument (type 105). On the RTX 5080 the next probe created four signatures and stopped after the fifth, a mesh-dispatch signature, returned unsupported. The two R16_UINT buffer views also remain unsupported. See the [parent fixes under review](docs/peer_compatibility.md).
+The direct run stopped on a guest breakpoint after pipeline creation. Follow-up tracing identified the third indirect command signature as the first call returning an error. The slot 41 adapter now accepts its measured 12-byte compute argument (type 105). On the RTX 5080 the next probe created four signatures and stopped after the fifth, a mesh-dispatch signature, returned unsupported. A separate local build created that fifth signature and reached an 18th root signature. It stopped at Xbox device slot 61 while creating a sampler. See the [diagnostic results](STATUS.md#sampler-creation-after-the-fifth-indirect-signature) and [parent fixes under review](docs/peer_compatibility.md).
 
 | Configuration | Observed reach |
 |---|---|
