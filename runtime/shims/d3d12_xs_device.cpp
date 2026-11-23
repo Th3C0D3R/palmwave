@@ -3785,8 +3785,20 @@ void proxy_create_srv_at_va_x(DeviceProxy* self, std::uint64_t resource_desc, st
 
     const auto width = field_at<std::uint64_t>(resource, offsetof(D3D12_RESOURCE_DESC, Width));
     const auto va = field_at<std::uint64_t>(view, kSrvAtVaVaOffset);
-    if (const char* mismatch = srv_at_va_shape_mismatch(resource, view))
+    if (const char* mismatch = srv_at_va_shape_mismatch(resource, view)) {
+        if (d3d12_trace::enabled()) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
+            static_assert(offsetof(D3D12_SHADER_RESOURCE_VIEW_DESC, Buffer) + sizeof(D3D12_BUFFER_SRV) <= kSrvAtVaVaOffset);
+            std::memcpy(&desc, view, kSrvAtVaVaOffset);
+            if (desc.ViewDimension == D3D12_SRV_DIMENSION_BUFFER)
+                std::fprintf(stderr, "[rt] d3d12_xs: unsupported slot 70 buffer view: format %u, mapping %#x, "
+                             "first %llu, elements %u, stride %u, flags %#x, resource width %llu\n",
+                             UINT(desc.Format), desc.Shader4ComponentMapping,
+                             static_cast<unsigned long long>(desc.Buffer.FirstElement), desc.Buffer.NumElements,
+                             desc.Buffer.StructureByteStride, UINT(desc.Buffer.Flags), static_cast<unsigned long long>(width));
+        }
         return refuse(SrvAtVaOutcome::unsupported_shape, mismatch, va, width);
+    }
     const auto elements = field_at<std::uint32_t>(
         view, offsetof(D3D12_SHADER_RESOURCE_VIEW_DESC, Buffer) + offsetof(D3D12_BUFFER_SRV, NumElements));
     if (!width || width % 4 != 0 || width > kSrvAtVaMaxWidth)

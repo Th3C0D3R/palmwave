@@ -6546,17 +6546,18 @@ public:
 
     HRESULT STDMETHODCALLTYPE CreateRootSignature(UINT node_mask, const void* blob, SIZE_T size, REFIID riid,
                                                   void** out) override {
+        constexpr const char* method = "ID3D12Device::CreateRootSignature";
         // The host runtime answers a null output with S_FALSE before it looks at the blob or the node mask
         // (compare_invalid_arguments, "root signature:"). Otherwise it refuses a node other than node 0, and a DXBC
         // container whose own size (the dword at +24) is not the size passed.
-        if (!out) return S_FALSE;
+        if (!out) return d3d12_trace::result(method, S_FALSE);
         *out = nullptr;
-        if (!blob || !size || (node_mask & ~1u)) return E_INVALIDARG;
+        if (!blob || !size || (node_mask & ~1u)) return d3d12_trace::result(method, E_INVALIDARG);
         const auto* bytes = static_cast<const std::uint8_t*>(blob);
         if (size >= 28 && std::memcmp(bytes, "DXBC", 4) == 0) {
             std::uint32_t container_size = 0;
             std::memcpy(&container_size, bytes + 24, sizeof(container_size));
-            if (container_size != size) return E_INVALIDARG;
+            if (container_size != size) return d3d12_trace::result(method, E_INVALIDARG);
         }
         // The repository's root-signature model (runtime/src/root_signature.h): parse the RTS0 blob, then pack
         // the parameters into the 32 user-data dwords. pack() refuses what it cannot place (more than 32 dwords:
@@ -6564,7 +6565,7 @@ public:
         const rt::rootsig::DecodeResult parsed = rt::rootsig::parse_rts0(bytes, size);
         if (!parsed.ok) {
             std::fprintf(stderr, "[rt] d3d12: root signature not understood: %s\n", parsed.error.c_str());
-            return E_INVALIDARG;
+            return d3d12_trace::result(method, E_INVALIDARG);
         }
         // Two layouts, one per bind point (RootArgumentLayout): graphics keeps pack(), compute takes the console
         // layout pack_stage() measured (D3D-448). The signature is refused only when neither can place it.
@@ -6573,7 +6574,7 @@ public:
         if (!packed.ok && !compute.ok) {
             std::fprintf(stderr, "[rt] d3d12: root signature refused: %s (compute: %s)\n", packed.error.c_str(),
                          compute.error.c_str());
-            return E_INVALIDARG;
+            return d3d12_trace::result(method, E_INVALIDARG);
         }
         if (!packed.ok)
             std::fprintf(stderr, "[rt] d3d12: root signature usable for compute only: %s\n", packed.error.c_str());
@@ -6597,25 +6598,26 @@ public:
         auto* signature = new RootSignature(
             std::move(layout), palmwave::sha256_hex({static_cast<const std::uint8_t*>(blob), size}));
         signature->attach_device(identity());
-        return hand_out(signature, riid, out);
+        return d3d12_trace::result(method, hand_out(signature, riid, out));
     }
 
     // PC slot 11; the Xbox ABI reaches it through device slots 62 and 67 (the proxy forwards).
     HRESULT STDMETHODCALLTYPE CreateComputePipelineState(const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID riid,
                                                          void** out) override {
-        if (!out) return E_POINTER;
+        constexpr const char* method = "ID3D12Device::CreateComputePipelineState";
+        if (!out) return d3d12_trace::result(method, E_POINTER);
         *out = nullptr;
-        if (!desc) return E_INVALIDARG;
+        if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
         palmwave::cached_pso::Key key = pipeline_key(*desc);
-        if (const HRESULT hr = check_cached_pso(state_.pso_identity, key, desc->CachedPSO); FAILED(hr)) return hr;
+        if (const HRESULT hr = check_cached_pso(state_.pso_identity, key, desc->CachedPSO); FAILED(hr)) return d3d12_trace::result(method, hr);
         auto* pipeline = new PipelineState(state_);
         pipeline->attach_device(identity());
         if (const HRESULT hr = pipeline->create_compute(*desc); FAILED(hr)) {
             pipeline->Release();
-            return hr;
+            return d3d12_trace::result(method, hr);
         }
         pipeline->set_cache_key(std::move(key));
-        return hand_out(pipeline, riid, out);
+        return d3d12_trace::result(method, hand_out(pipeline, riid, out));
     }
 
     HRESULT STDMETHODCALLTYPE CreateGraphicsPipelineState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc, REFIID riid,
