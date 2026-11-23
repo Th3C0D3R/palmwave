@@ -4044,6 +4044,20 @@ static void no_dialogs() {
 }
 
 int main(int argc, char** argv) {
+    if (argc == 3 && std::strcmp(argv[1], "--env-resource-struct-slot") == 0) {
+        const unsigned route = std::strcmp(argv[2], "95") == 0 ? 95u : 108u;
+        EXPECT(SetEnvironmentVariableA("PALMWAVE_XS_SCHEDULE_EVENT_SLOT", argv[2]) != FALSE);
+        Mock* mock = nullptr;
+        void* device = make_device(mock, 8, true);
+        EXPECT(device);
+        xs::reset_device_proxy_stats();
+        // RDX=1 is a valid integer event, never a pointer. The old ABI detector dereferenced address 1.
+        EXPECT(hr_of(raw(device, route, 1, 0, 0, 0)) == S_OK);
+        EXPECT(xs::device_slot_hits(route) == 1 && mock->calls[56] == 0 && mock->calls[68] == 0);
+        EXPECT(release(device) == 0 && mock->refs == 0);
+        std::printf("configured schedule route %u accepted integer event 1 before struct ABI detection\n", route);
+        return 0;
+    }
     no_dialogs();
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc == 2 && std::strcmp(argv[1], "--slot133") == 0) return check_placed_resource_refusal();

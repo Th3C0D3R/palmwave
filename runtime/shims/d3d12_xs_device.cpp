@@ -3852,6 +3852,13 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                     static_cast<UINT>(a2), static_cast<D3D12_HEAP_TYPE>(static_cast<std::uint32_t>(a3))));
         }
         if constexpr (Slot == 95 || Slot == 108) {
+            // Configured routes own the slot before ABI detection: ScheduleFrameEventX, for example, puts an
+            // integer event in RDX, not a readable struct-return buffer or device pointer.
+            std::uint64_t configured = 0;
+            if (route_xbox_device_slot(self, Slot, a1, a2, a3, a4, a5, configured)) {
+                note_slot(Slot);
+                return configured;
+            }
             // The slot-25 rule: the console C ABI form has the return buffer in RCX and the device in RDX, recognised
             // before `self` is read. In both forms a2/a3 are the mask and count and a4/a5 the first two stack words
             // (descriptions, per-resource array), so they keep their positions.

@@ -963,6 +963,8 @@ if(BUILD_TESTING)
     add_test(NAME xs_proxy_mock_env_slots_127 COMMAND xs_proxy_mock_test --env-slots-127)
     # Device slots 92-95/108-110/112 to ID3D12Device4/8 over mock interface objects (CPU only, no GPU).
     add_test(NAME xs_proxy_mock_resource_routes COMMAND xs_proxy_mock_test --resource-routes)
+    add_test(NAME xs_proxy_mock_env_resource_95 COMMAND xs_proxy_mock_test --env-resource-struct-slot 95)
+    add_test(NAME xs_proxy_mock_env_resource_108 COMMAND xs_proxy_mock_test --env-resource-struct-slot 108)
     add_test(NAME xs_proxy_mock_slot70_trace COMMAND xs_proxy_mock_test --slot70)
     set_tests_properties(xs_proxy_mock_slot70_trace PROPERTIES
                          PASS_REGULAR_EXPRESSION "[(]device slot 70[)] unsupported"
