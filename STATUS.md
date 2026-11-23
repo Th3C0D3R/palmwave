@@ -1,6 +1,6 @@
 # Measured status
 
-Updated: 23 November 2026. Target: a first verified frame from the retail executable, not gameplay.
+Updated: 24 November 2026. Target: a first verified frame from the retail executable, not gameplay.
 
 ## Local preparation
 
@@ -353,9 +353,50 @@ The complete semantic suite passed 5,969 tests across 448 files in 336 seconds. 
 
 On RTX 5080 / driver 621.14 with Vulkan and synchronization validation, the D3D12 imported RAW regression passed in 0.68 seconds with positive relative addresses: 66,112 exact word comparisons and 256 scalar checks, including ClearUAV. Its `--below` mode returned 77 because both imports remained above the arena; it is not a negative-placement pass. The independent native `vk_import_signed48` test passed in 0.33 seconds with two real imports below the real arena: 98,304 original-memory word comparisons and 256 scalar checks, zero validation errors. It uses the standard translated shader and actual arena `heap_base`, and proves negative scalar/vector loads and stores without claiming the D3D12 descriptor or ClearUAV paths at negative placement.
 
-The last executable startup measurement above predates this integration and still records two negative-address
-view refusals. No new executable run, successful negative-placement D3D12 submission, menu or frame is claimed.
+At integration time, the executable startup measurement above still recorded two negative-address view refusals;
+that integration test alone claimed no new executable run, successful negative-placement D3D12 submission, menu or frame.
 
 The combined runtime build passed. Its focused CTest run completed in 1.98 seconds with six passes and one explicit
 skip for D3D12 negative placement. It included the ABI marker, JSON loader, address arithmetic, host-read barrier,
 positive D3D12 import and native negative-address shader checks.
+
+
+## Compute-pipeline creation and the next startup stop
+
+On 24 November 2026, the local Xbox Series executable was run directly inside a network-isolated AppContainer
+on NVIDIA GeForce RTX 5080 / driver 621.14. The four opt-ins were enabled: Xbox flush, host import, committed
+texture and texture-hook backing. The runtime included the signed48-v1 address contract and the JSON loader's
+move-based tree handling. A bounded cache build for the 52 signed48 BVH compute programs completed with
+52 modules and 52 pipelines successful, zero failures or skips, in 32.3 seconds on two compiler threads.
+The resulting cache was 5,453,962 bytes; the startup run loaded a cache of that same size. This is a bounded
+BVH result, not completion of the full driver-pipeline corpus or verification of shader semantics.
+
+The direct run records four successful DLL initializations, five queues and five fences. It creates and closes
+585 command lists through the console route: the previously observed 581 plus four additional closed lists.
+The console and desktop-wrapper trace entries describe the same lists and are not added together. The real
+174 MiB host buffer is imported, one slot-70 RAW view is written, and both callback-backed 3840 x 2160 images
+are created. CreateRootSignature returns successfully 17 times and CreateComputePipelineState 53 times.
+Two slot-70 requests are still refused because their format is outside the supported RAW shape. A follow-up
+diagnostic identifies both as typed R16_UINT buffer views; they are not negative-relative-address refusals.
+
+The direct capture contains 25 startup events and 2,341 D3D12 trace events: 2,294 ok, 30 called,
+14 experimental-hypothesis, one experimental and two unsupported. Pipeline-result tracing was added between
+captures, so a larger total is not by itself evidence of further execution. Successful API returns establish
+resource and pipeline creation, not submitted or completed GPU work.
+
+The final startup event is a guest breakpoint (0x80000003) at trace time 25.209 seconds. The direct process
+measurement is 50.744 seconds, with exit code 0x80000003 and no timeout; trace time and process duration are
+different measurements. The previous allocation-accounting assertion and secondary-thread null write are not
+observed. Several runtime and preparation changes were combined, so this run does not establish which change
+accounts for the different stop.
+
+A subsequent diagnostic build adds command-signature result tracing. It records two successful signatures for
+draw and indexed draw, then one failed CreateCommandSignature request with a 12-byte stride and a single
+argument of type 105, followed by the guest breakpoint. This is the first measured failed HRESULT; the earlier
+typed-SRV refusals are void calls. No meaning for type 105 or cause of the breakpoint is inferred. Its trace
+contains 2,344 events: 2,296 ok, 30 called, 14 experimental-hypothesis, one experimental, two unsupported and
+one failed. The debugger wrapper exits zero after 26.738 seconds; that is diagnostic completion, not a successful
+executable exit. The three extra trace events reflect the added command-signature instrumentation.
+
+No game Draw, ExecuteCommandLists, Present, menu or rendered frame is observed in these captures. The default
+configuration has not been remeasured here and remains separate from the four-option experimental path.
