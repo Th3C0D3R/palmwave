@@ -20,7 +20,7 @@ Source revision: original upstream `dde82f27e994337094afc476ded0b1426f6e87e2`, m
 | Driver pipeline creation | Running on RTX 5080; final full-corpus counts pending |
 | Retail dry-run | Exit 0; five modules mapped |
 | Retail initialization | Exit 0; four DLL initializations succeed |
-| Retail execution | First missing export fixed in `eebabab`; next stop is direct TLS-slot-zero access before D3D12 |
+| Retail execution | Runtime export and TLS-slot-zero blockers fixed; next stop is the DirectStorage factory import before D3D12 |
 | First rendered frame | Not verified |
 
 The scanner candidate is not counted as a shader translation failure. Generated data and full logs are private and stored outside the authoring repository. No game assets have been added to Git.
@@ -43,4 +43,4 @@ The first full semantic run executed 5,956 tests across 447 files in 245 seconds
 
 The baseline run ended with Windows status `0xC0000374`. A first-chance debugger revealed an earlier breakpoint after the dynamic `XErrorReport` lookup failed; the final status alone did not establish a heap bug. Commit `eebabab` exposes the existing offline report handler, adapted from upstream PR #6582. Both targeted runtime tests passed, and the next offline run successfully initialized the GDK runtime.
 
-The next first-chance exception is an access violation. Debugging confirms that the executable reads TLS slot zero directly while the loader assigned its TLS index six; the host and guest blocks differ. This matches the documented `/GA` loader issue. A scoped loader correction is being reviewed. No D3D12 call or rendered frame has been observed in these runs. Raw traces, addresses and disassembly remain private.
+The next first-chance exception is an access violation. Debugging confirms that the executable reads TLS slot zero directly while the loader assigned its TLS index six; the host and guest blocks differ. This matches the documented `/GA` loader issue. The loader correction adapted from upstream PR #4313 passed all seven focused CTests (35.73 seconds), including real `/GA` code, existing/new threads and clone cleanup. The next offline run confirms this access violation is cleared and stops at the first unimplemented `xcrdapi.dll!DStorageGetFactory` call with `PALMWAVE_UNIMPLEMENTED=stop`. No D3D12 call or rendered frame has been observed in these runs. Raw traces, addresses and disassembly remain private.
