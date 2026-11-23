@@ -16,9 +16,11 @@ docs/fspx.md.
 as the DLL skips it. The DLL does not check the version word.
 
 Usage:
-    python -I fspx_unpack.py <file> [<file> ...] --out DIR [--disasm] [--mcpu gfx1030]
-<file> is the DLL, a .dxbc container or a bare FSPX payload. Writes, per shader, the same layout the game's shader
-corpus uses, so tools/rdna2spirv.py can read it:
+    python -I fspx_unpack.py <file> [<file> ...] --out DIR [--disasm [--backend {llvm-mc,python}]] [--mcpu gfx1030]
+<file> is the DLL, a .dxbc container or a bare FSPX payload. --backend picks the disassembler for --disasm, with
+the names tools/shader_disasm.py uses: llvm-mc (the default; LLVM_MC names it) or python (tools/rdna2_decode.py,
+which needs no LLVM). Each program is decoded with the wave size of its kind-0 entry (wave32 when the entry is too
+short to say). Writes, per shader, the same layout the game's shader corpus uses, so tools/rdna2spirv.py can read it:
     DIR/<name>.dxbc          the container (absent for a bare payload)
     DIR/index.json           [{"file": "<name>.dxbc", "stage": "cs", ...}]
     DIR/fspx/<name>.json     the decoded kind-0 entry, the directory and the code range
@@ -179,11 +181,19 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Unpack the FSPX compute programs in FidelityFX shader containers.")
     ap.add_argument("files", nargs="+", help="the DLL, .dxbc containers or bare FSPX payloads")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--disasm", action="store_true", help="also write disasm/<name>.s (needs llvm-mc, see LLVM_MC)")
+    ap.add_argument("--disasm", action="store_true",
+                    help="also write disasm/<name>.s (with the llvm-mc backend this needs llvm-mc, see LLVM_MC)")
+    # None marks "not given", so --backend without --disasm is refused instead of silently doing nothing.
+    ap.add_argument("--backend", choices=("llvm-mc", "python"), default=None,
+                    help="disassembler backend for --disasm: llvm-mc (default) or the pure-Python RDNA2 decoder "
+                         "(tools/rdna2_decode.py, no LLVM needed), as in tools/shader_disasm.py")
     ap.add_argument("--mcpu", default="gfx1030",
-                    help="llvm-mc CPU for --disasm (default gfx1030: the programs use v_dot4 instructions, which "
-                         "gfx1010 and gfx1013 do not decode)")
+                    help="target CPU for --disasm (default gfx1030: the programs use v_dot4 instructions, which "
+                         "llvm-mc does not decode for gfx1010 and gfx1013)")
     a = ap.parse_args(argv)
+    if a.backend is not None and not a.disasm:
+        ap.error("--backend selects the --disasm backend; give --disasm too")
+    backend = a.backend or "llvm-mc"
     # An output in the input folder can replace a .dxbc input and, when the input is the folder itself,
     # os.makedirs writes there before open() tries to read the folder as a file. Refuse before either.
     for path in a.files:
@@ -254,14 +264,20 @@ def main(argv=None) -> int:
             listing = None
             if disasm and meta["code"]["end"]:
                 start, end = meta["code"]["start"], meta["code"]["end"]
-                asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu)
+                # The kind-0 wave size decides how the python backend prints wave-sized operands (vcc_lo or vcc,
+                # one SGPR or a pair). shader_disasm's llvm-mc path takes the argument and runs llvm-mc as before.
+                # A kind-0 entry too short for word 4 keeps shader_disasm's default, wave32.
+                asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu, backend=backend,
+                                                  wave32=meta.get("wave32", True))
                 if not asm.strip():
                     reason = (err.strip().splitlines() or ["no output"])[0]
                     print(f"{name}: {reason}", file=sys.stderr)
                     bad += 1
                     continue
                 entry["invalid_words"] = invalid
-                listing = f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n" + asm
+                tool = "" if backend == "llvm-mc" else f", {backend} decoder"  # llvm-mc header unchanged
+                listing = (f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}{tool}, {invalid} invalid words\n"
+                           + asm)
                 if err.strip():
                     listing += "\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n"
             if container:

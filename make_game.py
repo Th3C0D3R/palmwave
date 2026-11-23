@@ -1315,13 +1315,19 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
             f.write(sources + "\n")
         translate(disasm, spirv, jobs, emulate=emulate, fallbacks=fallbacks)
     verify_translation_completeness(dxbc, spirv)
-    fspx_shaders(game, work, signature, emulate=emulate, fallbacks=fallbacks)
+    fspx_shaders(game, work, emulate=emulate, fallbacks=fallbacks)
     bvh_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
     log("shaders: done")
 
 
 FSPX_DLL = "amd_fidelityfx_upscaler_xbox.dll"
-FSPX_TOOLS = ("fspx_unpack.py", "shader_disasm.py")   # with TRANSLATION_SOURCES, what the FSPX outputs come from
+# The step disassembles with fspx_unpack.py's pure-Python backend (docs/fspx.md, "Build and run-time lookup"),
+# so these are the files that run then: fspx_unpack.py and its imports, shader_disasm.py and its imports, and the
+# decoder rdna2_decode.py with its tables. With TRANSLATION_SOURCES, what the FSPX outputs come from. The game's own
+# shaders are disassembled by llvm-mc and do not depend on the decoder, so a decoder edit reruns this step only.
+FSPX_DISASM_BACKEND = "python"
+FSPX_TOOLS = ("fspx_unpack.py", "shader_disasm.py", "rdna2_decode.py", "rdna2_isa_tables.py", "gfx10_formats.json",
+              "mc_command.py", "shader_stage_manifest.py", "report_paths.py")
 
 
 def file_sha256(path: str) -> str:
@@ -1332,15 +1338,15 @@ def file_sha256(path: str) -> str:
     return h.hexdigest()
 
 
-def fspx_settings(dll: str, mc_signature: str, emulate: bool, fallbacks: tuple[str, ...]) -> str:
-    """What the FSPX outputs depend on, as one line: the DLL, the unpacking and translating tools, llvm-mc, the
-    wave64 mode and the fallback flags."""
+def fspx_settings(dll: str, emulate: bool, fallbacks: tuple[str, ...]) -> str:
+    """What the FSPX outputs depend on, as one line: the DLL, the disassembler backend, the unpacking, decoding and
+    translating sources, the wave64 mode and the fallback flags. llvm-mc is not among them: the step never runs it."""
     tools = hashlib.sha256()
     for name in FSPX_TOOLS:
         tools.update(f"{name}\0".encode() + bytes.fromhex(file_sha256(os.path.join(TOOLS, name))))
-    return json.dumps({"dll": file_sha256(dll), "tools": tools.hexdigest(), "translator": translation_sources_digest(),
-                       "llvm_mc": mc_signature, "wave64_emulate": bool(emulate), "fallbacks": list(fallbacks)},
-                      sort_keys=True)
+    return json.dumps({"dll": file_sha256(dll), "backend": FSPX_DISASM_BACKEND, "tools": tools.hexdigest(),
+                       "translator": translation_sources_digest(), "wave64_emulate": bool(emulate),
+                       "fallbacks": list(fallbacks)}, sort_keys=True)
 
 
 def fspx_cache_complete(spirv: str) -> bool:
@@ -1353,9 +1359,9 @@ def fspx_cache_complete(spirv: str) -> bool:
     return isinstance(index, dict) and bool(index) and all(os.path.isfile(os.path.join(spirv, name + ".spv")) for name in index)
 
 
-def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
-                 fallbacks: tuple[str, ...] = ()) -> None:
-    """The FidelityFX DLL's compute programs (docs/fspx.md): tools/fspx_unpack.py unpacks and disassembles them into
+def fspx_shaders(game: str, work: str, emulate: bool = False, fallbacks: tuple[str, ...] = ()) -> None:
+    """The FidelityFX DLL's compute programs (docs/fspx.md): tools/fspx_unpack.py unpacks them and disassembles them
+    with its pure-Python backend (--backend python, FSPX_DISASM_BACKEND; the CLI's own default stays llvm-mc) into
     <work>/shaders/fspx, rdna2spirv.py translates them into <work>/shaders/spirv/fspx, where the runtime's shader
     library finds them by fspx_code_sha256. The game's own shaders neither feed nor depend on this step.
 
@@ -1369,7 +1375,7 @@ def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
     if not os.path.isfile(dll):
         log(f"shaders: no {FSPX_DLL} in the game folder, so no FSPX programs to translate")
         return
-    settings = fspx_settings(dll, mc_signature, emulate, fallbacks)
+    settings = fspx_settings(dll, emulate, fallbacks)
     if read_shader_setting(settings_file) == settings and fspx_cache_complete(spirv):
         return
     log(f"shaders: unpacking and translating the FSPX programs of {FSPX_DLL}")
@@ -1381,7 +1387,7 @@ def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
                 for entry in entries:
                     if entry.name.endswith(suffixes) and entry.is_file(follow_symlinks=False):
                         os.unlink(entry.path)
-    py("fspx_unpack.py", dll, "--out", unpacked, "--disasm")
+    py("fspx_unpack.py", dll, "--out", unpacked, "--disasm", "--backend", FSPX_DISASM_BACKEND)
     extra = (["--wave64-emulate"] if emulate else []) + list(fallbacks)
     py("rdna2spirv.py", os.path.join(unpacked, "disasm"), "--out", spirv, "--no-asm", *extra)
     clash = fspx_key_clash(spirv)

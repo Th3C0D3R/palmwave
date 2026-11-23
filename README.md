@@ -46,7 +46,7 @@ Measured on **Ryzen 9 9950X3D / NVIDIA RTX 5080 16 GB / driver 621.14 / Windows 
 | Windows runtime build | 684 / 684 build steps completed |
 | Main-corpus SPIR-V validation | 26,503 / 26,503 passed |
 | Embedded BVH shaders | 52 / 52 translated and SPIR-V valid |
-| Embedded FSPX shaders | 18 / 29 translated and valid; 11 rejected as undecodable fall-through |
+| Embedded FSPX shaders | 29 / 29 translated and SPIR-V valid with the native decoder; GPU semantics not yet verified |
 | GPU pipeline creation | In progress; full-pass result pending |
 | Retail dry-run / initialization | Both exit 0; four DLL initializations succeed |
 | Retail execution | Missing runtime export and TLS-slot-zero blockers fixed; now stops at DirectStorage factory creation before D3D12 |

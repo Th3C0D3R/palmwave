@@ -16,7 +16,7 @@ Source revision: original upstream `dde82f27e994337094afc476ded0b1426f6e87e2`, m
 | Vulkan in the intended offline sandbox | Initialization and enumeration succeed; no rendering test implied |
 | Main-corpus translation/validation | 26,503 / 26,503 translated and SPIR-V valid; 24 min 25 s translation |
 | Embedded BVH programs | 52 / 52 translated and SPIR-V valid |
-| Embedded FSPX programs | 18 / 29 translated and valid; 11 rejected: fall-through into undecodable words |
+| Embedded FSPX programs | 29 / 29 translated and SPIR-V valid with the native decoder; previously 18 / 29 with LLVM |
 | Driver pipeline creation | Running on RTX 5080; final full-corpus counts pending |
 | Retail dry-run | Exit 0; five modules mapped |
 | Retail initialization | Exit 0; four DLL initializations succeed |
@@ -44,3 +44,7 @@ The first full semantic run executed 5,956 tests across 447 files in 245 seconds
 The baseline run ended with Windows status `0xC0000374`. A first-chance debugger revealed an earlier breakpoint after the dynamic `XErrorReport` lookup failed; the final status alone did not establish a heap bug. Commit `eebabab` exposes the existing offline report handler, adapted from upstream PR #6582. Both targeted runtime tests passed, and the next offline run successfully initialized the GDK runtime.
 
 The next first-chance exception is an access violation. Debugging confirms that the executable reads TLS slot zero directly while the loader assigned its TLS index six; the host and guest blocks differ. This matches the documented `/GA` loader issue. The loader correction adapted from upstream PR #4313 passed all seven focused CTests (35.73 seconds), including real `/GA` code, existing/new threads and clone cleanup. The next offline run confirms this access violation is cleared and stops at the first unimplemented `xcrdapi.dll!DStorageGetFactory` call with `PALMWAVE_UNIMPLEMENTED=stop`. No D3D12 call or rendered frame has been observed in these runs. Raw traces, addresses and disassembly remain private.
+
+## FSPX decoder connection
+
+The build now explicitly selects the existing Python RDNA2 decoder for its FSPX step. All 29 programs were rebuilt and passed SPIR-V validation, preserving dispatch metadata and the strict reachable-code gap guard. Main-corpus translation was unchanged. Of the 18 LLVM-baseline outputs, 16 are byte-identical; the other two reflect wave-size and literal-printing differences described in [fspx.md](docs/fspx.md). These are CPU/tool checks; GPU semantics of the 29 programs remain unverified. The focused FSPX/resume checks cover backend selection, dispatch wave size and cache invalidation. Implementation was assisted by Claude Code Opus 5.5 and reviewed in Codex.

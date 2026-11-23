@@ -170,16 +170,16 @@ class FspxStage(unittest.TestCase):
             with open(os.path.join(self.spirv, "index.json"), "w") as f:
                 json.dump(index, f)
 
-    def run_step(self, signature="llvm-mc 23", emulate=False, fallbacks=()):
+    def run_step(self, emulate=False, fallbacks=()):
         self.calls = []
         with mock.patch.object(make_game, "py", self.fake_py), mock.patch.object(make_game, "log", lambda *a: None):
-            make_game.fspx_shaders(self.game, self.work, signature, emulate=emulate, fallbacks=fallbacks)
+            make_game.fspx_shaders(self.game, self.work, emulate=emulate, fallbacks=fallbacks)
         return [tool for tool, _ in self.calls]
 
     def test_runs_once_then_nothing(self):
         self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
         (_, unpack), (_, translate) = self.calls
-        self.assertEqual(unpack, (self.dll, "--out", self.unpacked, "--disasm"))
+        self.assertEqual(unpack, (self.dll, "--out", self.unpacked, "--disasm", "--backend", "python"))
         self.assertEqual(translate, (os.path.join(self.unpacked, "disasm"), "--out", self.spirv, "--no-asm"))
         self.assertTrue(os.path.isfile(os.path.join(self.spirv, "fspx_build.json")))
         self.assertEqual(self.run_step(), [])
@@ -210,10 +210,12 @@ class FspxStage(unittest.TestCase):
         with open(os.path.join(self.spirv, "index.json"), encoding="utf-8") as f:
             self.assertEqual(json.load(f), {})
 
-    def test_failed_disassembly_leaves_no_marker_and_is_retried(self):
+    def test_real_unpack_uses_the_python_decoder_and_a_failure_leaves_no_marker(self):
+        """The real fspx_unpack.py under the stage: an unpack failure stops the step with no marker, and the retry
+        disassembles with the Python decoder while LLVM_MC names a tool that fails every call."""
         mc = os.path.join(self.tmp.name, "fake_mc.py")
         with open(mc, "w", encoding="utf-8", newline="\n") as f:
-            f.write("import sys\nsys.stderr.write('error: disassembly stopped\\n')\nsys.exit(23)\n")
+            f.write("import sys\nsys.stderr.write('error: llvm-mc must not run\\n')\nsys.exit(23)\n")
         real_py = make_game.py
 
         def run_tool(tool, *args):
@@ -223,25 +225,38 @@ class FspxStage(unittest.TestCase):
             else:
                 self.fake_py(tool, *args)
 
+        bad = bytearray(container(program()))                 # the kind-6 entry's size made too large: status 5
+        accc = bytes(bad).find(b"FSPX")
+        for k in range(4):
+            at = accc + 16 + 16 * k
+            if struct.unpack_from("<I", bad, at)[0] == 6:
+                struct.pack_into("<I", bad, at + 8, 0xFFFFFF00)
+        with open(self.dll, "wb") as f:
+            f.write(dll_like(bytes(bad)))
         env = dict(LLVM_MC=f'"{sys.executable}" "{mc}"')
         with mock.patch.dict(os.environ, env), mock.patch.object(make_game, "py", run_tool), \
                 mock.patch.object(make_game, "log", lambda *a: None):
             with self.assertRaises(SystemExit) as error, contextlib.redirect_stderr(io.StringIO()):
-                make_game.fspx_shaders(self.game, self.work, "llvm-mc 23")
+                make_game.fspx_shaders(self.game, self.work)
             self.assertEqual(error.exception.code, 1)
             self.assertEqual([tool for tool, _ in self.calls], ["fspx_unpack.py"])
             self.assertFalse(os.path.exists(os.path.join(self.spirv, "index.json")))
             self.assertFalse(os.path.exists(os.path.join(self.spirv, "fspx_build.json")))
             self.assertEqual(os.listdir(os.path.join(self.unpacked, "disasm")), [])
-            with open(mc, "w", encoding="utf-8", newline="\n") as f:
-                f.write("print('\\ts_endpgm')\n")
+            self.write_dll(program())
             self.calls = []
-            make_game.fspx_shaders(self.game, self.work, "llvm-mc 23")
+            make_game.fspx_shaders(self.game, self.work)
             self.assertEqual([tool for tool, _ in self.calls], ["fspx_unpack.py", "rdna2spirv.py"])
+            listing = os.path.join(self.unpacked, "disasm", os.path.splitext(make_game.FSPX_DLL)[0] + ".s")
+            with open(listing, encoding="utf-8") as f:
+                text = f.read()
+            self.assertIn("python decoder, 0 invalid words", text.splitlines()[0])
+            self.assertIn("s_endpgm", text)
+            self.assertNotIn("llvm-mc", text)
             self.assertTrue(os.path.isfile(os.path.join(self.spirv, "index.json")))
             self.assertTrue(os.path.isfile(os.path.join(self.spirv, "fspx_build.json")))
             self.calls = []
-            make_game.fspx_shaders(self.game, self.work, "llvm-mc 23")
+            make_game.fspx_shaders(self.game, self.work)
             self.assertEqual(self.calls, [])
 
     def test_missing_cached_module_is_rebuilt(self) -> None:
@@ -263,20 +278,51 @@ class FspxStage(unittest.TestCase):
 
     def test_each_input_change_runs_it_again(self):
         self.run_step()
-        self.assertEqual(self.run_step(signature="llvm-mc 24"), ["fspx_unpack.py", "rdna2spirv.py"])
-        self.assertEqual(self.run_step(signature="llvm-mc 24", emulate=True), ["fspx_unpack.py", "rdna2spirv.py"])
+        self.assertEqual(self.run_step(emulate=True), ["fspx_unpack.py", "rdna2spirv.py"])
         self.assertIn("--wave64-emulate", self.calls[1][1])
         flags = ("--no-float-controls",)
-        self.assertEqual(self.run_step(signature="llvm-mc 24", emulate=True, fallbacks=flags),
-                         ["fspx_unpack.py", "rdna2spirv.py"])
+        self.assertEqual(self.run_step(emulate=True, fallbacks=flags), ["fspx_unpack.py", "rdna2spirv.py"])
         self.assertIn("--no-float-controls", self.calls[1][1])
         self.write_dll(program() + b"\0\0\x80\xbf")
-        self.assertEqual(self.run_step(signature="llvm-mc 24", emulate=True, fallbacks=flags),
-                         ["fspx_unpack.py", "rdna2spirv.py"])
-        self.assertEqual(self.run_step(signature="llvm-mc 24", emulate=True, fallbacks=flags), [])
+        self.assertEqual(self.run_step(emulate=True, fallbacks=flags), ["fspx_unpack.py", "rdna2spirv.py"])
+        self.assertEqual(self.run_step(emulate=True, fallbacks=flags), [])
         with mock.patch.object(make_game, "translation_sources_digest", return_value="another translator"):
-            self.assertEqual(self.run_step(signature="llvm-mc 24", emulate=True, fallbacks=flags),
-                             ["fspx_unpack.py", "rdna2spirv.py"])
+            self.assertEqual(self.run_step(emulate=True, fallbacks=flags), ["fspx_unpack.py", "rdna2spirv.py"])
+
+    def test_a_decoder_source_edit_runs_it_again(self):
+        """The Python decoder and its tables are FSPX inputs: an edit to either is a new fingerprint."""
+        self.run_step()
+        real = make_game.file_sha256
+        for name in ("rdna2_decode.py", "rdna2_isa_tables.py"):
+            with self.subTest(name=name):
+                edited = os.path.join(make_game.TOOLS, name)
+                with mock.patch.object(make_game, "file_sha256",
+                                       lambda p: "e" * 64 if p == edited else real(p)):
+                    self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
+                    self.assertEqual(self.run_step(), [])
+                self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])   # back to the real bytes
+
+    def test_fingerprint_covers_the_disassembly_imports(self):
+        """Every tools/ module fspx_unpack.py loads for --disasm, followed through their imports, is fingerprinted, so
+        a new decoder dependency cannot be left out of FSPX_TOOLS unnoticed."""
+        import ast
+        seen, todo = set(), ["fspx_unpack"]
+        while todo:
+            module = todo.pop()
+            if module in seen or not os.path.isfile(os.path.join(make_game.TOOLS, module + ".py")):
+                continue
+            seen.add(module)
+            with open(os.path.join(make_game.TOOLS, module + ".py"), encoding="utf-8") as f:
+                tree = ast.parse(f.read())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    todo += [a.name.split(".")[0] for a in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                    todo.append(node.module.split(".")[0])
+        covered = set(make_game.FSPX_TOOLS) | set(make_game.TRANSLATION_SOURCES)
+        self.assertIn("rdna2_decode", seen)
+        self.assertEqual(sorted(m + ".py" for m in seen if m + ".py" not in covered), [])
+        self.assertIn("gfx10_formats.json", make_game.FSPX_TOOLS)                       # rdna2_decode's data file
 
     def test_same_keys_with_different_modules_fail_the_step(self):
         """Same kind 6 and same kind 0 must translate to one module; otherwise the runtime could not choose."""
@@ -306,13 +352,13 @@ class FspxStage(unittest.TestCase):
             self.fake_py(tool, *args)
         with mock.patch.object(make_game, "py", stop), mock.patch.object(make_game, "log", lambda *a: None):
             with self.assertRaises(KeyboardInterrupt):
-                make_game.fspx_shaders(self.game, self.work, "llvm-mc 24")
+                make_game.fspx_shaders(self.game, self.work, emulate=True)
         self.assertFalse(os.path.exists(os.path.join(self.spirv, "index.json")))
         self.assertFalse(os.path.exists(os.path.join(self.spirv, "fspx_build.json")))
         self.assertFalse(os.path.exists(os.path.join(self.spirv, "upscaler.spv")))   # from the run before
         self.assertTrue(os.path.isfile(os.path.join(self.spirv, "notes.txt")))
-        self.assertEqual(self.run_step(signature="llvm-mc 24"), ["fspx_unpack.py", "rdna2spirv.py"])
-        self.assertEqual(self.run_step(signature="llvm-mc 24"), [])
+        self.assertEqual(self.run_step(emulate=True), ["fspx_unpack.py", "rdna2spirv.py"])
+        self.assertEqual(self.run_step(emulate=True), [])
 
 
 class ShadersStageWithTheDll(unittest.TestCase):
@@ -363,9 +409,10 @@ class ShadersStageWithTheDll(unittest.TestCase):
                 ran.append("translate")
                 touch(spirv, "index.json")
 
-            def stage():
+            def stage(file_sha256=make_game.file_sha256):
                 ran.clear()
                 with mock.patch.object(make_game, "py", fake_py), \
+                        mock.patch.object(make_game, "file_sha256", file_sha256), \
                         mock.patch.object(make_game, "need", lambda *a: None), \
                         mock.patch.object(make_game, "translate", fake_translate), \
                         mock.patch.object(make_game, "llvm_mc_signature", return_value="llvm-mc 23"), \
@@ -379,6 +426,11 @@ class ShadersStageWithTheDll(unittest.TestCase):
             with open(dll, "wb") as f:
                 f.write(dll_like(container(program() + b"\0\0\x80\xbf")))
             self.assertEqual(stage(), ["fspx_unpack.py", "rdna2spirv.py"])
+            # An edit to the Python decoder reruns the FSPX step alone: the corpus is disassembled by llvm-mc.
+            decoder, real = os.path.join(make_game.TOOLS, "rdna2_decode.py"), make_game.file_sha256
+            edited = lambda p: "e" * 64 if p == decoder else real(p)   # noqa: E731
+            self.assertEqual(stage(edited), ["fspx_unpack.py", "rdna2spirv.py"])
+            self.assertEqual(stage(edited), [])
             self.assertTrue(os.path.isfile(os.path.join(work, "shaders", "spirv", "index.json")))
             self.assertTrue(os.path.isfile(os.path.join(work, "shaders", "spirv", "fspx", "index.json")))
 

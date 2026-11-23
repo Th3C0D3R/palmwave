@@ -348,6 +348,126 @@ class Cli(unittest.TestCase):
                 self.assertEqual(json.load(f), [])
 
 
+DOT4_OPSEL = struct.pack("<2I", 0xCC165008, 0x0C0E0501)  # v_dot4_i32_i8 op_sel 2 / op_sel_hi 5 (test_rdna2_decode.py)
+V_CMP_EQ = struct.pack("<I", 0x7D840480)                    # v_cmp_eq_u32_e32 vcc(_lo), 0, v2
+
+
+class CliBackend(unittest.TestCase):
+    """--backend picks shader_disasm's backend for --disasm, and the kind-0 wave size is passed to it."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        # A stand-in llvm-mc that leaves a marker when it runs, so each test sees which backend did the work.
+        self.marker = os.path.join(self.tmp.name, "llvm_mc_ran")
+        self.mc = os.path.join(self.tmp.name, "fake_mc.py")
+        with open(self.mc, "w", encoding="utf-8", newline="\n") as f:
+            f.write("import sys\n"
+                    f"open({self.marker!r}, 'w').close()\n"
+                    "sys.stdin.read()\n"
+                    "print('\\tfake_llvm_mc_line')\n")
+
+    def payload(self, body, wave32=True, state=None):
+        name = os.path.join(self.tmp.name, f"p{len(os.listdir(self.tmp.name))}.fspx")
+        code = prologue() + body + ENDPGM + S_NOP * 2
+        with open(name, "wb") as f:
+            f.write(make_fspx([(0, state if state is not None else kind0(wave32=wave32)), (6, code)]))
+        return name
+
+    def run_cli(self, *argv, llvm_mc=None):
+        env = dict(os.environ, LLVM_MC=llvm_mc or f'"{sys.executable}" "{self.mc}"')
+        return subprocess.run([sys.executable, "-I", TOOL, *argv], capture_output=True, text=True, env=env,
+                              timeout=120)
+
+    def listing(self, out, src):
+        name = os.path.splitext(os.path.basename(src))[0]
+        with open(os.path.join(out, "disasm", name + ".s"), encoding="utf-8") as f:
+            return f.read()
+
+    def test_default_backend_is_still_llvm_mc(self):
+        src = self.payload(V_MOV)
+        out = os.path.join(self.tmp.name, "out")
+        result = self.run_cli(src, "--out", out, "--disasm")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(os.path.exists(self.marker), "the default --disasm did not run llvm-mc")
+        text = self.listing(out, src)
+        self.assertIn("fake_llvm_mc_line", text)
+        # The header keeps its llvm-mc form, so existing listings and build signatures read the same.
+        self.assertEqual(text.splitlines()[0], f"; {os.path.splitext(os.path.basename(src))[0]}  "
+                                               "code 0x24..0x2c (fspx), gfx1030, 0 invalid words")
+
+    def test_explicit_llvm_mc_matches_the_default(self):
+        src = self.payload(V_MOV)
+        a, b = os.path.join(self.tmp.name, "a"), os.path.join(self.tmp.name, "b")
+        self.assertEqual(self.run_cli(src, "--out", a, "--disasm").returncode, 0)
+        self.assertEqual(self.run_cli(src, "--out", b, "--disasm", "--backend", "llvm-mc").returncode, 0)
+        self.assertEqual(self.listing(a, src), self.listing(b, src))
+
+    def test_python_backend_needs_no_llvm_and_decodes_the_dot4_opsel_word(self):
+        src = self.payload(V_MOV + DOT4_OPSEL)
+        out = os.path.join(self.tmp.name, "out")
+        missing = os.path.join(self.tmp.name, "no-such-llvm-mc.exe")
+        result = self.run_cli(src, "--out", out, "--disasm", "--backend", "python", llvm_mc=missing)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(os.path.exists(self.marker))
+        text = self.listing(out, src)
+        header, *body = text.splitlines()
+        self.assertTrue(header.endswith("(fspx), gfx1030, python decoder, 0 invalid words"), header)
+        self.assertNotIn("llvm-mc messages", text)
+        self.assertEqual([line.split()[0] for line in body], ["v_mov_b32_e32", "v_dot4_i32_i8", "s_endpgm"])
+        self.assertIn("op_sel:[0,1,0] op_sel_hi:[1,0,1]", body[1])
+        self.assertIn("encoding: [0x08,0x50,0x16,0xcc,0x01,0x05,0x0e,0x0c]", body[1])
+        with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)[0]["invalid_words"], 0)
+
+    def test_python_backend_gets_the_dispatch_state_wave_size(self):
+        w32 = self.payload(V_CMP_EQ, wave32=True)
+        w64 = self.payload(V_CMP_EQ, wave32=False)
+        out = os.path.join(self.tmp.name, "out")
+        result = self.run_cli(w32, w64, "--out", out, "--disasm", "--backend", "python")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        line32 = self.listing(out, w32).splitlines()[1]
+        line64 = self.listing(out, w64).splitlines()[1]
+        self.assertRegex(line32, r"^\tv_cmp_eq_u32_e32 vcc_lo, 0, v2\b")
+        self.assertRegex(line64, r"^\tv_cmp_eq_u32_e32 vcc, 0, v2\b")
+
+    def test_short_kind0_decodes_as_wave32(self):
+        src = self.payload(V_CMP_EQ, state=struct.pack("<2I", 1, 2))
+        out = os.path.join(self.tmp.name, "out")
+        result = self.run_cli(src, "--out", out, "--disasm", "--backend", "python")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("vcc_lo, 0, v2", self.listing(out, src))
+
+    def test_unknown_backend_is_refused_before_any_output(self):
+        src = self.payload(V_MOV)
+        out = os.path.join(self.tmp.name, "out")
+        result = self.run_cli(src, "--out", out, "--disasm", "--backend", "objdump")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("invalid choice: 'objdump'", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertFalse(os.path.exists(out))
+        self.assertFalse(os.path.exists(self.marker))
+
+    def test_backend_without_disasm_is_refused_before_any_output(self):
+        src = self.payload(V_MOV)
+        out = os.path.join(self.tmp.name, "out")
+        for backend in ("python", "llvm-mc"):
+            with self.subTest(backend=backend):
+                result = self.run_cli(src, "--out", out, "--backend", backend)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("--backend selects the --disasm backend", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertFalse(os.path.exists(out))
+
+    def test_help_names_the_backends(self):
+        result = self.run_cli("--help")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("--backend {llvm-mc,python}", result.stdout)
+
+
 class CliOutCollision(unittest.TestCase):
     """--out must never be the folder the tool reads, including through another spelling of its name."""
 

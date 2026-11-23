@@ -142,6 +142,13 @@ program whose kind 0 is too short for word 4 keeps the code heuristic.
   game) or `gfx1100`. Measured on one 10,432-byte program, prologue included: 13 invalid words with the first group,
   1,276 with `gfx1010` and `gfx1013`, 1,290 with `gfx1100`.
   - `fspx_unpack.py --disasm` defaults to `gfx1030`.
+  - `--backend {llvm-mc,python}` picks the disassembler for `--disasm`, with `tools/shader_disasm.py`'s names.
+    `llvm-mc` is the CLI's default; `make_game.py`'s FSPX step passes `python` (see "Build and run-time lookup").
+    `python` uses `tools/rdna2_decode.py`, which
+    needs no LLVM and decodes the `op_sel` 2 VOP3P words below. Each program is decoded with its kind-0 wave size,
+    or as wave32 when kind 0 is too short for word 4. Only the `python` decoder prints that size (`vcc_lo` or
+    `vcc`). `llvm-mc` is run as before, with its own wave32 default. A `python` listing's header line adds
+    `python decoder` after the target. `--backend` without `--disasm` is refused.
 - **What llvm-mc still rejects.** With `gfx1030`, 21 of the 29 decode with no invalid word. The other 89 words, in 8
   programs, are all VOP3P opcode 0x16 with `op_sel` 2 and `op_sel_hi` 5. That is the opcode of the 1,458
   `v_dot4_i32_i8` that `llvm-mc` does decode, all of which have `op_sel` 0.
@@ -165,8 +172,8 @@ program whose kind 0 is too short for word 4 keeps the code heuristic.
 
 ## Build and run-time lookup
 
-**Build.** `make_game.py`'s `shaders` stage, after the game's own shaders, runs `tools/fspx_unpack.py --disasm` on
-the package's `amd_fidelityfx_upscaler_xbox.dll` into `<work>/shaders/fspx/` and `tools/rdna2spirv.py` on that
+**Build.** `make_game.py`'s `shaders` stage, after the game's own shaders, runs `tools/fspx_unpack.py --disasm
+--backend python` on the package's `amd_fidelityfx_upscaler_xbox.dll` into `<work>/shaders/fspx/` and `tools/rdna2spirv.py` on that
 disassembly into `<work>/shaders/spirv/fspx/`, with the same `--wave64-emulate` and fallback flags. Each index entry
 of a program without an FSSM blob gets two keys (`tools/shader_meta.py`):
 
@@ -179,9 +186,19 @@ same code key and the same state key must have identical modules; when they do n
 programs, and leaves no `index.json` for the runtime to load. In the 1.0.2.1 DLL the 29 kind-6 programs are 29
 different byte strings, so every code key has one entry (measured).
 
-The step is redone as a whole when the DLL, the unpacking or translating tools, `llvm-mc`, the wave64 mode or the
-flags change (`fspx_build.json`, written last); it never makes the game's shaders translate again. A package without
-the DLL skips it.
+**Disassembler.** The step selects the pure-Python decoder explicitly (`FSPX_DISASM_BACKEND`); the standalone CLI
+still defaults to `llvm-mc`, and the game's own shaders are still disassembled by `llvm-mc` through
+`tools/shader_disasm.py`. The reason is the `op_sel` 2 VOP3P words above: `llvm-mc` cannot decode them, and
+the fall-through guard (see "Translation status") refuses the programs that reach them. The guard is unchanged; the
+Python listings simply have no undecodable words for it to stop at. The step needs no `llvm-mc`.
+
+The step is redone as a whole when the DLL, the disassembler backend, the unpacking, decoding or translating sources,
+the wave64 mode or the flags change (`fspx_build.json`, written last). The decoding sources are
+`tools/rdna2_decode.py`, `tools/rdna2_isa_tables.py`, `tools/gfx10_formats.json` and the modules
+`fspx_unpack.py` and `shader_disasm.py` import (`FSPX_TOOLS`). The game's shaders do not depend on the decoder, so a
+decoder edit redoes only this step. The `llvm-mc` version is no longer an input; a `fspx_build.json` written before
+this change still names it, so the step runs once more. It never makes the game's shaders translate again. A package
+without the DLL skips it.
 
 **Run time.** `ShaderLibrary::load(dir)` (`runtime/src/shader_library.h`) reads `<dir>/index.json` and then, when it
 is there, `<dir>/fspx/index.json`, whose entries are named `fspx/<name>`. A missing or unreadable `fspx/index.json`
@@ -243,6 +260,19 @@ it is now refused (`fall-through into undecodable words`): programs 04, 05, 06, 
 (found by @aslan2142). Recount by @CuteBooty with LLVM 23.1.5 (gfx1030 listings, `spirv-val --target-env vulkan1.2`):
 26 of 29 translated and passed before the change, **20 of 29** after it; the 20 kept give byte-identical SPIR-V, and
 8 of the 9 refused stop at a fall-through into undecodable words.
+
+**With the Python decoder** (the build step's backend), measured locally on the 29 programs of package 1.0.2.1, CPU
+only, on a machine with an NVIDIA RTX 5080 (aggregate counts only; no listings or modules recorded):
+
+- **29 of 29** disassemble with no invalid word, and all 29 translate and pass `spirv-val` (24 wave32, 5 wave64 with
+  `--wave64-emulate`). The build step's `fspx_unpack.py --backend python` output matched independently produced
+  Python-decoder outputs for all 29.
+- **The `llvm-mc` baseline** translated 18 of 29 on the same machine. Of those 18, 16 give byte-identical SPIR-V with
+  either decoder. The 2 differences are in what `llvm-mc` prints: in one wave64 program it prints a 32-bit `vcc_lo`/SGPR
+  destination although kind 0 says wave64, and in one program LLVM 21 prints only the low 16 bits of a `v_fma_mix*`
+  literal, where the Python decoder keeps all 32 bits (design.md, "Printed encodings").
+- **Not established:** that these modules are correct on a GPU. No GPU test has run any of the 29 yet; passing
+  `spirv-val` and matching across decoders show neither GPU semantics nor that a frame renders.
 
 ## Unknown
 
