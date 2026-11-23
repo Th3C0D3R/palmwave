@@ -341,7 +341,8 @@ that size. Which threads the game creates pipelines on is not known without its 
 
 `make_game.py` runs the pipelines stage in fresh checker processes over at most **500 index entries** each, on
 Windows and POSIX. The ranges partition the same name-sorted index as `--start` / `--count`, including the final
-short range. Each finished process saves to the same `pipeline_cache.bin`, and the next loads that checkpoint.
+short range. Each finished process saves to the same `pipeline_cache.bin` (`pipeline_cache_bvh.bin` with
+`--pipeline-scope bvh`, below), and the next loads that checkpoint.
 This bounds each invocation to a range that can be split further if concurrent heavy compiles exceed available
 memory. A work folder with at most 500 entries keeps the single invocation. An older checker without the range
 options keeps the older invocation; rebuild the runtime to get batching.
@@ -370,6 +371,53 @@ cannot complete even alone fails with a diagnostic rather than being counted as 
 bounded coverage and cache checkpoints, collective memory-crash recovery, a genuinely crashing module, validation
 failures, interruptions, setup failures, inconclusive probes and compatibility with older checkers. It needs no
 game files or GPU.
+
+## BVH builder scope (`--pipeline-scope`)
+
+`--pipeline-scope` picks what the `pipelines` stage checks. `main` (default) is unchanged: the game's translated
+shaders in `<work>/shaders/spirv/index.json`, with the cache and reports named as before. `bvh` checks only the
+`XboxBvhBuilder.dll` programs that the shaders stage translates into `<work>/shaders/spirv/bvh/index.json`. It does
+not read or need the main index and does not fall back to it. The checker gets that folder as its `<spirv dir>`,
+so only the entries in that index are checked. The scope does not generate shaders. Run the shaders stage first,
+on a package that has the DLL.
+
+```powershell
+python -I make_game.py --game "<package>" --work "<work>" --out "<out>" --runtime-build "<runtime-build>" --stages pipelines --pipeline-scope bvh --jobs 1 --no-tui
+```
+
+Both scopes write to `--out`, with different file names:
+
+| Scope | Cache | In-flight report | Crash list |
+|---|---|---|---|
+| `main` | `pipeline_cache.bin` | `pipeline_inflight.txt` | `pipeline_crashes.txt` |
+| `bvh` | `pipeline_cache_bvh.bin` | `pipeline_inflight_bvh.txt` | `pipeline_crashes_bvh.txt` |
+
+A run reads only its own scope's existing cache and passes it to the checker. It clears only its own in-flight
+report and crash list at the start, as the main scope always has. It never deletes or overwrites the other scope's
+files. Batching, crash probes, retries and exit codes are the same as in the main scope (above). A checker failure
+fails the stage. If the BVH index is missing, unreadable, malformed, not a JSON object or empty, the stage stops
+before it starts the checker. When `pipelines` is selected without `shaders`, preflight checks the same index.
+
+The stage has no completion stamp in either scope. Each run starts the checker again and resumes from the selected
+cache. The overall percent shown during the build comes from in-memory progress only. A completed run in one scope
+does not mean the other scope is done.
+
+`--jobs 1` is a bounded starting point for a diagnostic run, for example on an RTX 5080. It does not guarantee an
+upper limit on RAM or time: one large module can still use a lot of memory. A successful run means the driver
+accepted the generated entries in the BVH index. It does not mean the GPU behaves correctly, it does not cover the
+full corpus, and it does not show that a frame renders.
+
+**Using the BVH cache.** The runtime loads only `pipeline_cache.bin` beside its executable
+(`pipeline_cache_path` in `runtime/shims/d3d12_vulkan_device.cpp`). This option does not change which cache the
+runtime selects. To use the BVH cache in a diagnostic launch, set up a separate launch directory and copy
+`pipeline_cache_bvh.bin` there as `pipeline_cache.bin`. Keep the main cache in `<out>`. If that launch directory
+already has a `pipeline_cache.bin`, save a copy before replacing it. `make_game.py` never copies, renames or replaces
+either cache. If the header doesn't match the device, the runtime starts with an empty cache, as with the main
+cache.
+
+The original Palmwave implementation was written by Claude Code (Claude Opus 5.5), then reviewed and tested by
+OpenAI Codex under Moon AI. Validation used synthetic indexes and mocked checker processes only; no GPU or
+application package was used for this change. See `tests/test_make_game_pipeline_scope.py` for the scope regressions.
 
 ## Crash isolation (`--isolate`)
 

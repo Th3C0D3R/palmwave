@@ -28,8 +28,9 @@ Stages (each skips work that is already done, so a stopped build continues where
               clang-cl and an xwin SDK (docs/testing.md) and palmwave.sh starts it with Wine; --runtime-build DIR
               takes a Windows build of runtime/ instead (the runtime-windows artifact of the Runtime workflow)
     pipelines create every translated shader on your GPU's driver as a pipeline, report anything the driver
-              rejects or that has to be skipped, and save the pipeline cache next to the port (the runtime doesn't
-              load that cache yet)
+              rejects or that has to be skipped, and save the pipeline cache next to the port (the runtime loads
+              pipeline_cache.bin beside its executable). --pipeline-scope bvh checks only the translated
+              XboxBvhBuilder.dll programs, into pipeline_cache_bvh.bin (docs/pipeline_check.md)
 
 shaders, assets and runtime do not depend on each other and run together after check. pipelines starts once the
 translated shaders are ready and, when this run includes runtime, that stage has finished rebuilding
@@ -822,7 +823,7 @@ def pipeline_check_prerequisite(runtime_selected: bool = False) -> str:
 
 def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | None = None, *,
               emulate: bool = False, keep_emulated: bool = False,
-              fallbacks: tuple[str, ...] = (), jobs: int = 1) -> None:
+              fallbacks: tuple[str, ...] = (), jobs: int = 1, pipeline_scope: str = "main") -> None:
     """Find every missing prerequisite before a long build starts, and list them all at once."""
     if "runtime" in stages and runtime_build:
         absent = [n for n in RUNTIME_FILES if not os.path.isfile(os.path.join(runtime_build, n))]
@@ -866,7 +867,7 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
     if missing:
         fail("Install these first, then run the build again:\n  - " + "\n  - ".join(dict.fromkeys(missing)))
     if "pipelines" in stages and "shaders" not in stages:
-        require_translated_shaders(work)
+        require_translated_shaders(work, pipeline_scope)
     need = {s: MIN_FREE_GB.get(s, 0) for s in stages}
     # A rerun that only refreshes the shaders shouldn't need room for a second copy of exports already on disk.
     # --wav still counts it: the WAV decode writes several times the Ogg Opus size and has no marker.
@@ -2342,7 +2343,58 @@ def pipeline_check_exe(runtime_build: str | None = None) -> str | None:
     return next((p for p in found if os.path.isfile(p) and (windows or os.access(p, os.X_OK))), None)
 
 
-def require_translated_shaders(work: str) -> str:
+# What the pipelines stage checks (--pipeline-scope). main: the game's shaders.rpf index, as always. bvh: only the
+# XboxBvhBuilder.dll programs the shaders stage translates into <work>/shaders/spirv/bvh (bvh_shaders). Each scope
+# has its own cache and scratch reports in --out, so one scope never reuses, deletes or overwrites the other's.
+# The stage keeps no completion stamp for either scope: every run starts the checker again and resumes from the
+# selected cache, and StageBoard's completion is in-memory progress only. A finished run of one scope says nothing
+# about the other.
+PIPELINE_SCOPES = ("main", "bvh")
+
+
+def pipeline_scope_files(out: str, scope: str = "main") -> "tuple[str, str, str]":
+    """The cache, in-flight report and crash list of a scope in --out. main keeps the names the runtime and earlier
+    builds use; any other scope adds _<scope> before the extension."""
+    if scope not in PIPELINE_SCOPES:
+        raise ValueError(f"unknown pipeline scope {scope!r}")
+    suffix = "" if scope == "main" else f"_{scope}"
+    return (os.path.join(out, f"pipeline_cache{suffix}.bin"), os.path.join(out, f"pipeline_inflight{suffix}.txt"),
+            os.path.join(out, f"pipeline_crashes{suffix}.txt"))
+
+
+def pipeline_scope_kwargs(scope: str) -> dict:
+    """The keyword a non-default scope adds to the preflight() and pipelines() calls; main calls stay as before."""
+    return {} if scope == "main" else {"pipeline_scope": scope}
+
+
+def require_bvh_shaders(work: str) -> str:
+    """The translated BVH builder folder, after a strict check of its own index. The main index is never read or
+    used in its place: a missing, unreadable, malformed, non-object or empty BVH index stops before the checker."""
+    spirv = os.path.join(work, "shaders", "spirv", "bvh")
+    index = os.path.join(spirv, "index.json")
+    if not os.path.isfile(index):
+        fail(f"--pipeline-scope bvh: no translated {BVH_DLL} programs at {index}. Run the shaders stage on a "
+             f"package that has {BVH_DLL} first; the main shader index is not checked in its place.")
+    try:
+        with open(index, encoding="utf-8") as f:
+            translated = json.load(f)
+    except (OSError, ValueError) as e:
+        fail(f"--pipeline-scope bvh: the {BVH_DLL} index {index} is unreadable "
+             f"({getattr(e, 'strerror', None) or e}): run the shaders stage again.")
+    if not isinstance(translated, dict):
+        fail(f"--pipeline-scope bvh: the {BVH_DLL} index {index} must contain a JSON object of translated modules: "
+             "run the shaders stage again.")
+    if not translated:
+        fail(f"--pipeline-scope bvh: the {BVH_DLL} index {index} is empty, so there is nothing to check. "
+             "Run the shaders stage again.")
+    return spirv
+
+
+def require_translated_shaders(work: str, scope: str = "main") -> str:
+    if scope not in PIPELINE_SCOPES:
+        raise ValueError(f"unknown pipeline scope {scope!r}")
+    if scope == "bvh":
+        return require_bvh_shaders(work)
     spirv = os.path.join(work, "shaders", "spirv")
     index = os.path.join(spirv, "index.json")
     if not os.path.isfile(index):
@@ -2359,7 +2411,9 @@ def require_translated_shaders(work: str) -> str:
     return spirv
 
 
-def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: str | None = None) -> None:
+def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: str | None = None,
+              pipeline_scope: str = "main") -> None:
+    cache, inflight, skip = pipeline_scope_files(out, pipeline_scope)   # also refuses an unknown scope
     exe = pipeline_check_exe(runtime_build)
     if not exe and os.name == "nt":
         fail("vk_pipeline_check.exe wasn't built: run the runtime stage with the Vulkan SDK installed.")
@@ -2367,12 +2421,14 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
         fail("vk_pipeline_check wasn't built. With CMake 3.24+, a C++20 compiler and the Vulkan headers and "
              "loader installed, run: cmake -S runtime -B runtime/build/linux && "
              "cmake --build runtime/build/linux --parallel")
-    spirv = require_translated_shaders(work)
-    log("pipelines: creating every shader module and pipeline (compute and graphics) on this GPU")
+    spirv = require_translated_shaders(work, pipeline_scope)
+    if pipeline_scope == "bvh":
+        log(f"pipelines: creating every module and pipeline in the {BVH_DLL} index on this GPU, into "
+            f"{os.path.basename(cache)}")
+    else:
+        log("pipelines: creating every shader module and pipeline (compute and graphics) on this GPU")
     os.makedirs(out, exist_ok=True)
-    cache = os.path.join(out, "pipeline_cache.bin")
-    inflight = os.path.join(out, "pipeline_inflight.txt")
-    skip = os.path.join(out, "pipeline_crashes.txt")
+    # This scope's scratch reports only: its cache is the checker's input; the other scope's files are untouched.
     drop(inflight, skip)   # every module gets a fresh chance on each run (a new translator may have fixed it)
     # --jobs: make_game.py's own; without it vk_pipeline_check uses half the hardware threads whatever was asked
     base = [exe, spirv, cache, *(["--jobs", str(jobs)] if jobs else [])]
@@ -2552,9 +2608,10 @@ def _invoke_stage(name: str, fn) -> None:
 
 def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, wav: bool, jobs: int,
                      runtime_build: str | None, emulate: bool, keep_emulated: bool,
-                     fallbacks: tuple[str, ...], overlap: bool = True) -> None:
+                     fallbacks: tuple[str, ...], overlap: bool = True, pipeline_scope: str = "main") -> None:
     """Run build stages after check. With overlap=True (default), shaders/assets/runtime share the machine and
-    pipelines starts once shaders (and a selected runtime rebuild) are ready. With overlap=False, stages run in order."""
+    pipelines starts once shaders (and a selected runtime rebuild) are ready. With overlap=False, stages run in order.
+    Both run the pipelines stage through fn_pipelines with the same pipeline_scope."""
     cpu_heavy = [s for s in ("shaders", "assets") if s in stages]
     split = max(1, jobs // len(cpu_heavy)) if (overlap and len(cpu_heavy) > 1) else jobs
     dump_jobs = split if (overlap and len(cpu_heavy) > 1 and "assets" in stages) else None
@@ -2571,7 +2628,7 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
         runtime(game, out, v, runtime_build, jobs, work=work)
 
     def fn_pipelines():
-        pipelines(work, out, jobs, runtime_build=runtime_build)
+        pipelines(work, out, jobs, runtime_build=runtime_build, **pipeline_scope_kwargs(pipeline_scope))
 
     builders = {
         "shaders": fn_shaders,
@@ -2701,6 +2758,10 @@ def main() -> int:
     ap.add_argument("--no-tui", action="store_true",
                     help="plain console logs (default when stdout is not a TTY); skip the Palmwave setup screen "
                          "and per-stage log view")
+    ap.add_argument("--pipeline-scope", choices=PIPELINE_SCOPES, default="main",
+                    help="what the pipelines stage checks: main (default) the game's translated shaders into "
+                         "pipeline_cache.bin; bvh only the translated XboxBvhBuilder.dll programs into "
+                         "pipeline_cache_bvh.bin, which the runtime does not load by itself (docs/pipeline_check.md)")
     a = ap.parse_args()
     stages = STAGES
     if a.stages is not None:
@@ -2809,7 +2870,7 @@ def main() -> int:
         a.jobs = palmwave_tui.clamp_jobs(cfg.jobs)
         overlap = cfg.overlap
     preflight(stages, work, a.wav, runtime_build, emulate=emulate, keep_emulated=keep_emulated,
-              fallbacks=fallbacks, jobs=a.jobs)
+              fallbacks=fallbacks, jobs=a.jobs, **pipeline_scope_kwargs(a.pipeline_scope))
     if not a.out and icloud_documents():
         for note in icloud_default_notes():
             log(note)
@@ -2822,12 +2883,12 @@ def main() -> int:
             tui_board.set_summary(f"build 0% · {', '.join(build_stages)}")
             run_build_stages(stages, game=game, work=work, out=out, v=v, wav=a.wav, jobs=a.jobs,
                              runtime_build=runtime_build, emulate=emulate, keep_emulated=keep_emulated,
-                             fallbacks=fallbacks, overlap=overlap)
+                             fallbacks=fallbacks, overlap=overlap, pipeline_scope=a.pipeline_scope)
             tui_board.set_summary(f"finished in {(time.time() - t0) / 60:.0f} min")
     else:
         run_build_stages(stages, game=game, work=work, out=out, v=v, wav=a.wav, jobs=a.jobs,
                          runtime_build=runtime_build, emulate=emulate, keep_emulated=keep_emulated,
-                         fallbacks=fallbacks, overlap=overlap)
+                         fallbacks=fallbacks, overlap=overlap, pipeline_scope=a.pipeline_scope)
     log(f"finished in {(time.time() - t0) / 60:.0f} min")
     return 0
 
