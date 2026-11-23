@@ -19,9 +19,9 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-blue" alt="GPL-3.0 license"></a>
 </p>
 
-Palmwave is an experimental open-source Xbox Series compatibility layer and shader translation toolchain for PC, developed under **[Moon AI](https://realmoon.ai), the AI platform created by Stellarr Studio**. Its first target is a **verified frame rendered by the Xbox Series build of Xbox Series title on Windows**.
+Palmwave is an experimental open-source Xbox Series compatibility layer and shader translation toolchain for PC, developed under **[Moon AI](https://realmoon.ai), the AI platform created by Stellarr Studio**. Its first target is a **verified frame rendered by an Xbox Series executable on Windows**.
 
-**Xbox Series title's Xbox Series executable starts on PC and reaches Vulkan graphics initialization on NVIDIA RTX 5080. It then stops during startup. No menu or rendered game frame has been observed.**
+**The tested Xbox Series executable starts on PC and reaches Vulkan graphics initialization on NVIDIA RTX 5080. It then stops during startup. No menu or rendered game frame has been observed.**
 
 **Local compatibility milestone: graphics device reached.** The default run creates five queues, five fences, an allocator and the first Xbox command list, then stops at unimplemented list methods 132 and 131. With the explicitly opt-in synchronization and host-memory experiments, the run reaches **581 command lists created and closed, a real 174 MiB buffer import and the first descriptor heap**. It then stops at the title's assertion on the heap's CPU descriptor address. This experimental result does not establish a stable launch or a first frame. Measurements and limitations are recorded in [STATUS.md](STATUS.md); a successful presentation call alone would not establish a rendered image.
 
