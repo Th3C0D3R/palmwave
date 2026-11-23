@@ -6,6 +6,7 @@
 // whatever block sits in slot 0. loader_tls_index0_test calls the exports on threads of its own; under
 // `palmwave --run` (run_tiny_tls_ga) main() checks the value on the game thread and on a second thread and returns 0
 // only when both read the template value 42.
+#include <windows.h>
 #include <cstdio>
 #include <thread>
 
@@ -13,7 +14,18 @@ extern "C" unsigned long _tls_index;
 
 namespace {
 thread_local int t_value = 42;
+DWORD g_detach_thread = 0;
+int(__cdecl* g_detach_read)() = nullptr;
+int* g_detach_result = nullptr;
+
+void NTAPI read_dll_tls_on_detach(PVOID, DWORD reason, PVOID) {
+    if (reason == DLL_THREAD_DETACH && GetCurrentThreadId() == g_detach_thread && g_detach_read && g_detach_result)
+        *g_detach_result = g_detach_read();
 }
+}
+
+#pragma section(".CRT$XLB", read)
+__declspec(allocate(".CRT$XLB")) PIMAGE_TLS_CALLBACK g_detach_callback = read_dll_tls_on_detach;
 
 extern "C" __declspec(dllexport) __declspec(noinline) int __cdecl tiny_ga_get() { return t_value; }
 extern "C" __declspec(dllexport) __declspec(noinline) void __cdecl tiny_ga_set(int value) { t_value = value; }
@@ -21,6 +33,11 @@ extern "C" __declspec(dllexport) __declspec(noinline) void __cdecl tiny_ga_set(i
 extern "C" __declspec(dllexport) __declspec(noinline) int* __cdecl tiny_ga_address() { return &t_value; }
 extern "C" __declspec(dllexport) unsigned long __cdecl tiny_ga_tls_index() { return _tls_index; }
 extern "C" __declspec(dllexport) unsigned long* __cdecl tiny_ga_tls_index_address() { return &_tls_index; }
+extern "C" __declspec(dllexport) void __cdecl tiny_ga_watch_detach(DWORD thread, int(__cdecl* read)(), int* result) {
+    g_detach_thread = thread;
+    g_detach_read = read;
+    g_detach_result = result;
+}
 
 int main() {
     const int on_main = tiny_ga_get();

@@ -979,10 +979,9 @@ void forget_ended_thread_id() {
     }
 }
 
-// DLL_THREAD_DETACH, before this thread's own records are released: the blocks load() gave it come out, newest first,
-// after the module's TLS callbacks have seen the event (Windows sends DLL_THREAD_DETACH to a DLL for a thread that
-// was running before it was loaded, too).
-void release_existing_blocks_of_this_thread() {
+// Windows sends DLL_THREAD_DETACH to a DLL for a thread that was running before it was loaded, too. Keep these
+// blocks installed until this thread's other modules have also run their callbacks: they can still read this TLS.
+void run_existing_thread_detach_callbacks() {
     const DWORD self = GetCurrentThreadId();
     std::vector<ExistingThreadBlock> mine;
     {
@@ -1001,6 +1000,10 @@ void release_existing_blocks_of_this_thread() {
             std::fprintf(stderr, "[rt] loader: thread detach: %s\n", e.what());
         }
     }
+}
+
+void release_existing_blocks_of_this_thread() {
+    const DWORD self = GetCurrentThreadId();
     ExistingThreadsLock lock;
     ExistingThreads& state = existing_threads();
     for (auto it = state.blocks.end(); it != state.blocks.begin();) {
@@ -1022,7 +1025,7 @@ void release_existing_blocks_of_this_thread() {
 // every module's block before the first DllMain of a new thread, and runs an EXE's TLS callbacks after every DllMain,
 // for attach and for detach (measured on Windows 11 26300). So attach installs all copies first and then runs the
 // callbacks, the DLL slots in order and the executable's last; detach runs the DLL slots in reverse and then the
-// executable's slot, each releasing its copy after its callbacks.
+// executable's slot. Every mapped block stays installed until all detach callbacks have finished.
 void __cdecl on_host_thread_event(DWORD reason) {
     SharedTlsLock lock;
     // The try/catch is per slot: a throw from one module's install or callbacks must not take the thread events
@@ -1057,10 +1060,8 @@ void __cdecl on_host_thread_event(DWORD reason) {
             }
         }
     } else if (reason == DLL_THREAD_DETACH) {
-        // The blocks load() gave this thread while it was already running come out first (they can sit on top of
-        // an older module's block in the same slot).
         try {
-            release_existing_blocks_of_this_thread();
+            run_existing_thread_detach_callbacks();
         } catch (const std::exception& e) {
             std::fprintf(stderr, "[rt] loader: thread detach: %s\n", e.what());
         }
@@ -1075,12 +1076,24 @@ void __cdecl on_host_thread_event(DWORD reason) {
                     std::fprintf(stderr, "[rt] loader: thread detach, slot %zu (%s): %s\n", i, m->name.c_str(),
                                  e.what());
                 }
-                // Released even when the callbacks threw: a leaked block would be handed to the OS loader as the
-                // helper's own TLS block and freed with it at thread exit.
-                uninstall_thread_block(*m);
-            } else {
-                release_thread_slot(i);  // installed by a module whose Loader is gone (or nothing to do)
             }
+        }
+        // The EXE's callback can call a mapped DLL and read its thread-local state. Only now restore/free any
+        // blocks, including those installed by load() on an existing thread, which can cover older slot records.
+        // Cleanup still runs after a callback throws: Windows must receive the helper's original block back.
+        try {
+            release_existing_blocks_of_this_thread();
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[rt] loader: thread detach: %s\n", e.what());
+        }
+        for (size_t step = 0; step < kTlsSlotCount; ++step) {
+            const size_t i = step < kMaxMappedTlsModules ? kMaxMappedTlsModules - 1 - step : kMainImageSlot;
+            Module* m = g_tls_slot_owners[i].load();
+            if (m && g_thread_tls_slots[i].module == m &&
+                g_thread_tls_slots[i].generation == m->tls_generation)
+                uninstall_thread_block(*m);
+            else
+                release_thread_slot(i);  // installed by a module whose Loader is gone (or nothing to do)
         }
     }
 }

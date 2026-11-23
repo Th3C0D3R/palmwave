@@ -319,7 +319,7 @@ void test_first_run(const fs::path& exe, const fs::path& dll, EarlyThread& early
         check(early.slot0_restored, "uninstall_tls_for_thread leaves that thread's copy in slot 0");
 
         loader.initialise();
-        check(m.initialised, "initialise() runs the executable's TLS callbacks (it has none)");
+        check(m.initialised, "initialise() runs the executable's TLS callbacks");
         check(run_new_thread(&ga).ga == 42, "after initialise() a new thread still reads 42");
 
         rt::Module& d = loader.load(dll);
@@ -367,6 +367,48 @@ void test_second_run(const fs::path& exe) {
     fs::remove(copy, ec);
 }
 
+void test_detach_reads_dll_tls(const fs::path& exe, const fs::path& dll) {
+    std::printf("\n-- the executable's detach callback reads DLL TLS --\n");
+    for (bool dll_loaded_after_thread : {false, true}) {
+        rt::Loader loader(exe.parent_path());
+        auto& executable = loader.load(exe);
+        loader.initialise();
+        const auto watch = find_export<void(__cdecl*)(DWORD, int(__cdecl*)(), int*)>(executable, "tiny_ga_watch_detach");
+        const HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        const HANDLE go = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!ready || !go) throw std::runtime_error("cannot create the detach test events");
+        void(__cdecl* dll_set)(int) = nullptr;
+        std::thread worker;
+        const auto start = [&] {
+            worker = std::thread([&] {
+                SetEvent(ready);
+                WaitForSingleObject(go, INFINITE);
+                dll_set(73);
+            });
+            WaitForSingleObject(ready, INFINITE);
+        };
+        // Exercise both records: DLL TLS installed at thread attach, and a DLL loaded onto an existing thread
+        // whose EXE TLS is already in g_thread_tls_slots.
+        if (dll_loaded_after_thread) start();
+        auto& library = loader.load(dll);
+        loader.initialise();
+        const auto dll_get = find_export<int(__cdecl*)()>(library, "tiny_tls_get");
+        dll_set = find_export<void(__cdecl*)(int)>(library, "tiny_tls_set");
+        if (!dll_loaded_after_thread) start();
+        int detached_value = -1;
+        watch(GetThreadId(worker.native_handle()), dll_get, &detached_value);
+        SetEvent(go);
+        worker.join();
+        watch(0, nullptr, nullptr);
+        CloseHandle(go);
+        CloseHandle(ready);
+        check(detached_value == 73, dll_loaded_after_thread
+                  ? "EXE detach reads the DLL TLS installed on an existing thread"
+                  : "EXE detach reads the DLL TLS installed at thread attach");
+        check(dll_get() == 7 && host_value() == 555, "detach preserves the loading thread's DLL and host TLS");
+    }
+}
+
 void test_home_template() {
     std::printf("\n-- the home clone --\n");
     const HMODULE home = home_module();
@@ -404,6 +446,7 @@ __declspec(noinline) void after_reservation(bool reserved, const std::string& wh
     test_home_template();
     test_first_run(exe, dll, early, own_block);
     test_second_run(exe);
+    test_detach_reads_dll_tls(exe, dll);
 }
 
 __declspec(noinline) int scenario_runs(const fs::path& exe, const fs::path& dll) {
