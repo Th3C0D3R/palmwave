@@ -20,7 +20,7 @@ Source revision: original upstream `dde82f27e994337094afc476ded0b1426f6e87e2`, m
 | Driver pipeline creation | Running on RTX 5080; final full-corpus counts pending |
 | Retail dry-run | Exit 0; five modules mapped |
 | Retail initialization | Exit 0; four DLL initializations succeed |
-| Retail execution | Vulkan device, five queues, five fences and an allocator created; next stop is the console command-list interface |
+| Retail execution | Vulkan device, five queues, five fences, an allocator and the first Xbox command list created; recording stops at methods 132 and 131 |
 | First rendered frame | Not verified |
 
 The scanner candidate is not counted as a shader translation failure. Generated data and full logs are private and stored outside the authoring repository. No game assets have been added to Git.
@@ -64,3 +64,8 @@ The Xbox-only queue route now accepts the four observed option values as ordinar
 ## NVIDIA memory capabilities
 
 A Vulkan SDK 1.4.363.0 capability query identifies the RTX 5080 as adapter 0 (vendor `10de`, device `2c02`, driver 621.14), separately from the integrated AMD adapter. It exposes `VK_EXT_external_memory_host` revision 1 with 4096-byte minimum host-pointer alignment, sparse binding, sparse buffer residency and sparse aliasing. The reported sparse address space and maximum buffer size are 1 TiB. Mesh and task shaders are supported, with 128 maximum mesh workgroup invocations. These are device capability queries, not proof of successful memory import, shader correctness or a rendered game frame.
+## Console command list reached
+
+The console slot-73 route now returns a console-shaped list with the measured full interface ID; PC slot 12 retains its PC layout. Unknown recording methods mark the list incomplete, make Close fail and prevent submission. This replaces the upstream candidate's silent return from unimplemented methods. The upload arena uses mapped GPU resources rather than host-only pointers, but its contents and address translation have not yet been exercised by the retail probe. Arena storage remains live until device destruction; reclamation and general shader address translation remain open.
+
+Three focused proxy CTests pass in 0.37 seconds (CPU/WARP), and queue/allocator CTests pass in 14.93 seconds. The new offline RTX 5080 run reports 19 startup events, four successful DLL initializations, no unimplemented import, and 17 graphics trace events: 14 successful and three unsupported. The first unsupported event is list method 132, followed by 131 and the refused Close. Their semantic contracts remain unverified; names or no-op handlers in other repositories do not establish their effects. No Draw or Present is observed. The debugger stops on the subsequent guest assertion; its own exit code 0 is not a successful guest exit or a first frame.

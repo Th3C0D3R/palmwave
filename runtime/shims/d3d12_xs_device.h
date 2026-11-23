@@ -16,8 +16,11 @@
 //   slot 48   CreateCommandQueueX(desc, riid, out) -> the same queue proxy as slot 8. The Xbox desc's first fields are
 //             D3D12_COMMAND_QUEUE_DESC's (public HLE).
 //   slot 73   CreateCommandListX(desc, allocator, initialState, riid, out) -> PC CreateCommandList(0, type, allocator,
-//             initialState, riid, out). The type is the first word of the Xbox desc; there is no node-mask argument
-//             in the console call (public HLE; the PC six-argument form differs).
+//             initialState, IID_ID3D12GraphicsCommandList, &list), handed back behind a console-shaped list proxy
+//             (below). The type is the first word of the Xbox desc; there is no node-mask argument in the console
+//             call (public HLE; the PC six-argument form differs). A type other than direct, bundle or compute
+//             (copy, the derived DMA type 6, anything unknown) is refused with E_NOTIMPL rather than coerced to
+//             DIRECT: the console DMA-list vtable is not modelled.
 //   slots 78/79/80  SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX. A per-device token state machine answers
 //             them before the PC vtable is indexed; WaitFrameEventX returns at once with a fresh non-zero token.
 //             Slot 80 is outside a PC ID3D12Device11 table, so it is checked before the beyond-table refusal.
@@ -48,9 +51,20 @@
 // keeps the public slots is an assumption (docs/d3d12_command_objects.md §5.2). Heap, queue and fence proxies are
 // unwrapped wherever a device or queue method hands them to the real runtime: queue Signal/Wait (14/15), device
 // CreateSharedHandle (31), MakeResident/Evict (34/35), SetEventOnMultipleFenceCompletion (45), SetResidencyPriority
-// (46) and EnqueueMakeResident (50). Command lists are not wrapped, so ExecuteCommandLists passes them through and a
-// heap proxy given to a list's SetDescriptorHeaps reaches the real list as it is. QueryInterface answers only the
-// modelled interfaces; one the real object has but the proxy does not model is logged once and refused.
+// (46) and EnqueueMakeResident (50). QueryInterface answers only the modelled interfaces; one the real object has but
+// the proxy does not model is logged once and refused.
+//
+// Command lists have two separate paths. Device slot 73 (CreateCommandListX, console callers) returns a console-shaped
+// list proxy: a 160-slot table in console order (PC order through 26, console-only 27-30, the PC chain +4 through
+// 58, 60 -> EndEvent, 61 -> ExecuteIndirect, 139 -> Reset, 146 -> GCL7 Barrier, 148 AllocateUploadMemory) and the
+// console object body with the inline-record cursor pinned at its limits (+0x18 = +0x28 = +0x30), so inline writers
+// always take the vtable path. Any other slot is logged, traced "unsupported" and returns E_NOTIMPL; the list then
+// fails Close with E_NOTIMPL and queue ExecuteCommandLists refuses to submit it until a Reset. Queue
+// ExecuteCommandLists unwraps list proxies; the list unwraps allocator (Reset), bundle and heap proxies itself. The
+// console list's QueryInterface answers only the measured console IID (when the real list implements the PC interface
+// it maps to) and the layout-identical base chain IUnknown/ID3D12Object/ID3D12DeviceChild/ID3D12CommandList; PC
+// ID3D12GraphicsCommandList..8 IIDs are refused, since the console table is shifted from theirs. Device slot 12 (the PC CreateCommandList) is forwarded unchanged and returns the PC-shaped real list, for callers
+// compiled against the PC headers (the synthetic GPU tests and fixtures).
 #pragma once
 
 #include <d3d12.h>
@@ -147,6 +161,18 @@ bool allocator_slot_first_call_seen(unsigned slot);
 std::uint64_t allocator_table_overruns();
 // Heap slots 0-2, 7 (GetDevice -> device proxy) and 9/10 (handle conversion).
 bool heap_slot_overridden(unsigned slot);
+
+// Console command-list proxies (device slot 73). list_proxy_real_list returns the wrapped list (no reference added),
+// or null when `list` is not a list proxy. list_proxy_slot_count is the PC slot count of the real list (82 for
+// ID3D12GraphicsCommandList8); list_proxy_unsupported_slot the first console slot recorded since the last Reset that
+// was not executed (0 when none). list_slot_hits counts calls per console slot, under the counter rule below.
+bool is_list_proxy(const void* list);
+ID3D12GraphicsCommandList* list_proxy_real_list(const void* list);
+unsigned list_proxy_table_size();
+unsigned list_proxy_slot_count(const void* list);
+unsigned long list_proxy_ref_count(const void* list);
+unsigned list_proxy_unsupported_slot(const void* list);
+std::uint64_t list_slot_hits(unsigned slot);
 
 // Number of live references on a device proxy. Test helper for the heap's GetDevice/lifetime checks.
 unsigned long device_proxy_ref_count(const void* device);

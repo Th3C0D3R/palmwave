@@ -8,6 +8,9 @@
 //     and with a null output or IID, with the references of every object it touches;
 //   - allocation failures in the proxy (operator new, the arrays it unwraps), injected in this executable only;
 //   - device slot 26 called the console's way (the struct's buffer in RCX, the device in RDX) and the PC way;
+//   - console command lists from device slot 73: the object body, the console->PC slot table, ownership, unwrapping
+//     (allocator, bundle, heap array, queue ExecuteCommandLists), unsupported slots failing Close and refusing the
+//     submission until Reset, AllocateUploadMemory over a mapped mock buffer, and the unwrapped PC path of slot 12;
 //   - --fail-virtualalloc / --fail-virtualprotect / --fail-veh: the guard region's setup failing, injected by
 //     patching this executable's own import table before the first proxy table is built (one process each).
 // Every device, queue, fence and resource here is a mock that records the calls it gets. No game data, no Xbox DLLs.
@@ -71,9 +74,15 @@ namespace xs = rt::d3d12_xs;
 
 // ---- Mocks ----
 
-enum class Kind { device, queue, fence, resource, allocator, command_list };
+// command_list answers ID3D12GraphicsCommandList only; list answers the whole chain through
+// ID3D12GraphicsCommandList8 (the Vulkan layer's shape), so the console IID's ID3D12GraphicsCommandList6 and the
+// GCL7 Barrier are reachable.
+enum class Kind { device, queue, fence, resource, allocator, command_list, list };
 
 constexpr unsigned kMockSlots = 128;
+constexpr std::uint64_t kMockGpuBase = 0x00007f0000000000ull;  // mock buffers' GPU addresses, unlike any CPU one
+// The console command-list IID the 1.0.2.1 executable passes to device slot 73 (d3d12_xs_command_list_iid.h).
+constexpr GUID kConsoleListIid{0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
 constexpr std::uint64_t kFenceHandle = 0x1000, kResourceHandle = 0x2000;  // the handles the mock device opens
 constexpr std::uint64_t kCompletedValue = 7;                            // what a mock fence's slot 8 returns
 constexpr UINT kHeapMarker = 0x26262626;  // the VisibleNodeMask a mock device's slot 26 answers
@@ -87,7 +96,10 @@ struct Mock {
     int device_level;        // device: highest ID3D12DeviceN it answers (0 = ID3D12Device only)
     bool fence1;             // fence: answers ID3D12Fence1; device: the fences it makes do
     bool allocator_tag;      // allocator: answers kPalmwaveCommandAllocatorTag; device: the allocators it makes do
-    bool create_null;        // device: creation returns create_result with no object
+    bool full_chain_lists;   // device: CreateCommandList makes a Kind::list mock, else Kind::command_list
+    void* mapped;            // resource from CreateCommittedResource: the memory Map returns, freed at refs 0
+    std::uint64_t gpu_va;    // resource from CreateCommittedResource: what GetGPUVirtualAddress returns
+    bool create_null;       // device: creation returns create_result with no object
     HRESULT create_result;   // device: what creation returns (S_OK makes the object)
     Mock* last_child;        // device: the object its last creation or open made
     bool validate_queue_desc;  // device: opt in to the PC queue-description contract
@@ -154,6 +166,16 @@ bool mock_has(const Mock* m, REFIID iid) {
         case Kind::allocator:
             return IsEqualIID(iid, __uuidof(ID3D12CommandAllocator)) ||
                    (m->allocator_tag && IsEqualIID(iid, xs::kPalmwaveCommandAllocatorTag));
+        case Kind::list: {
+            const IID lists[] = {__uuidof(ID3D12CommandList),          __uuidof(ID3D12GraphicsCommandList),
+                                 __uuidof(ID3D12GraphicsCommandList1), __uuidof(ID3D12GraphicsCommandList2),
+                                 __uuidof(ID3D12GraphicsCommandList3), __uuidof(ID3D12GraphicsCommandList4),
+                                 __uuidof(ID3D12GraphicsCommandList5), __uuidof(ID3D12GraphicsCommandList6),
+                                 __uuidof(ID3D12GraphicsCommandList7), __uuidof(ID3D12GraphicsCommandList8)};
+            for (const IID& list_iid : lists)
+                if (IsEqualIID(iid, list_iid)) return true;
+            return false;
+        }
         default: return false;
     }
 }
@@ -225,6 +247,30 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         return S_OK;
     }
     if (m->kind == Kind::fence && slot == 8) return kCompletedValue;  // GetCompletedValue
+    if (m->kind == Kind::queue && slot == 10) copy_array(m, slot, a2, a1);  // ExecuteCommandLists(count, lists)
+    if (m->kind == Kind::resource) {
+        if (slot == 8) {  // Map(subresource, range, &data)
+            if (a3) *reinterpret_cast<void**>(a3) = m->mapped;
+            return static_cast<std::uint32_t>(m->mapped ? S_OK : E_FAIL);
+        }
+        if (slot == 11) return m->gpu_va;  // GetGPUVirtualAddress
+    }
+    if (m->kind == Kind::list || m->kind == Kind::command_list) {
+        // The view setters get a copy the proxy owns only for the call, so what arrived is recorded now.
+        if (slot == 28) copy_array(m, slot, a2, a1);  // SetDescriptorHeaps(count, heaps)
+        if (slot == 43 && a1)                         // IASetIndexBuffer(view)
+            m->array[slot][0] = reinterpret_cast<const D3D12_INDEX_BUFFER_VIEW*>(a1)->BufferLocation;
+        if (slot == 44 && a3) {                       // IASetVertexBuffers(start, count, views)
+            const auto* views = reinterpret_cast<const D3D12_VERTEX_BUFFER_VIEW*>(a3);
+            for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(a2) && i < 4; ++i)
+                m->array[slot][i] = views[i].BufferLocation;
+        }
+        if (slot == 45 && a3) {                       // SOSetTargets(start, count, views)
+            const auto* views = reinterpret_cast<const D3D12_STREAM_OUTPUT_BUFFER_VIEW*>(a3);
+            m->array[slot][0] = views[0].BufferLocation;
+            m->array[slot][1] = views[0].BufferFilledSizeLocation;
+        }
+    }
     return S_OK;
 }
 
@@ -237,7 +283,12 @@ std::uint64_t WINAPI mock_slot(Mock* self, std::uint64_t a1, std::uint64_t a2, s
     } else if constexpr (Slot == 1) {
         return static_cast<std::uint64_t>(++self->refs);
     } else if constexpr (Slot == 2) {
-        return static_cast<std::uint64_t>(--self->refs);
+        const long refs = --self->refs;
+        if (refs == 0 && self->mapped) {
+            VirtualFree(self->mapped, 0, MEM_RELEASE);
+            self->mapped = nullptr;
+        }
+        return static_cast<std::uint64_t>(refs);
     } else {
         // A caller may pass fewer words than this thunk declares (OpenSharedHandle passes three), so its frame
         // has no room past the four register homes. The words are copied into this frame and passed by pointer:
@@ -264,7 +315,40 @@ HRESULT WINAPI mock_create_command_list(Mock* self, std::uint64_t node_mask, std
     if (!out) return S_FALSE;
     *out = nullptr;
     if (self->create_null || FAILED(self->create_result)) return self->create_result;
-    Mock* child = new_mock(Kind::command_list);
+    Mock* child = new_mock(self->full_chain_lists ? Kind::list : Kind::command_list);
+    self->last_child = child;
+    return mock_query(child, riid, out);
+}
+
+// PC ID3D12Device::CreateCommittedResource takes seven words after `this`; the upload arena behind console list slot
+// 148 calls it. The buffer is real memory (Map returns it) with a GPU address that differs from it, so a translated
+// address is told apart from an untranslated one.
+HRESULT WINAPI mock_create_committed_resource(Mock* self, const D3D12_HEAP_PROPERTIES* heap, std::uint64_t flags,
+                                              const D3D12_RESOURCE_DESC* desc, std::uint64_t state,
+                                              const D3D12_CLEAR_VALUE* clear, const IID* riid, void** out) {
+    ++self->calls[27];
+    if (self->kind != Kind::device) {
+        // The mocks share one table: on a PC command list slot 27 is the void ExecuteBundle(bundle). Record the words
+        // as received instead of reading them as a heap description; the return value is unchanged and carries no
+        // contract for a void method.
+        const std::uint64_t words[] = {reinterpret_cast<std::uint64_t>(heap), flags,
+                                       reinterpret_cast<std::uint64_t>(desc), state,
+                                       reinterpret_cast<std::uint64_t>(clear)};
+        std::memcpy(self->args[27], words, sizeof(words));
+        return out ? E_INVALIDARG : S_FALSE;
+    }
+    (void)state;
+    (void)clear;
+    self->args[27][0] = heap ? static_cast<std::uint64_t>(heap->Type) : 0;
+    self->args[27][1] = desc ? desc->Width : 0;
+    if (!out) return S_FALSE;
+    *out = nullptr;
+    if (self->create_null || FAILED(self->create_result)) return self->create_result;
+    if (!desc) return E_INVALIDARG;
+    Mock* child = new_mock(Kind::resource);
+    child->mapped = VirtualAlloc(nullptr, static_cast<SIZE_T>(desc->Width), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!child->mapped) return E_OUTOFMEMORY;
+    child->gpu_va = kMockGpuBase + (static_cast<std::uint64_t>(child - g_pool) << 32);
     self->last_child = child;
     return mock_query(child, riid, out);
 }
@@ -279,6 +363,7 @@ void** mock_vtable() {
     static const bool filled = [] {
         fill_mock_vtable(table, std::make_index_sequence<kMockSlots>{});
         table[12] = reinterpret_cast<void*>(&mock_create_command_list);
+        table[27] = reinterpret_cast<void*>(&mock_create_committed_resource);
         return true;
     }();
     (void)filled;
@@ -292,9 +377,9 @@ using SlotFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::
                                       std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
 
 std::uint64_t raw(const void* object, unsigned slot, std::uint64_t a1 = 0, std::uint64_t a2 = 0,
-                  std::uint64_t a3 = 0, std::uint64_t a4 = 0, std::uint64_t a5 = 0) {
+                  std::uint64_t a3 = 0, std::uint64_t a4 = 0, std::uint64_t a5 = 0, std::uint64_t a6 = 0) {
     void* const* vtable = *reinterpret_cast<void* const* const*>(object);
-    return reinterpret_cast<SlotFn>(vtable[slot])(const_cast<void*>(object), a1, a2, a3, a4, a5, 0, 0, 0, 0, 0, 0,
+    return reinterpret_cast<SlotFn>(vtable[slot])(const_cast<void*>(object), a1, a2, a3, a4, a5, a6, 0, 0, 0, 0, 0,
                                                   0, 0, 0);
 }
 
@@ -316,11 +401,12 @@ const IID kDevice1Iid = __uuidof(ID3D12Device1);
 const D3D12_COMMAND_QUEUE_DESC kQueueDesc{};
 
 // A device proxy over a new mock device. The proxy takes the mock's one reference.
-void* make_device(Mock*& mock, int level, bool fence1, bool allocator_tag = true) {
+void* make_device(Mock*& mock, int level, bool fence1, bool allocator_tag = true, bool full_chain_lists = false) {
     mock = new_mock(Kind::device);
     mock->device_level = level;
     mock->fence1 = fence1;
     mock->allocator_tag = allocator_tag;
+    mock->full_chain_lists = full_chain_lists;
     mock->refs = 1;
     void* device = nullptr;
     if (FAILED(xs::create_device_proxy(reinterpret_cast<ID3D12Device*>(mock), __uuidof(ID3D12Device), &device)))
@@ -718,7 +804,7 @@ int check_allocators() {
 int check_xbox_slots() {
 #ifdef __ID3D12Device11_INTERFACE_DEFINED__
     Mock* mock = nullptr;
-    void* device = make_device(mock, 11, true);
+    void* device = make_device(mock, 11, true, true, true);  // full-chain lists: the console IID needs GCL6
     EXPECT(device && xs::device_proxy_slot_count(device) == 80);
     xs::reset_device_proxy_stats();
 
@@ -745,7 +831,8 @@ int check_xbox_slots() {
            std::memcmp(&mock->last_queue_desc, &kQueueDesc, sizeof(kQueueDesc)) == 0);
 
     // 73 CreateCommandListX(desc, allocator, initialState, riid, out): the type is desc's first word, the allocator
-    // proxy is unwrapped, the node mask is 0 and the PC six-argument CreateCommandList (slot 12) is reached.
+    // proxy is unwrapped, the node mask is 0 and the PC six-argument CreateCommandList (slot 12) is reached; the list
+    // comes back behind the console list proxy (check_lists covers the proxy itself).
     const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
     void* allocator = nullptr;
     EXPECT(hr_of(raw(device, 9, 0, word(&allocator_iid), word(&allocator))) == S_OK);
@@ -758,14 +845,15 @@ int check_xbox_slots() {
     } desc{};
     desc.type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     desc.node_mask = 7;  // ignored by the console call, as the HLE does
-    const IID list_iid = __uuidof(ID3D12GraphicsCommandList);
+    const IID& list_iid = kConsoleListIid;  // the measured console IID the title passes
     void* list = nullptr;
     EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&list_iid), word(&list))) == S_OK);
-    EXPECT(list && reinterpret_cast<Mock*>(list)->kind == Kind::command_list);
+    EXPECT(xs::is_list_proxy(list) && reinterpret_cast<Mock*>(xs::list_proxy_real_list(list))->kind == Kind::list);
     EXPECT(mock->calls[73] == 0 && mock->calls[12] == 1 && xs::device_slot_hits(73) == 1);
     EXPECT(mock->args[12][0] == 0 && mock->args[12][1] == D3D12_COMMAND_LIST_TYPE_DIRECT);
     EXPECT(mock->args[12][2] == word(real_allocator) && mock->args[12][3] == 0);
-    EXPECT(mock->args[12][4] == word(&list_iid));
+    // The real list is made as ID3D12GraphicsCommandList; the console IID is answered by the console proxy only.
+    EXPECT(IsEqualIID(*reinterpret_cast<const IID*>(mock->args[12][4]), __uuidof(ID3D12GraphicsCommandList)));
 
     // Release the list before the refusal calls below: the COM convention (and the handler) nulls the caller's
     // output on failure, so an invalid call would clear this pointer.
@@ -775,6 +863,14 @@ int check_xbox_slots() {
     EXPECT(hr_of(raw(device, 73, 0, word(allocator), 0, word(&list_iid), word(&list))) == E_INVALIDARG);
     EXPECT(hr_of(raw(device, 73, word(&desc), 0, 0, word(&list_iid), word(&list))) == E_INVALIDARG);
     EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&list_iid), 0)) == E_POINTER);
+    // A copy list, the derived DMA type 6 and an unknown type (the console's separate DMA-list vtable is not modelled)
+    // are refused before anything is created, not coerced to a direct list.
+    for (const std::uint32_t type : {static_cast<std::uint32_t>(D3D12_COMMAND_LIST_TYPE_COPY), 6u, 99u}) {
+        desc.type = type;
+        list = reinterpret_cast<void*>(1);
+        EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&list_iid), word(&list))) == E_NOTIMPL);
+        EXPECT(!list && mock->calls[12] == 1);
+    }
 
     EXPECT(xs::device_slot_overridden(48) && xs::device_slot_overridden(73) && xs::device_slot_overridden(78) &&
            xs::device_slot_overridden(79) && xs::device_slot_overridden(80));
@@ -789,6 +885,263 @@ int check_xbox_slots() {
     std::printf("%s: ID3D12Device11 is not in this SDK; Xbox slot 80's beyond-table case is not built\n", g_label);
     return 0;
 #endif
+}
+
+// ---- 7b. Console command lists (device slot 73) and the PC path (device slot 12) ----
+
+int check_lists() {
+    const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
+    const IID gcl_iid = __uuidof(ID3D12GraphicsCommandList);
+    const std::uint32_t direct_desc[4] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 0, 0, 0};
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true, true, true);
+    EXPECT(device);
+    xs::reset_device_proxy_stats();
+    const unsigned long device_refs = xs::device_proxy_ref_count(device);
+    void* allocator = nullptr;
+    EXPECT(hr_of(raw(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, word(&allocator_iid), word(&allocator))) == S_OK);
+    Mock* const real_allocator = mock->last_child;
+    EXPECT(xs::is_allocator_proxy(allocator));
+
+    // Creation with the measured console IID: the allocator proxy unwrapped, the real list made as
+    // ID3D12GraphicsCommandList, the console IID answered by the proxy (it maps to ID3D12GraphicsCommandList6).
+    void* list = nullptr;
+    EXPECT(hr_of(raw(device, 73, word(direct_desc), word(allocator), 0, word(&kConsoleListIid), word(&list))) == S_OK);
+    Mock* const real = mock->last_child;
+    EXPECT(real->kind == Kind::list && mock->args[12][2] == word(real_allocator));
+    EXPECT(xs::is_list_proxy(list) && word(xs::list_proxy_real_list(list)) == word(real));
+    EXPECT(xs::list_proxy_slot_count(list) == 82 && xs::list_proxy_table_size() == 160);
+    EXPECT(xs::list_proxy_ref_count(list) == 1 && real->refs == 1);
+    EXPECT(xs::device_proxy_ref_count(device) == device_refs + 2);  // the allocator and the list
+
+    // The object body: the real list at +0x08, the inline-record cursor (+0x18) equal to both limits (+0x28, +0x30)
+    // and pointing inside the proxy's own body, the flag bytes, header table and pipeline record zero.
+    const auto* object = reinterpret_cast<const std::uint8_t*>(list);
+    std::uint64_t fields[4];
+    std::memcpy(&fields[0], object + 0x08, 8);
+    std::memcpy(&fields[1], object + 0x18, 8);
+    std::memcpy(&fields[2], object + 0x28, 8);
+    std::memcpy(&fields[3], object + 0x30, 8);
+    EXPECT(fields[0] == word(real));
+    EXPECT(fields[1] == fields[2] && fields[1] == fields[3]);
+    EXPECT(fields[1] >= word(list) + 0x554 && fields[1] < word(list) + 0x18 + 0x600);  // past the pipeline record
+    for (std::size_t offset = 0x140; offset < 0x144; ++offset) EXPECT(object[offset] == 0);
+    for (std::size_t offset = 0x344; offset < 0x554; ++offset) EXPECT(object[offset] == 0);
+
+    // QueryInterface: the console IID and the layout-identical base chain (IUnknown, ID3D12Object, ID3D12DeviceChild,
+    // ID3D12CommandList) return the proxy. Every PC graphics-list IID is refused with the output cleared even though
+    // the real list implements it: the console table is shifted from the PC one (PC lists come from device slot 12).
+    // An unknown IID with the console list's first 32 bits is refused too.
+    void* asked = nullptr;
+    EXPECT(hr_of(raw(list, 0, word(&kConsoleListIid), word(&asked))) == S_OK && asked == list && release(asked) == 1);
+    for (const IID& base : {__uuidof(IUnknown), __uuidof(ID3D12Object), __uuidof(ID3D12DeviceChild),
+                            __uuidof(ID3D12CommandList)}) {
+        asked = nullptr;
+        EXPECT(hr_of(raw(list, 0, word(&base), word(&asked))) == S_OK && asked == list && release(asked) == 1);
+    }
+    const GUID unknown_console{0xc3827890, 0x4024, 0x474c, {0, 0, 0, 0, 0, 0, 0, 1}};
+    const IID refused[] = {kQueueIid,
+                           unknown_console,
+                           __uuidof(ID3D12GraphicsCommandList),
+                           __uuidof(ID3D12GraphicsCommandList1),
+                           __uuidof(ID3D12GraphicsCommandList2),
+                           __uuidof(ID3D12GraphicsCommandList3),
+                           __uuidof(ID3D12GraphicsCommandList4),
+                           __uuidof(ID3D12GraphicsCommandList5),
+                           __uuidof(ID3D12GraphicsCommandList6),
+                           __uuidof(ID3D12GraphicsCommandList7),
+                           __uuidof(ID3D12GraphicsCommandList8)};
+    for (const IID& iid : refused) {
+        asked = reinterpret_cast<void*>(1);
+        EXPECT(hr_of(raw(list, 0, word(&iid), word(&asked))) == E_NOINTERFACE && !asked);
+    }
+    EXPECT(xs::list_proxy_ref_count(list) == 1 && real->refs == 1);  // no refusal leaked a reference
+    // GetDevice answers with the Xbox-ABI device.
+    const IID device_iid = __uuidof(ID3D12Device);
+    void* found = nullptr;
+    EXPECT(hr_of(raw(list, 7, word(&device_iid), word(&found))) == S_OK && found == device);
+    release(found);
+    EXPECT(xs::device_proxy_ref_count(device) == device_refs + 2);
+
+    // Forwarding by the console table: Dispatch keeps its slot (14), the +4 block moves (console 37 -> PC 33), the
+    // heap array of SetDescriptorHeaps (console 32 -> PC 28) is unwrapped (any proxy kind unwraps the same way; the
+    // allocator stands in for a heap here), Reset at console 139 and 10 reaches PC 10 with the real allocator, and the
+    // enhanced Barrier (console 146) reaches GCL7 slot 80. Dispatch, SetComputeRoot32BitConstant, SetDescriptorHeaps
+    // and Barrier are void: their return register carries no contract, so only forwarding and arguments are checked.
+    // Reset is HRESULT-returning and keeps its S_OK check.
+    raw(list, 14, 1, 2, 3);
+    EXPECT(real->calls[14] == 1 && real->args[14][2] == 3);
+    raw(list, 37, 4, 0x1234, 2);
+    EXPECT(real->calls[33] == 1 && real->args[33][1] == 0x1234 && real->calls[37] == 0);
+    const std::uint64_t heaps[2] = {word(allocator), word(real_allocator)};
+    raw(list, 32, 2, word(heaps));
+    EXPECT(real->calls[28] == 1 && real->calls[32] == 0);
+    EXPECT(real->array[28][0] == word(real_allocator) && real->array[28][1] == word(real_allocator));
+    EXPECT(hr_of(raw(list, 139, word(allocator), 0)) == S_OK && real->calls[10] == 1 &&
+           real->args[10][0] == word(real_allocator));
+    EXPECT(hr_of(raw(list, 10, word(allocator), 0)) == S_OK && real->calls[10] == 2 &&
+           real->args[10][0] == word(real_allocator));
+    const std::uint64_t barrier_group[4] = {};
+    raw(list, 146, 1, word(barrier_group));
+    EXPECT(real->calls[80] == 1 && real->args[80][0] == 1 && real->args[80][1] == word(barrier_group));
+    EXPECT(xs::list_slot_hits(139) == 1 && xs::list_slot_hits(146) == 1);
+
+    // Close and submission: the queue gets the real list, never the proxy.
+    void* queue = make_queue(device);
+    EXPECT(queue);
+    Mock* const queue_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(queue));
+    EXPECT(hr_of(raw(list, 9)) == S_OK && real->calls[9] == 1);
+    const std::uint64_t submitted[1] = {word(list)};
+    raw(queue, 10, 1, word(submitted));
+    EXPECT(queue_mock->calls[10] == 1 && queue_mock->array[10][0] == word(real));
+
+    // Unsupported slots: a console-only extra (27), the disputed 59 and the unmeasured tail (100) return E_NOTIMPL
+    // and reach nothing. The list keeps the first one; its Close still closes the real list but fails, and the queue
+    // refuses the whole submission.
+    const auto total_calls = [](const Mock* m) {
+        unsigned total = 0;
+        for (const unsigned calls : m->calls) total += calls;
+        return total;
+    };
+    EXPECT(hr_of(raw(list, 139, word(allocator), 0)) == S_OK);
+    const unsigned real_calls_before = total_calls(real);
+    EXPECT(hr_of(raw(list, 27, 1, 2, 3, 4)) == E_NOTIMPL);
+    EXPECT(hr_of(raw(list, 59, 1, 2, 3)) == E_NOTIMPL && hr_of(raw(list, 100)) == E_NOTIMPL);
+    EXPECT(total_calls(real) == real_calls_before);
+    EXPECT(xs::list_proxy_unsupported_slot(list) == 27);
+    EXPECT(hr_of(raw(list, 9)) == E_NOTIMPL && real->calls[9] == 2);
+    raw(queue, 10, 1, word(submitted));
+    EXPECT(queue_mock->calls[10] == 1);
+    // Reset starts a clean recording: Close succeeds and the list is submitted again.
+    EXPECT(hr_of(raw(list, 139, word(allocator), 0)) == S_OK && xs::list_proxy_unsupported_slot(list) == 0);
+    EXPECT(hr_of(raw(list, 9)) == S_OK);
+    raw(queue, 10, 1, word(submitted));
+    EXPECT(queue_mock->calls[10] == 2 && queue_mock->array[10][0] == word(real));
+
+    // ExecuteBundle (console 31 -> PC 27): a clean bundle proxy unwraps; one with an unexecuted command makes the
+    // calling list incomplete and is not forwarded. ExecuteBundle is void, so its return register is not checked:
+    // forwarding, the unwrapped argument and the poison state are.
+    void* bundle = nullptr;
+    EXPECT(hr_of(raw(device, 73, word(direct_desc), word(allocator), 0, word(&kConsoleListIid), word(&bundle))) ==
+           S_OK);
+    Mock* const real_bundle = mock->last_child;
+    EXPECT(xs::is_list_proxy(bundle) && word(xs::list_proxy_real_list(bundle)) == word(real_bundle));
+    raw(list, 31, word(bundle));
+    EXPECT(real->calls[27] == 1 && real->args[27][0] == word(real_bundle));
+    EXPECT(xs::list_proxy_unsupported_slot(list) == 0);
+    EXPECT(hr_of(raw(bundle, 28)) == E_NOTIMPL && xs::list_proxy_unsupported_slot(bundle) == 28);
+    raw(list, 31, word(bundle));
+    EXPECT(real->calls[27] == 1 && xs::list_proxy_unsupported_slot(list) == 31);
+    EXPECT(hr_of(raw(list, 139, word(allocator), 0)) == S_OK);
+
+    // AllocateUploadMemory (console 148): pointers into a mapped UPLOAD buffer, refusals that move nothing, and the
+    // root-descriptor and IA/SO view setters receive the buffer's GPU address for an arena pointer.
+    EXPECT(raw(list, 148, 0, 16) == 0 && mock->calls[27] == 0);
+    const std::uint64_t p1 = raw(list, 148, 4096, 64);
+    Mock* const chunk = mock->last_child;
+    EXPECT(p1 && chunk->kind == Kind::resource && mock->calls[27] == 1);
+    EXPECT(mock->args[27][0] == D3D12_HEAP_TYPE_UPLOAD && mock->args[27][1] >= 4096);
+    EXPECT(p1 == word(chunk->mapped) && (p1 & 63) == 0 && chunk->calls[8] == 1);  // Map
+    const std::uint64_t p2 = raw(list, 148, 16, 16);
+    EXPECT(p2 == p1 + 4096);
+    EXPECT(raw(list, 148, ~0ull, 16) == 0 && raw(list, 148, 16, 48) == 0 && raw(list, 148, 16, 1u << 20) == 0);
+    const std::uint64_t p3 = raw(list, 148, 16, 16);
+    EXPECT(p3 == p2 + 16 && mock->calls[27] == 1);  // refusals moved nothing; still one chunk
+    std::memset(reinterpret_cast<void*>(p1), 0x5a, 4096);  // the title writes the mapped memory directly
+    const std::uint64_t gpu = chunk->gpu_va;
+    // The root-descriptor and IA/SO view setters are void: forwarding and the translated arguments are checked, not
+    // their return register.
+    raw(list, 43, 3, p2);
+    EXPECT(real->calls[39] == 1 && real->args[39][0] == 3 && real->args[39][1] == gpu + 4096);
+    raw(list, 44, 3, 0xdead0000);
+    EXPECT(real->calls[40] == 1 && real->args[40][0] == 3 && real->args[40][1] == 0xdead0000);
+    D3D12_INDEX_BUFFER_VIEW ib_view{};
+    ib_view.BufferLocation = p1 + 32;
+    raw(list, 47, word(&ib_view));
+    EXPECT(real->calls[43] == 1 && real->array[43][0] == gpu + 32);
+    EXPECT(ib_view.BufferLocation == p1 + 32);  // the title's struct is not written
+    D3D12_VERTEX_BUFFER_VIEW vb_views[2]{};
+    vb_views[0].BufferLocation = p1;
+    vb_views[1].BufferLocation = 0xdead0000;
+    raw(list, 48, 0, 2, word(vb_views));
+    EXPECT(real->calls[44] == 1 && real->args[44][1] == 2);
+    EXPECT(real->array[44][0] == gpu && real->array[44][1] == 0xdead0000 && vb_views[0].BufferLocation == p1);
+    D3D12_STREAM_OUTPUT_BUFFER_VIEW so_view{};
+    so_view.BufferLocation = p1;
+    so_view.BufferFilledSizeLocation = p2;
+    raw(list, 49, 0, 1, word(&so_view));
+    EXPECT(real->calls[45] == 1 && real->args[45][1] == 1);
+    EXPECT(real->array[45][0] == gpu && real->array[45][1] == gpu + 4096);
+    // A device that cannot make the buffer hands out no memory: 0, not host memory posing as a GPU address.
+    mock->create_result = E_OUTOFMEMORY;
+    EXPECT(raw(list, 148, 16u << 20, 16) == 0 && mock->calls[27] == 2);
+    mock->create_result = S_OK;
+    // A request larger than the remaining chunk gets a chunk of its own.
+    const std::uint64_t big = raw(list, 148, 16u << 20, 256);
+    Mock* const big_chunk = mock->last_child;
+    EXPECT(big && mock->calls[27] == 3 && big == word(big_chunk->mapped) && (big & 255) == 0);
+    EXPECT(xs::list_proxy_unsupported_slot(list) == 0);  // none of this marked the list
+
+    // Ownership: the lists hold their real lists and the device; the arena's buffers go with the device.
+    EXPECT(release(bundle) == 0 && real_bundle->refs == 0);
+    EXPECT(release(list) == 0 && real->refs == 0);
+    EXPECT(release(queue) == 0 && release(allocator) == 0 && real_allocator->refs == 0);
+    EXPECT(xs::device_proxy_ref_count(device) == device_refs);
+    EXPECT(chunk->refs == 1 && big_chunk->refs == 1);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    EXPECT(chunk->refs == 0 && chunk->calls[9] == 1 && big_chunk->refs == 0 && big_chunk->calls[9] == 1);
+
+    // Creation failures: an IID the proxy does not model (including the PC graphics-list IIDs), and a refused
+    // allocation for the proxy, all release the real list and leave the device's references as they were.
+    Mock* mock2 = nullptr;
+    void* device2 = make_device(mock2, 9, true, true, true);
+    EXPECT(device2);
+    void* allocator2 = nullptr;
+    EXPECT(hr_of(raw(device2, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, word(&allocator_iid), word(&allocator2))) == S_OK);
+    const unsigned long device2_refs = xs::device_proxy_ref_count(device2);
+    void* out = reinterpret_cast<void*>(1);
+    EXPECT(hr_of(raw(device2, 73, word(direct_desc), word(allocator2), 0, word(&kQueueIid), word(&out))) ==
+           E_NOINTERFACE);
+    EXPECT(!out && mock2->last_child->kind == Kind::list && mock2->last_child->refs == 0);
+    // A PC graphics-list IID through slot 73 is refused the same way although the real list implements it: the
+    // console-shaped proxy is never handed out as a PC list.
+    for (const IID& pc_iid : {__uuidof(ID3D12GraphicsCommandList), __uuidof(ID3D12GraphicsCommandList6)}) {
+        out = reinterpret_cast<void*>(1);
+        EXPECT(hr_of(raw(device2, 73, word(direct_desc), word(allocator2), 0, word(&pc_iid), word(&out))) ==
+               E_NOINTERFACE);
+        EXPECT(!out && mock2->last_child->kind == Kind::list && mock2->last_child->refs == 0);
+    }
+    EXPECT(xs::device_proxy_ref_count(device2) == device2_refs);
+    g_fail_news = 1;
+    out = reinterpret_cast<void*>(1);
+    const HRESULT starved =
+        hr_of(raw(device2, 73, word(direct_desc), word(allocator2), 0, word(&kConsoleListIid), word(&out)));
+    g_fail_news = 0;
+    EXPECT(starved == E_OUTOFMEMORY && !out && mock2->last_child->kind == Kind::list &&
+           mock2->last_child->refs == 0);
+    EXPECT(xs::device_proxy_ref_count(device2) == device2_refs);
+    EXPECT(release(allocator2) == 0);
+
+    // The PC path: device slot 12 is forwarded unchanged, so a caller compiled against the PC headers gets the real
+    // PC-shaped list, which the queue passes through as it is.
+    void* pc_list = nullptr;
+    EXPECT(hr_of(raw(device2, 12, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, 0, 0, word(&gcl_iid), word(&pc_list))) == S_OK);
+    EXPECT(pc_list == mock2->last_child && !xs::is_list_proxy(pc_list) &&
+           mock2->last_child->kind == Kind::list);
+    void* queue2 = make_queue(device2);
+    EXPECT(queue2);
+    Mock* const queue2_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(queue2));
+    const std::uint64_t pc_submitted[1] = {word(pc_list)};
+    raw(queue2, 10, 1, word(pc_submitted));
+    EXPECT(queue2_mock->calls[10] == 1 && queue2_mock->array[10][0] == word(pc_list));
+    EXPECT(release(pc_list) == 0 && release(queue2) == 0);
+    EXPECT(release(device2) == 0 && mock2->refs == 0);
+    std::printf("%s: slot 73 lists are console-shaped (body, cursor pinned, console/base IIDs only, PC graphics-list "
+                "IIDs refused, GetDevice), forward by the console "
+                "table with allocator/bundle/heap/queue unwrapping, fail Close and refuse submission after an "
+                "unsupported slot until Reset, carve upload memory from a mapped buffer whose GPU address the setters "
+                "receive; slot 12 stays PC-shaped\n", g_label);
+    return 0;
 }
 
 // ---- 8. Environment overrides for the Xbox device slots (one process each, read once) ----
@@ -806,7 +1159,7 @@ int run_env_slots(bool valid) {
     EXPECT(SetEnvironmentVariableA("PALMWAVE_XS_LIST_X_SLOT", list_x) != FALSE);
 
     Mock* mock = nullptr;
-    void* device = make_device(mock, 11, true);
+    void* device = make_device(mock, 11, true, true, true);  // full-chain lists: the console IID needs GCL6
     EXPECT(device);
     xs::reset_device_proxy_stats();
     std::uint64_t token = 0;
@@ -824,9 +1177,10 @@ int run_env_slots(bool valid) {
         struct {
             std::uint32_t type, node_mask;
         } desc{static_cast<std::uint32_t>(D3D12_COMMAND_LIST_TYPE_DIRECT), 0};
-        const IID list_iid = __uuidof(ID3D12GraphicsCommandList);
         void* list = nullptr;
-        EXPECT(hr_of(raw(device, 100, word(&desc), word(allocator), 0, word(&list_iid), word(&list))) == S_OK);
+        EXPECT(hr_of(raw(device, 100, word(&desc), word(allocator), 0, word(&kConsoleListIid), word(&list))) ==
+               S_OK);
+        EXPECT(xs::is_list_proxy(list));
         EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK && mock->calls[78] == 1);
         EXPECT(release(list) == 0);
         EXPECT(release(allocator) == 0);
@@ -1083,6 +1437,7 @@ int main(int argc, char** argv) {
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_xbox_queue_descriptions() ||
+        check_lists() ||
         check_custom_heap_properties())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);

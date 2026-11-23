@@ -20,7 +20,7 @@
 
 Palmwave is an experimental open-source Xbox Series compatibility layer and shader translation toolchain for PC, developed under **[Moon AI](https://realmoon.ai), the AI platform created by Stellarr Studio**. Its first target is a **verified frame rendered by the Xbox Series build of Xbox Series title on Windows**.
 
-**Retail startup reaches a Vulkan graphics device, five command queues, five fences and a command allocator on RTX 5080. The next blocker is the Xbox command-list interface. No rendered frame or playable release is verified.** Progress is recorded from local builds and traces in [STATUS.md](STATUS.md). A successful presentation call alone does not establish a rendered image.
+**Retail startup reaches a Vulkan graphics device, five command queues, five fences, a command allocator and the first Xbox command list on RTX 5080. Recording stops at unimplemented Xbox list methods 132 and 131. No rendered frame or playable release is verified.** Progress is recorded from local builds and traces in [STATUS.md](STATUS.md). A successful presentation call alone does not establish a rendered image.
 
 Palmwave starts from the GPL-3.0 [Leonida](https://github.com/ItsNotRexed/Leonida) source at `dde82f27e`, with a new Git history. The loader, translator, runtime, tests and technical documentation originate there. Original copyrights, licenses and third-party notices are retained; see [UPSTREAM.md](UPSTREAM.md).
 
@@ -49,7 +49,7 @@ Measured on **Ryzen 9 9950X3D / NVIDIA RTX 5080 16 GB / driver 621.14 / Windows 
 | Embedded FSPX shaders | 29 / 29 translated and SPIR-V valid with the native decoder; GPU semantics not yet verified |
 | GPU pipeline creation | In progress; full-pass result pending |
 | Retail dry-run / initialization | Both exit 0; four DLL initializations succeed |
-| Retail execution | Vulkan device, five queues, five fences and an allocator created on RTX 5080; next stop is the console command-list interface |
+| Retail execution | Vulkan device, five queues, five fences, an allocator and the first Xbox command list created on RTX 5080; recording stops at methods 132 and 131 |
 | First rendered frame | Not verified |
 
 These counts are preparation results, not gameplay or rendering results. Historical measurements in the inherited `docs/` remain attributed to their original authors and hardware.

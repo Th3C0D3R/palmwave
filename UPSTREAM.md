@@ -46,6 +46,23 @@ Palmwave limits the mapping to values 0..3 and the configured Xbox queue route (
 
 The synthetic regression snapshots the backend description, exercises all four values, preserves the caller's bytes, checks distinct backend queue objects, rejects unknown bits before backend calls, and checks PC flags, capability queries and backend failures. The regression fails with the old forwarder; all six `xs_proxy_mock` CTests pass after the adaptation in 0.20 seconds with MSVC 19.51 on CPU only. No GPU execution or new rendered frame is claimed by this test. The bounded adaptation and tests were assisted by OpenAI Codex.
 
+## Console command-list proxy
+
+The console-shaped command-list proxy, the slot-73 command-list IID table (`runtime/shims/d3d12_xs_command_list_iid.h`), the `AllocateUploadMemory` upload arena and the related mock-test hunks are adapted from NolanCotter's [Leonida PR #2490](https://github.com/ItsNotRexed/Leonida/pull/2490), at commit `084c8bd097d30541f32ff3c7f0968b8baef5fc95` of NolanCotter/Leonida, under GPL-3.0. The IID header keeps its upstream provenance note. That note cites the 1.0.2.1 executable's slot-73 IID and TomBox's GPL-3.0 xbox-emulator list. The `Reset` at console slot 139 is credited upstream to a measurement on the retail title by Pipodi, and the arena's overflow refusal to a review on that PR by daemosofchaos. Only the hunks below were imported. No whole file was replaced.
+
+A local offline run confirms that slot 73 creates the first console command list; the next unimplemented methods are slots 132 and 131. Palmwave changed the following:
+- **Creation slot.** Only device slot 73 (`CreateCommandListX`) returns the console proxy. The PC slot 12 stays forwarded unchanged and returns the PC-shaped list to callers compiled against the PC headers. This replaces the upstream `console_lists` device flag and the `LEONIDA_D3D12_LISTS` variable, so the GPU tests, `D3D12XboxCreateDevice` and `check_tiny_frame.py` are unchanged.
+- **Interface boundary.** The console proxy accepts only its measured full console IID and the layout-identical base interfaces. PC graphics-command-list IIDs are rejected rather than exposing the shifted console table; PC callers obtain their real list through slot 12.
+- **Unsupported slots.** Upstream recorded unmodelled list slots and returned 0. Here they return `E_NOTIMPL` and mark the list. `Close` then fails and queue `ExecuteCommandLists` refuses the submission until `Reset`.
+- **Console slot 59.** It is not forwarded as `SetPredication`, because a retail-title measurement in `docs/d3d12_vulkan.md` places a dispatch there.
+- **Upload arena fallback.** The fallback that handed out host `VirtualAlloc` memory, with its own address used as the GPU address, is removed. A device that cannot map an UPLOAD buffer gets 0. Allocation aligns absolute addresses, and the IA/SO views are translated in fixed stack copies instead of per-list vectors.
+- **List types.** Slot 73 refuses copy and unknown type words instead of coercing them to direct, since the console DMA-list vtable is not modelled.
+- **Slot count.** `detect_list_slot_count` uses the SDK's cumulative counts (GCL1 66 … GCL6 80, GCL7 81, GCL8 82).
+- **Cursor position.** The pinned inline-record cursor sits at `+0x580`, past every measured field, instead of `+0x518`.
+- **Not imported.** The PresentX wiring, queue layout detection, SignalX, the list-tail name table, the `gameinput` ordinal, branding and the README/doc rewrites. The queue slot-48 flag translation was not touched, and neither were the DirectStorage and slot-26 code.
+
+The adaptation and interface-boundary correction were written with Claude Code (Claude Opus 5.5) as Moon AI project contributions, then reviewed and built with OpenAI Codex. Five focused CTests pass: three CPU/WARP proxy tests in 0.37 seconds and two queue/allocator tests in 14.93 seconds. The offline retail probe on RTX 5080 records 14 successful graphics calls and three unsupported calls, with no draw or presentation. See STATUS.md for limits.
+
 ## Project identity and tools
 
 Palmwave is developed under [Moon AI](https://realmoon.ai), the AI platform created by Stellarr Studio. The maintainer account is [fablinoo](https://github.com/fablinoo). The initial setup was AI-assisted with OpenAI Codex and OpenAI image generation; Claude Code was assigned a read-only source review. This records the actual tool provenance.

@@ -773,9 +773,33 @@ Queues and fences are wrapped the same way.
   and `Evict` (34/35), `SetEventOnMultipleFenceCompletion` (45), `SetResidencyPriority` (46) and
   `EnqueueMakeResident` (50).
 - **QueryInterface.** It answers only the modelled interfaces, so no real object reaches the title.
-- **What is not covered.** Command lists are not wrapped yet: `ExecuteCommandLists` passes the lists through,
-  and a heap proxy given to a list's `SetDescriptorHeaps` reaches the real list unchanged. The command-list
-  proxy of §3.5a adds the unwrap at both places.
+- **Command lists.** Two separate paths. Lists from the PC slot 12 are not wrapped, so callers compiled against
+  the PC headers (the synthetic GPU tests and fixtures) keep the PC vtable, and `ExecuteCommandLists` passes them
+  through. Lists from the console slot 73 (`CreateCommandListX`) come back behind a console-shaped list proxy
+  (adapted from upstream PR #2490; see `UPSTREAM.md`):
+  - **Object.** The console body of §3.4/§3.5a starts at `+0x18`. The inline-record cursor (`+0x18`) and both
+    limits (`+0x28`, `+0x30`) are pinned to one address past the measured fields, so the console SDK's inline
+    writers always find the buffer full and call the vtable method. Flag bytes, the header table at `+0x344` and
+    the pipeline record at `+0x544` stay zero.
+  - **Slot table (160 slots).** The PC order runs through 26, 27–30 are console-only, and the PC chain is
+    shifted +4 through 58. Then 60 is `EndEvent`, 61 `ExecuteIndirect`, 139 `Reset` (allocator unwrapped), 146 the
+    GCL7 `Barrier` and 148 `AllocateUploadMemory`. Console 59 is deliberately not forwarded: the +4 shift would
+    make it `SetPredication`, but a retail-title measurement puts an indirect/mesh dispatch there
+    ([d3d12_vulkan.md](d3d12_vulkan.md) §8.2, question 2).
+  - **Unsupported slots.** Every other slot is logged once with its first four argument words, traced
+    `unsupported`, and returns `E_NOTIMPL` without a PC call. The list keeps the first such slot. Its `Close`
+    still closes the real list but returns `E_NOTIMPL`, and queue `ExecuteCommandLists` refuses the whole call
+    (traced `refused`) until a successful `Reset`. A partial list therefore never runs as if it were complete.
+  - **Unwrapping.** Queue `ExecuteCommandLists` unwraps list proxies. The list itself unwraps the allocator at
+    `Reset`, a bundle at `ExecuteBundle` and heap proxies at `SetDescriptorHeaps`.
+  - **Upload memory.** `AllocateUploadMemory` carves from persistently mapped UPLOAD buffers. The six root
+    descriptor setters and the index, vertex and stream-output view setters translate an arena pointer to the
+    buffer's GPU address. A device that cannot create and map such a buffer gets 0.
+  - **Types.** Only direct, bundle and compute lists are wrapped. Any other type word (copy, the derived DMA type
+    6, unknown values) is refused with `E_NOTIMPL` instead of being coerced to direct, because the DMA-list
+    vtable is not modelled.
+  - **Tests.** `xs_proxy_mock_test` checks the layout, ownership, forwarding, unwrapping and refusals over
+    synthetic objects. Nothing here has been run against the retail executable or on a GPU.
 
 Command allocators get the same kind of proxy: device slot 9 (`CreateCommandAllocator`) returns one.
 

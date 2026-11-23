@@ -22,6 +22,7 @@
 #include <wrl/client.h>
 
 #include "d3d12_trace.h"
+#include "d3d12_xs_command_list_iid.h"
 #include "d3d12_xs_device.h"
 #include "shims.h"
 
@@ -369,14 +370,29 @@ int main(int argc, char** argv) {
             UINT Type;
             UINT NodeMask;
         } list_desc{D3D12_COMMAND_LIST_TYPE_DIRECT, 7};  // the node mask is ignored by the console call
-        const IID iid_list = __uuidof(ID3D12GraphicsCommandList);
-        ComPtr<ID3D12GraphicsCommandList> xbox_list;
+        // The measured console IID the title passes; the console-shaped proxy is held as IUnknown, never as a PC
+        // graphics list (its table is shifted from the PC one).
+        const IID iid_list = rt::d3d12_xs::kCommandListIidPairs[0].console;
+        ComPtr<IUnknown> xbox_list;
         hr = SUCCEEDED(hr) ? reinterpret_cast<CreateListXFn>(proxy_vtbl[73])(
                                  device.Get(), &list_desc, xbox_allocator.Get(), nullptr, &iid_list,
                                  reinterpret_cast<void**>(xbox_list.GetAddressOf()))
                            : hr;
         check(hr == S_OK && xbox_list != nullptr, "slot 73 CreateCommandListX returns a command list");
+        check(rt::d3d12_xs::is_list_proxy(xbox_list.Get()) &&
+                  rt::d3d12_xs::list_proxy_real_list(xbox_list.Get()) != nullptr,
+              "slot 73 returns the console-shaped list proxy over a real PC list");
         check(rt::d3d12_xs::device_slot_hits(73) == 1, "slot 73 hit counter is 1");
+        if (xbox_list) {
+            void* as_pc = reinterpret_cast<void*>(1);
+            hr = xbox_list->QueryInterface(__uuidof(ID3D12GraphicsCommandList), &as_pc);
+            check(hr == E_NOINTERFACE && as_pc == nullptr,
+                  "the console list refuses ID3D12GraphicsCommandList and clears the output");
+            void* as_base = nullptr;
+            hr = xbox_list->QueryInterface(__uuidof(ID3D12CommandList), &as_base);
+            check(hr == S_OK && as_base == xbox_list.Get(), "the console list answers ID3D12CommandList");
+            if (as_base) static_cast<IUnknown*>(as_base)->Release();
+        }
     }
 
     // Slot 62: an empty root signature and a trivial compute shader through the Xbox signature. The PC entry at
