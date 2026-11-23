@@ -20,7 +20,7 @@ Source revision: original upstream `dde82f27e994337094afc476ded0b1426f6e87e2`, m
 | Driver pipeline creation | Running on RTX 5080; final full-corpus counts pending |
 | Retail dry-run | Exit 0; five modules mapped |
 | Retail initialization | Exit 0; four DLL initializations succeed |
-| Retail execution | Runtime export and TLS-slot-zero blockers fixed; next stop is the DirectStorage factory import before D3D12 |
+| Retail execution | Runtime export, TLS-slot-zero and DirectStorage factory blockers cleared; next stop is a refused file interface before D3D12 |
 | First rendered frame | Not verified |
 
 The scanner candidate is not counted as a shader translation failure. Generated data and full logs are private and stored outside the authoring repository. No game assets have been added to Git.
@@ -48,3 +48,7 @@ The next first-chance exception is an access violation. Debugging confirms that 
 ## FSPX decoder connection
 
 The build now explicitly selects the existing Python RDNA2 decoder for its FSPX step. All 29 programs were rebuilt and passed SPIR-V validation, preserving dispatch metadata and the strict reachable-code gap guard. Main-corpus translation was unchanged. Of the 18 LLVM-baseline outputs, 16 are byte-identical; the other two reflect wave-size and literal-printing differences described in [fspx.md](docs/fspx.md). These are CPU/tool checks; GPU semantics of the 29 programs remain unverified. The focused FSPX/resume checks cover backend selection, dispatch wave size and cache invalidation. Implementation was assisted by Claude Code Opus 5.5 and reviewed in Codex.
+
+## DirectStorage factory
+
+The offline run now passes factory creation and reaches `OpenFile`, which refuses an unrecognized file interface. The shim serves real CPU file/memory queues adapted from upstream PR #4348, with strict interface checks and no host-open fallback when the file-system shim is absent. Both focused CTests (`dstorage`, `unimplemented_policy`) passed in 0.53 seconds. These are synthetic CPU checks; the retail probe on the RTX 5080 still stops before any D3D12 trace or rendered frame. This is a first-chance debugger stop, not a successful guest exit.

@@ -117,7 +117,12 @@ if(WIN32 AND PALMWAVE_BUILD_WINDOWS_RUNTIME)
     shims/xgameruntime_offline.cpp
     shims/library_loader.cpp
     shims/process.cpp
+    shims/dstorage.cpp
   )
+  # dstorage.cpp's guarded_move turns an access violation in a title's buffer into E_DSTORAGE_ACCESS_VIOLATION with
+  # __try. MSVC always catches it; clang-cl only with asynchronous exceptions (as for tiny_dll below). A source file
+  # property, so palmwave and dstorage_test both get it.
+  set_source_files_properties(shims/dstorage.cpp PROPERTIES COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:Clang>:/EHa>")
   add_dependencies(palmwave palmwave_tls_host)
   target_compile_definitions(palmwave PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
   target_compile_options(palmwave PRIVATE /W4 /permissive- /utf-8)
@@ -235,6 +240,19 @@ if(WIN32 AND PALMWAVE_BUILD_WINDOWS_RUNTIME)
   target_compile_options(file_system_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(file_system_test PRIVATE /OPT:NOREF)
   target_link_libraries(file_system_test PRIVATE advapi32)  # the ACL calls of the unlistable-marker-folder check
+
+  # Xbox DirectStorage (DStorageGetFactory under xcrdapi.dll, dstorage_xs.dll and dstorage.dll) over synthetic files:
+  # GAME: paths through the file shims, queues, status arrays, fences and errors. No GPU, no game data.
+  add_executable(dstorage_test
+    test/dstorage_test.cpp
+    shims/dstorage.cpp
+    shims/file_system.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(dstorage_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(dstorage_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(dstorage_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(dstorage_test PRIVATE /OPT:NOREF)
 
   # PALMWAVE_SKIP_INT3 (shims/startup_trace.h): its own executable, the variable is read once per process.
   add_executable(int3_skip_test
@@ -1064,6 +1082,10 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET winhttp_offline_test)
     add_test(NAME winhttp_offline COMMAND winhttp_offline_test)
+  endif()
+  if(WIN32 AND TARGET dstorage_test)
+    add_test(NAME dstorage COMMAND dstorage_test)
+    set_tests_properties(dstorage PROPERTIES TIMEOUT 120)
   endif()
   if(WIN32 AND TARGET api_ref_state_test)
     add_test(NAME api_ref_state COMMAND api_ref_state_test)

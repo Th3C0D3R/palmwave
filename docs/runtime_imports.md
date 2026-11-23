@@ -156,7 +156,7 @@ policy "other" (none is counted as returning an `HRESULT`), and they come from s
 | `xmem.dll` | 7: `XMemAllocDefault`, `XMemAllocatePhysicalPages`, `XMemFreeDefault`, `XMemFreePhysicalPages`, `XMemIsToolsMemAvailable`, `XMemMapPhysicalPages`, `XMemMapPhysicalPagesScatter` | the console's physical page and default allocation routines; `XMemAlloc`, `XMemFree`, `XMemVirtualQuery`, `XMemGetWorkingSetStatistics` and `XMemTransferMemory` already bind |
 | `d3d12_xs.dll` | 1: `D3D12ConfigureVirtualMemoryX` | GPU virtual memory setup |
 | `xg_xs.dll` | 2: `XGCreateTextureComputer`, `XGSuggestSwizzleMode` | texture layout computation |
-| `XCRDAPI.dll` | 1: `DStorageGetFactory` | DirectStorage |
+| `XCRDAPI.dll` | 1: `DStorageGetFactory` | DirectStorage; served since by `runtime/shims/dstorage.cpp` ([directstorage.md](directstorage.md)) |
 | `chad.dll` | 5: `XDspActivate`, `XDspConnectWithMaximumStreamLimit`, `XDspDeactivate`, `XDspDisconnect`, `XDspSubmitCommand` | the audio DSP |
 | `xapu.dll` | 5: `XApuConnect`, `XApuDequeueResult`, `XApuDisconnect`, `XApuEnqueueCommand`, `XApuGetResultCount` | the audio processing unit |
 | `AcpHal.dll` | 9: `AcpHalAllocateShapeContexts`, `AcpHalCreate`, `AcpHalReleaseShapeContexts`, `ApuAlloc`, `ApuCreateHeap`, `ApuFree`, `ApuIsVirtualAddressValid`, `ApuMapApuAddress`, `ApuMapVirtualAddress` | the audio hardware layer |
@@ -286,7 +286,8 @@ mostly correspond one to one to the `xgameruntime.lib` functions. The executable
 
 Bound to the host, those calls would load the PC's Gaming Services runtime, or fail, and never reach the offline
 shims. `runtime/shims/library_loader.cpp` therefore answers `LoadLibrary*` and `GetModuleHandle*` for a module the
-shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `xmem.dll`, `gameinput.dll`) with a
+shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `xmem.dll`, `gameinput.dll`, and the
+DirectStorage modules `xcrdapi.dll`, `dstorage_xs.dll` and `dstorage.dll`, [directstorage.md](directstorage.md)) with a
 pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name the registry doesn't serve is `NULL`
 with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
 
