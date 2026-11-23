@@ -86,6 +86,10 @@ struct DeviceProxy {
     // UploadArena is defined with the list proxy. Lists record on several threads, so the first call installs it by
     // compare-exchange.
     std::atomic<void*> upload_state{nullptr};
+    // The first 32-bit word of the D3D12XboxCreateDevice parameter block (create_device_proxy's xbox_version), or 0
+    // for a proxy made without one (PC-shaped tests and callers). Constant after creation. It selects the queue
+    // proxies' console method layout (see "Versioned console queue layout"); nothing else reads it.
+    std::uint32_t xbox_version = 0;
 };
 
 // Frees the upload arena in proxy_release; defined with the list proxy, where UploadArena is complete.
@@ -908,8 +912,9 @@ HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFII
 // fence) wrap what they create, so a title never holds a PC or Vulkan-layer queue or fence. The proxies forward
 // the public chain in PC order, exactly like the device proxy, and a slot past the PC vtable is logged and refused
 // with E_NOTIMPL. PresentX, SuspendX and ResumeX are queue methods past the public chain
-// (docs/d3d12_command_objects.md §5.3). Their slots are not known and nothing is guessed: the first run of the
-// executable names them in the log.
+// (docs/d3d12_command_objects.md §5.3). Queues of a device created with a console version word take the versioned
+// layout of "Versioned console queue layout" below (public implementation sources, routed before this refusal);
+// version 0 keeps exactly the PC behaviour described here.
 //
 // Slot numbers are those of the Windows SDK 10.0.26100 d3d12.h: ID3D12CommandQueue has 19, ID3D12Fence 11 and
 // ID3D12Fence1 12. That the console keeps these public slots, and keeps device slots 8/32/36/75, is an assumption
@@ -969,6 +974,7 @@ struct ChildProxy {
     void** real_vtable;
     unsigned slot_count;    // public slots the real object implements; the rest of the table is refused
     std::atomic<unsigned long> refs;
+    std::uint32_t xbox_version = 0;  // queues only: the device's xbox_version at creation, selects the queue layout
 };
 
 template <ChildKind K>
@@ -1262,6 +1268,302 @@ LONG CALLBACK table_overrun_handler(EXCEPTION_POINTERS* info) {
     return EXCEPTION_CONTINUE_SEARCH;  // diagnostics only: the fault goes on to the title's handlers or the crash
 }
 
+// Submits `count` lists on the real queue through its PC ExecuteCommandLists (PC queue slot 10). Shared by queue slot
+// 10 (the PC method, void) and the modern console ExecuteCommandListsX (slot 35). A console list proxy that recorded
+// a command it did not execute is never submitted, so no partial list runs as if it were complete: the whole call is
+// refused (the list's Close already returned E_NOTIMPL). Otherwise the array is copied with every list proxy replaced
+// by its real list; the caller's array is never written. S_OK means the real method was called; it is void, so its
+// own outcome is not observable here.
+HRESULT submit_command_lists(ChildProxy* self, std::uint64_t count_word, std::uint64_t lists_word,
+                             const char* trace_name, const char* label) {
+    const auto count = static_cast<std::uint32_t>(count_word);
+    const auto* lists = reinterpret_cast<const std::uint64_t*>(lists_word);
+    for (std::uint32_t i = 0; lists && i < count; ++i) {
+        if (const unsigned slot = list_unsupported_slot(reinterpret_cast<const void*>(lists[i]))) {
+            static std::atomic<bool> logged{false};
+            if (first_call(logged))
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: %s refused: list %u of %u recorded console list slot %u, which is not "
+                             "executed; nothing in this call is submitted\n",
+                             label, i, count, slot);
+            d3d12_trace::record(trace_name, "refused");
+            return E_NOTIMPL;
+        }
+    }
+    UnwrappedArray unwrapped;
+    if (!unwrapped.fill(lists_word, count)) {
+        std::fprintf(stderr, "[rt] d3d12_xs: %s of %u lists not submitted: out of memory\n", label, count);
+        d3d12_trace::record(trace_name, "failed");
+        return E_OUTOFMEMORY;
+    }
+    if (unwrapped.data()) lists_word = unwrapped.data();
+    d3d12_trace::record(trace_name);  // "called": the real method is void
+    using ExecuteFn = void(WINAPI*)(void*, std::uint32_t, std::uint64_t);
+    reinterpret_cast<ExecuteFn>(self->real_vtable[10])(self->real, count, lists_word);
+    return S_OK;
+}
+
+// ---- Versioned console queue layout -------------------------------------------------------------------------------
+//
+// The console queue's method order depends on the version word of the D3D12XboxCreateDevice parameter block
+// (DeviceProxy::xbox_version, copied into each queue proxy at creation). Public implementation sources, neither of
+// them a hardware or SDK document:
+//   - OpenScarlett (https://github.com/californiaAlmonds/OpenScarlett, 87cdba6a16052a5809f904ed5725d70e50521744, MIT,
+//     src/shims/d3d12_xs_shim.cpp GetPatchedVtbl): for Version >= 0x20004, Signal 16, Wait 17,
+//     GetTimestampFrequency 18, GetClockCalibration 19, GetDesc 20, SuspendX 23, ResumeX 24, SignalX 25, PresentX 32,
+//     and a four-argument list submission at 35; below 0x20004 the PC slots plus PresentX 30. It inserts its two
+//     extra slots at 14/15 and answers them with S_OK, keeping 8..13 in PC order.
+//   - FiveStar (https://github.com/ThatRecompDev/five-star-recomp, 18e225d2cbd526ba710beb69b7884d6c758d9291,
+//     GPL-3.0-or-later, src/FiveStar.Loader/Shims/D3D12X/XboxInterfaces.cs, XboxQueueMethods.cs, PresentSlots.cs,
+//     docs/d3d12x-shim.md): its own inferences from call sites agree on 16..20, 23, 24, 32 and 35, but shift the
+//     whole chain by two (ExecuteCommandLists at 12, SetMarker..EndEvent at 13..15).
+// No code is taken from either. The two disagree on modern slots 8..15, so none of those is routed: they are refused
+// with E_NOTIMPL rather than given either source's meaning. Only the slots both name the same are routed. Layouts:
+//   pc       version 0 (no parameter block, PC-shaped callers and tests): the existing PC forwarding, unchanged.
+//   legacy   0 < version < 0x20004: PC forwarding, plus slot 30 recognised as PresentX (refused, below).
+//   modern   version == 0x20004 exactly (the value OpenScarlett and FiveStar name and a local probe recorded).
+//   unknown  version > 0x20004: every method past IUnknown/ID3D12Object/ID3D12DeviceChild (slots 0..7) is refused,
+//            since neither source documents a later layout and OpenScarlett's ">=" is not evidence for it.
+//
+// Modern routing (console slot -> PC slot of the real queue): 16 -> 14 Signal and 17 -> 15 Wait (the fence proxy is
+// unwrapped), 18 -> 16 GetTimestampFrequency, 19 -> 17 GetClockCalibration, 20 -> 18 GetDesc in either struct-return
+// form (below), 35 ExecuteCommandListsX (below). Recognised but not implemented, E_NOTIMPL with a named trace:
+// 23 SuspendX, 24 ResumeX, 25 SignalX, 32 PresentX. PresentX (and legacy 30) is refused because the plane and
+// parameter layouts are not established (docs/BLOCKERS.md, "Queue PresentX bridge"); no frame is claimed.
+//
+// GetDesc (modern 20). The PC C++ form is (this = queue, RDX = return buffer); the console form measured for device
+// slots 25/26 puts the return buffer in RCX and the object in RDX, and OpenScarlett and FiveStar both handle that
+// swapped form here. The thunk identifies which register holds a queue proxy before it reads anything else, fills
+// the buffer through the real PC GetDesc and returns the buffer's address in RAX. With neither register a queue
+// proxy, or a null buffer, nothing is written and RAX is 0.
+//
+// ExecuteCommandListsX (modern 35): (count, lists, third word, fourth word as a 32-bit flags value) -> HRESULT. The
+// sources call the third word a frame token or a frame object and the fourth flags (FiveStar reports 0 or 3); both
+// sources ignore them and always report success. Their meaning is not established, so only 0 and 0 are accepted:
+// anything else is refused with E_NOTIMPL, logged with the exact values, and nothing is submitted. A zero count, a
+// null array or a null entry is E_INVALIDARG, and so is an entry that is a device, heap, queue, fence or allocator
+// proxy instead of a command list; nothing is submitted then either. Accepted calls go through submit_command_lists,
+// as slot 10 does, and return S_OK only after the real ExecuteCommandLists was called (E_NOTIMPL for a list with an
+// unexecuted console command, E_OUTOFMEMORY when the unwrapped copy cannot be allocated).
+
+enum class QueueLayout { pc, legacy, modern, unknown };
+
+constexpr std::uint32_t kXboxQueueModernVersion = 0x00020004u;
+constexpr unsigned kModernSignal = 16, kModernWait = 17, kModernTimestampFrequency = 18,
+                   kModernClockCalibration = 19, kModernGetDesc = 20, kModernSuspendX = 23, kModernResumeX = 24,
+                   kModernSignalX = 25, kModernPresentX = 32, kModernExecuteCommandListsX = 35;
+constexpr unsigned kLegacyPresentX = 30;
+static_assert(kModernExecuteCommandListsX < kQueueSlots, "the console queue slots must be inside the proxy table");
+
+// PresentX is recognised but its plane/parameter layout is not established: this named E_NOTIMPL is its answer.
+constexpr HRESULT kPresentXLayoutUnestablished = E_NOTIMPL;
+
+QueueLayout queue_layout(std::uint32_t version) {
+    if (version == 0) return QueueLayout::pc;
+    if (version < kXboxQueueModernVersion) return QueueLayout::legacy;
+    if (version == kXboxQueueModernVersion) return QueueLayout::modern;
+    return QueueLayout::unknown;
+}
+
+// Trace names for routed or refused console queue slots (fixed strings, the runtime/README.md grammar).
+const char* console_queue_trace_name(unsigned slot) {
+    switch (slot) {
+        case kModernSignal: return "XboxID3D12CommandQueue::Signal";
+        case kModernWait: return "XboxID3D12CommandQueue::Wait";
+        case kModernTimestampFrequency: return "XboxID3D12CommandQueue::GetTimestampFrequency";
+        case kModernClockCalibration: return "XboxID3D12CommandQueue::GetClockCalibration";
+        case kModernGetDesc: return "XboxID3D12CommandQueue::GetDesc";
+        case kModernSuspendX: return "XboxID3D12CommandQueue::SuspendX";
+        case kModernResumeX: return "XboxID3D12CommandQueue::ResumeX";
+        case kModernSignalX: return "XboxID3D12CommandQueue::SignalX";
+        case kModernPresentX: return "XboxID3D12CommandQueue::PresentX";
+        case kModernExecuteCommandListsX: return "XboxID3D12CommandQueue::ExecuteCommandListsX";
+        default: break;
+    }
+    static const auto names = [] {
+        static char storage[kQueueSlots][64];
+        for (unsigned s = 0; s < kQueueSlots; ++s)
+            std::snprintf(storage[s], sizeof(storage[s]), "XboxID3D12CommandQueue::ConsoleSlot%u", s);
+        return &storage;
+    }();
+    return (*names)[slot < kQueueSlots ? slot : 0];
+}
+
+// Counts a console-routed queue slot and logs its first call with the console name.
+void note_console_queue_slot(unsigned slot, const char* name) {
+    using S = ChildStats<ChildKind::queue>;
+    if (slot >= S::kSlots) return;
+    count_hit(S::hits[slot]);
+    if (first_call(S::first[slot]))
+        std::fprintf(stderr, "[rt] d3d12_xs: queue console slot %u (%s) first call\n", slot, name);
+}
+
+// A refused console queue slot: E_NOTIMPL, logged once per slot with the layout and the first four argument words.
+std::uint64_t refuse_console_queue_slot(unsigned slot, std::uint32_t version, const char* why, std::uint64_t a1,
+                                        std::uint64_t a2, std::uint64_t a3, std::uint64_t a4,
+                                        HRESULT hr = E_NOTIMPL) {
+    const char* name = slot == kLegacyPresentX && queue_layout(version) == QueueLayout::legacy
+                           ? "XboxID3D12CommandQueue::PresentX"
+                           : console_queue_trace_name(slot);
+    note_console_queue_slot(slot, name);
+    bool expected = false;
+    if (ChildStats<ChildKind::queue>::beyond_warned[slot].compare_exchange_strong(expected, true,
+                                                                                   std::memory_order_relaxed))
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: %s (queue slot %u, version 0x%08x) refused, 0x%08lx: %s (args 0x%llx 0x%llx "
+                     "0x%llx 0x%llx)\n",
+                     name, slot, version, static_cast<unsigned long>(hr), why, static_cast<unsigned long long>(a1),
+                     static_cast<unsigned long long>(a2), static_cast<unsigned long long>(a3),
+                     static_cast<unsigned long long>(a4));
+    d3d12_trace::record(name, "unsupported");
+    return hr_to_u64(hr);
+}
+
+// True when `object` is a proxy of this file that is not a command list (device, heap, queue, fence, allocator).
+bool is_non_list_proxy(const void* object) {
+    if (!object) return false;
+    if (is_device_proxy(object)) return true;
+    return proxy_real_object(object) && !list_real_or_null(object);
+}
+
+// Modern console slot 35. See the layout comment above for the accepted values.
+HRESULT execute_command_lists_x(ChildProxy* self, std::uint64_t count_word, std::uint64_t lists_word,
+                                std::uint64_t third_word, std::uint64_t flags_word) {
+    const char* name = console_queue_trace_name(kModernExecuteCommandListsX);
+    const auto count = static_cast<std::uint32_t>(count_word);
+    const auto flags = static_cast<std::uint32_t>(flags_word);
+    const auto* lists = reinterpret_cast<const std::uint64_t*>(lists_word);
+    static std::atomic<unsigned> logged{0};
+    const auto report = [&](const char* why) {
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: ExecuteCommandListsX (queue slot 35) refused: %s (count %u, lists 0x%llx, "
+                         "third word 0x%llx, flags 0x%x); nothing is submitted\n",
+                         why, count, static_cast<unsigned long long>(lists_word),
+                         static_cast<unsigned long long>(third_word), flags);
+    };
+    if (!count || !lists) {
+        report("zero count or null list array");
+        d3d12_trace::record(name, "refused");
+        return E_INVALIDARG;
+    }
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const auto* list = reinterpret_cast<const void*>(lists[i]);
+        if (!list || is_non_list_proxy(list)) {
+            report(list ? "an entry is a proxy of another kind, not a command list" : "a null list entry");
+            d3d12_trace::record(name, "refused");
+            return E_INVALIDARG;
+        }
+    }
+    if (third_word != 0 || flags != 0) {
+        report("a non-zero frame word or flags value, whose meaning is not established");
+        d3d12_trace::record(name, "unsupported");
+        return E_NOTIMPL;
+    }
+    return submit_command_lists(self, count, lists_word, name, "ExecuteCommandListsX");
+}
+
+// Modern console slot 20, either struct-return form. `rcx` may be the caller's buffer, not a proxy.
+// Returns false only for the PC form on a queue whose layout is not modern (the unchanged default path then runs).
+bool console_queue_get_desc(void* rcx, std::uint64_t a1, std::uint64_t& result) {
+    ChildProxy* proxy = nullptr;
+    void* out = nullptr;
+    bool console_form = false;
+    if (is_child_proxy<ChildKind::queue>(rcx)) {
+        proxy = static_cast<ChildProxy*>(rcx);
+        out = reinterpret_cast<void*>(a1);
+    } else if (is_child_proxy<ChildKind::queue>(reinterpret_cast<const void*>(a1))) {
+        proxy = reinterpret_cast<ChildProxy*>(a1);
+        out = rcx;
+        console_form = true;
+    } else {
+        refuse_console_queue_slot(kModernGetDesc, 0, "neither RCX nor RDX is a queue proxy", 0, a1, 0, 0);
+        result = 0;
+        return true;
+    }
+    if (queue_layout(proxy->xbox_version) != QueueLayout::modern) {
+        if (!console_form) return false;
+        refuse_console_queue_slot(kModernGetDesc, proxy->xbox_version,
+                                  "console-form GetDesc on a queue whose layout has no GetDesc at slot 20", 0, a1, 0,
+                                  0);
+        result = 0;
+        return true;
+    }
+    const char* name = console_queue_trace_name(kModernGetDesc);
+    note_console_queue_slot(kModernGetDesc, name);
+    if (!out) {
+        d3d12_trace::record(name, "refused");
+        result = 0;
+        return true;
+    }
+    d3d12_trace::record(name);
+    using GetDescFn = D3D12_COMMAND_QUEUE_DESC*(WINAPI*)(void*, D3D12_COMMAND_QUEUE_DESC*);
+    reinterpret_cast<GetDescFn>(proxy->real_vtable[18])(proxy->real, static_cast<D3D12_COMMAND_QUEUE_DESC*>(out));
+    result = reinterpret_cast<std::uint64_t>(out);
+    return true;
+}
+
+// Called by every queue thunk at slot 8 or above before the PC path. True when the slot was answered here (`result`
+// is the RAX value); false leaves the existing PC forwarding and beyond-public refusal unchanged.
+bool route_console_queue_slot(void* rcx, unsigned slot, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
+                              std::uint64_t a4, std::uint64_t& result) {
+    if (slot == kModernGetDesc) return console_queue_get_desc(rcx, a1, result);
+    auto* self = static_cast<ChildProxy*>(rcx);
+    const std::uint32_t version = self->xbox_version;
+    switch (queue_layout(version)) {
+        case QueueLayout::pc:
+            return false;
+        case QueueLayout::legacy:
+            if (slot != kLegacyPresentX) return false;
+            result = refuse_console_queue_slot(slot, version,
+                                               "PresentX (legacy slot 30): plane/parameter layout not established",
+                                               a1, a2, a3, a4, kPresentXLayoutUnestablished);
+            return true;
+        case QueueLayout::unknown:
+            result = refuse_console_queue_slot(slot, version, "no queue layout is known for this device version", a1,
+                                               a2, a3, a4);
+            return true;
+        case QueueLayout::modern:
+            break;
+    }
+    using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t);
+    const auto forward = [&](unsigned pc_slot, std::uint64_t first) {
+        const char* name = console_queue_trace_name(slot);
+        note_console_queue_slot(slot, name);
+        d3d12_trace::record(name);
+        return reinterpret_cast<ForwardFn>(self->real_vtable[pc_slot])(self->real, first, a2);
+    };
+    switch (slot) {
+        case kModernSignal: result = forward(kQueueSignal, unwrap_object(a1)); return true;
+        case kModernWait: result = forward(kQueueWait, unwrap_object(a1)); return true;
+        case kModernTimestampFrequency: result = forward(16, a1); return true;
+        case kModernClockCalibration: result = forward(17, a1); return true;
+        case kModernExecuteCommandListsX: {
+            note_console_queue_slot(slot, console_queue_trace_name(slot));
+            result = hr_to_u64(execute_command_lists_x(self, a1, a2, a3, a4));
+            return true;
+        }
+        case kModernPresentX:
+            result = refuse_console_queue_slot(slot, version,
+                                               "PresentX (modern slot 32): plane/parameter layout not established",
+                                               a1, a2, a3, a4, kPresentXLayoutUnestablished);
+            return true;
+        case kModernSuspendX:
+        case kModernResumeX:
+        case kModernSignalX:
+            result = refuse_console_queue_slot(slot, version, "recognised console method, not implemented", a1, a2,
+                                               a3, a4);
+            return true;
+        default:
+            result = refuse_console_queue_slot(
+                slot, version,
+                slot < kModernSignal ? "the public sources disagree on this modern slot (8..15)"
+                                     : "not a routed slot of the modern layout",
+                a1, a2, a3, a4);
+            return true;
+    }
+}
+
 template <ChildKind K, unsigned Slot>
 std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -1280,6 +1582,12 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         return hr_to_u64(child_get_device<K>(self, reinterpret_cast<const IID*>(a1),
                                              reinterpret_cast<void**>(a2)));
     } else {
+        // Console queue layouts first (see "Versioned console queue layout"); slot 20 may arrive with the caller's
+        // struct-return buffer in RCX, so `self` is not read before the router has identified the proxy.
+        if constexpr (K == ChildKind::queue && Slot >= 8) {
+            std::uint64_t routed = 0;
+            if (route_console_queue_slot(self, Slot, a1, a2, a3, a4, routed)) return routed;
+        }
         note_child_slot<K>(Slot);
         if (Slot >= self->slot_count) {
             bool expected = false;
@@ -1295,33 +1603,11 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             d3d12_trace::record(child_trace_name<K>(Slot), "unsupported");
             return hr_to_u64(E_NOTIMPL);
         }
-        // Queue slot 10: ExecuteCommandLists(count, lists), void. A console list proxy that recorded a command it did
-        // not execute is never submitted, so no partial list runs as if it were complete; the whole call is refused
-        // (the list's Close already returned E_NOTIMPL). Otherwise the array is copied with every list proxy
-        // replaced by its real list.
-        UnwrappedArray unwrapped;
+        // Queue slot 10: ExecuteCommandLists(count, lists), void (submit_command_lists: refusal of lists with
+        // unexecuted console commands, proxy unwrapping into a copy).
         if constexpr (K == ChildKind::queue && Slot == 10) {
-            const auto count = static_cast<std::uint32_t>(a1);
-            const auto* lists = reinterpret_cast<const std::uint64_t*>(a2);
-            for (std::uint32_t i = 0; lists && i < count; ++i) {
-                if (const unsigned slot = list_unsupported_slot(reinterpret_cast<const void*>(lists[i]))) {
-                    static std::atomic<bool> logged{false};
-                    if (first_call(logged))
-                        std::fprintf(stderr,
-                                     "[rt] d3d12_xs: ExecuteCommandLists refused: list %u of %u recorded console list "
-                                     "slot %u, which is not executed; nothing in this call is submitted\n",
-                                     i, count, slot);
-                    d3d12_trace::record(child_trace_name<K>(Slot), "refused");
-                    return 0;
-                }
-            }
-            if (!unwrapped.fill(a2, a1)) {
-                std::fprintf(stderr, "[rt] d3d12_xs: ExecuteCommandLists of %u lists not submitted: out of memory\n",
-                             count);
-                d3d12_trace::record(child_trace_name<K>(Slot), "failed");
-                return 0;
-            }
-            if (unwrapped.data()) a2 = unwrapped.data();
+            (void)submit_command_lists(self, a1, a2, child_trace_name<K>(Slot), "ExecuteCommandLists");
+            return 0;
         }
         d3d12_trace::record(child_trace_name<K>(Slot));  // "called": the real object's result is not inspected
         if constexpr (K == ChildKind::queue && (Slot == kQueueSignal || Slot == kQueueWait)) a1 = unwrap_object(a1);
@@ -1410,6 +1696,7 @@ HRESULT wrap_child(IUnknown* created, DeviceProxy* device, const IID* riid, void
         proxy->slot_count = kAllocatorPublicSlots;
     }
     proxy->refs.store(1, std::memory_order_relaxed);
+    proxy->xbox_version = (K == ChildKind::queue && device) ? device->xbox_version : 0;
     proxy_add_ref(device);  // the object keeps its Xbox-ABI device alive for GetDevice
 
     const HRESULT hr = child_query_interface<K>(proxy, riid, out);
@@ -3354,13 +3641,14 @@ unsigned detect_slot_count(ID3D12Device* real) {
 
 }  // namespace
 
-HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out) {
+HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out, std::uint32_t xbox_version) {
     if (!real) return E_POINTER;
     if (!out) return E_POINTER;
     *out = nullptr;
 
     DeviceProxy* proxy = new (std::nothrow) DeviceProxy;
     if (!proxy) return E_OUTOFMEMORY;
+    proxy->xbox_version = xbox_version;
     proxy->vtable = get_vtable();
     proxy->real = real;
     proxy->real_vtable = *reinterpret_cast<void***>(real);
@@ -3538,6 +3826,10 @@ ID3D12CommandQueue* queue_proxy_real_queue(const void* queue) {
 ID3D12Fence* fence_proxy_real_fence(const void* fence) {
     if (!is_fence_proxy(fence)) return nullptr;
     return reinterpret_cast<ID3D12Fence*>(static_cast<const ChildProxy*>(fence)->real);
+}
+
+std::uint32_t queue_proxy_xbox_version(const void* queue) {
+    return is_queue_proxy(queue) ? static_cast<const ChildProxy*>(queue)->xbox_version : 0;
 }
 
 unsigned queue_proxy_slot_count(const void* queue) {

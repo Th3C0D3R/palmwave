@@ -67,9 +67,12 @@
 // proxies of the same kind: the public chain (19 queue slots, 11 or 12 fence slots in SDK 10.0.26100) is forwarded
 // in PC order, and a slot past it, up to the end of the proxy's table (128 queue, 64 fence slots), is logged with its
 // first four argument words and refused with E_NOTIMPL. A slot past the table faults on the vtable read inside a
-// reserved, never-committed region, and the fault is logged with the slot. That is where the console's queue methods
-// (PresentX, SuspendX, ResumeX) will show up; their slots are not known and are not guessed, and that the console
-// keeps the public slots is an assumption (docs/d3d12_command_objects.md §5.2). Heap, queue and fence proxies are
+// reserved, never-committed region, and the fault is logged with the slot. A device created with a console version
+// word (create_device_proxy's xbox_version) gives its queues a versioned console layout instead: for 0x00020004,
+// Signal 16, Wait 17, GetTimestampFrequency 18, GetClockCalibration 19, GetDesc 20 (both struct-return forms) and a
+// strict ExecuteCommandListsX 35; PresentX (32, or 30 below 0x20004), SuspendX, ResumeX and SignalX are recognised
+// and refused with E_NOTIMPL; slots 8..15 are refused because the public sources disagree. Version 0 keeps the PC
+// layout, whose console use is an assumption (docs/d3d12_command_objects.md §5.2). Heap, queue and fence proxies are
 // unwrapped wherever a device or queue method hands them to the real runtime: queue Signal/Wait (14/15), device
 // CreateSharedHandle (31), MakeResident/Evict (34/35), SetEventOnMultipleFenceCompletion (45), SetResidencyPriority
 // (46) and EnqueueMakeResident (50). QueryInterface answers only the modelled interfaces; one the real object has but
@@ -103,7 +106,12 @@ namespace rt::d3d12_xs {
 // Wraps `real` and returns the requested device interface through `out`. Takes ownership of one reference to
 // `real` on success; on failure the caller keeps its reference. Returns E_NOINTERFACE if `riid` is not a D3D12
 // device interface the PC device implements.
-HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out);
+// `xbox_version` is the first 32-bit word of the D3D12XboxCreateDevice parameter block. It selects the console method
+// layout of the queues this device creates: 0 (the default, no parameter block) keeps the PC queue layout unchanged;
+// 0x00020004 selects the modern console layout (queue Signal 16 ... GetDesc 20, ExecuteCommandListsX 35); a smaller
+// non-zero value keeps the PC layout and recognises PresentX at 30; a larger one refuses every queue method past
+// slot 7. See "Versioned console queue layout" in d3d12_xs_device.cpp. Nothing else depends on it.
+HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out, std::uint32_t xbox_version = 0);
 
 // True when `device` points at a proxy created by create_device_proxy. Used by the tests.
 bool is_device_proxy(const void* device);
@@ -296,6 +304,8 @@ ID3D12CommandQueue* queue_proxy_real_queue(const void* queue);
 ID3D12Fence* fence_proxy_real_fence(const void* fence);
 // Public slots forwarded (19 for a queue; 11 or 12 for a fence), and the size of the proxy's vtable.
 unsigned queue_proxy_slot_count(const void* queue);
+// The device version a queue proxy took its console layout from (0 for the PC layout or a non-queue). Test helper.
+std::uint32_t queue_proxy_xbox_version(const void* queue);
 unsigned fence_proxy_slot_count(const void* fence);
 unsigned queue_proxy_table_size();
 unsigned fence_proxy_table_size();

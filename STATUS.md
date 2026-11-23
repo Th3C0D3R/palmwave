@@ -246,3 +246,16 @@ one experimental, two refused and two failed). Allocation information still succ
 committed-texture route still rejects the console resource flags. No Draw, ExecuteCommandLists, Present
 or rendered frame was observed. Signed relative addressing is being investigated independently of the texture
 and presentation work.
+
+## Versioned console command queues
+
+The device's measured version word now selects the console queue method layout. For version 0x20004,
+Signal, Wait, timestamp frequency, clock calibration and GetDesc route through typed calls; list submission
+at slot 35 unwraps the command lists and retains the guard against partially implemented lists.
+Unknown frame words, flags and ambiguous queue-prefix methods are refused explicitly. Version zero retains
+the PC layout. PresentX is recognized but awaits the separate real presenter bridge.
+
+The combined runtime passed 17 focused CPU/WARP CTests in 0.48 seconds; this change has no new GPU result.
+The last GPU integration result remains 24 targeted tests on RTX 5080 / 621.14. Public implementations were
+compared at pinned revisions and their disagreements are recorded in docs/BLOCKERS.md. No retail submission
+or frame is claimed by these adapter tests.

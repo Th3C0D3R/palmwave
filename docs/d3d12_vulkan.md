@@ -3386,7 +3386,11 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   display; with FIFO presents the swapchain holds the queue to the real refresh anyway), render statistics,
   `PercentScanned` of frames shown at a vblank (a scan position is never measured), and the vtable wiring. Slots to measure (all unknown): the device's `SetFrameIntervalX`,
   `ScheduleFrameEventX`, `WaitFrameEventX`, `GetFrameStatisticsX` and the queue's `PresentX`, `SuspendX`, `ResumeX`
-  (the list is in the header).
+  (the list is in the header). Queue slots now follow public implementation sources by device version (OpenScarlett and
+  FiveStar; for `0x20004`, PresentX 32, SuspendX 23, ResumeX 24). The proxy recognises them but returns `E_NOTIMPL`:
+  the queue is not yet connected to `XboxPresentation`. The plane bytes, a token source shared with the device's frame
+  slots, presenter ownership and per-queue ordering come first (docs/BLOCKERS.md, "Versioned console queue layout and
+  the PresentX bridge"). "One `VkQueue` behind all of them" above is stale: see 4.4, `pick_queue_slot`.
 - *Tests*: `frame_pacer_test` (fake clock: interval, offset, late waits, timeouts, latency blocking, tokens,
   statistics, suspend/resume, a real 10 ms timer; no GPU) and `xbox_present_test` (the Vulkan device, reading the
   swapchain image back: blank, solid, two colours, source rectangles, RGBA/BGRA/sRGB sources, 2 planes, plane composition

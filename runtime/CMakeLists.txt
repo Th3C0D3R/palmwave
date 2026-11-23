@@ -201,6 +201,13 @@ if(WIN32 AND PALMWAVE_BUILD_WINDOWS_RUNTIME)
     )
     target_compile_definitions(xs_proxy_mock_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(xs_proxy_mock_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    # The versioned console queue layout (PC, legacy, modern 0x20004, unknown) over synthetic COM objects.
+    add_executable(xs_queue_version_test
+      test/xs_queue_version_test.cpp
+      shims/d3d12_xs_device.cpp
+    )
+    target_compile_definitions(xs_queue_version_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(xs_queue_version_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
   else()
     message(STATUS "d3d12.lib not found: root_sig_test and device_proxy_test are not built")
   endif()
@@ -930,8 +937,12 @@ if(BUILD_TESTING)
     # and the line with run-specific pointers does not.
     add_test(NAME device_proxy_trace COMMAND device_proxy_test --trace-d3d12)
     set_tests_properties(device_proxy_trace PROPERTIES SKIP_RETURN_CODE 77
-        PASS_REGULAR_EXPRESSION "D3D12XboxCreateDevice params\\[24\\] =1234abcd"
+        PASS_REGULAR_EXPRESSION "D3D12XboxCreateDevice params\\[24\\] =00000000 1234abcd"
         FAIL_REGULAR_EXPRESSION "FAIL;D3D12XboxCreateDevice adapter=")
+  endif()
+  if(TARGET xs_queue_version_test)
+    add_test(NAME xs_queue_version COMMAND xs_queue_version_test)
+    set_tests_properties(xs_queue_version PROPERTIES FAIL_REGULAR_EXPRESSION "xs_queue_version line [0-9]+:")
   endif()
   if(TARGET xs_proxy_mock_test)
     add_test(NAME xs_proxy_mock COMMAND xs_proxy_mock_test)

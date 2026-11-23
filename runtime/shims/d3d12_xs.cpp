@@ -181,6 +181,15 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
     } else {
         std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice params = null\n");
     }
+    // Word 0 is the parameter block's version. It selects the console queue method layout of the device's queues
+    // (create_device_proxy; public OpenScarlett/FiveStar sources, not an SDK document). No block keeps the PC layout.
+    const std::uint32_t xbox_version = params ? *static_cast<const std::uint32_t*>(params) : 0;
+    std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice version word 0x%08x selects the %s queue layout\n",
+                 static_cast<unsigned>(xbox_version),
+                 xbox_version == 0              ? "PC"
+                 : xbox_version < 0x00020004u   ? "legacy console"
+                 : xbox_version == 0x00020004u  ? "modern console"
+                                                : "unknown (refused) console");
 
     static std::atomic<bool> proxy_logged{false};
     if (!proxy_logged.exchange(true, std::memory_order_relaxed)) {
@@ -203,7 +212,7 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
                          static_cast<unsigned long>(vhr));
             return result(method, vhr);
         }
-        vhr = rt::d3d12_xs::create_device_proxy(vulkan, *riid, out);
+        vhr = rt::d3d12_xs::create_device_proxy(vulkan, *riid, out, xbox_version);
         if (FAILED(vhr)) {
             vulkan->Release();
             std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice: proxy over the Vulkan device failed "
@@ -231,7 +240,7 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
         return result(method, FAILED(hr) ? hr : E_FAIL);
     }
 
-    hr = rt::d3d12_xs::create_device_proxy(real, *riid, out);
+    hr = rt::d3d12_xs::create_device_proxy(real, *riid, out, xbox_version);
     if (FAILED(hr)) {
         // create_device_proxy keeps the caller's reference on failure.
         real->Release();
