@@ -23,7 +23,7 @@ Palmwave is an experimental open-source Xbox Series compatibility layer and shad
 
 **Xbox Series title's Xbox Series executable starts on PC and reaches Vulkan graphics initialization on NVIDIA RTX 5080. It then stops during startup. No menu or rendered game frame has been observed.**
 
-**Local compatibility milestone: graphics device reached.** The default run creates five queues, five fences, an allocator and the first Xbox command list, then stops at unimplemented list methods 132 and 131. An explicitly opt-in synchronization experiment reaches **581 command lists created and closed**, then stops at memory-backed resource creation. This experimental result does not establish a stable launch or a first frame. Measurements and limitations are recorded in [STATUS.md](STATUS.md); a successful presentation call alone would not establish a rendered image.
+**Local compatibility milestone: graphics device reached.** The default run creates five queues, five fences, an allocator and the first Xbox command list, then stops at unimplemented list methods 132 and 131. With the explicitly opt-in synchronization and host-memory experiments, the run reaches **581 command lists created and closed, a real 174 MiB buffer import and the first descriptor heap**. It then stops at the title's assertion on the heap's CPU descriptor address. This experimental result does not establish a stable launch or a first frame. Measurements and limitations are recorded in [STATUS.md](STATUS.md); a successful presentation call alone would not establish a rendered image.
 
 Palmwave starts from the GPL-3.0 [Leonida](https://github.com/ItsNotRexed/Leonida) source at `dde82f27e`, with a new Git history. The loader, translator, runtime, tests and technical documentation originate there. Original copyrights, licenses and third-party notices are retained; see [UPSTREAM.md](UPSTREAM.md).
 
@@ -53,7 +53,7 @@ Measured on **Ryzen 9 9950X3D / NVIDIA RTX 5080 16 GB / driver 621.14 / Windows 
 | GPU pipeline creation | In progress; full-pass result pending |
 | Retail dry-run / initialization | Both exit 0; four DLL initializations succeed |
 | Retail execution | Vulkan device, five queues, five fences, an allocator and the first Xbox command list created on RTX 5080; recording stops at methods 132 and 131 |
-| Opt-in synchronization diagnostic | 581 lists created and closed; stops at Xbox memory-backed resource creation; experimental ABI hypothesis |
+| Opt-in startup diagnostics | 581 lists created and closed; real 174 MiB buffer imported; first descriptor heap created; stops at the CPU descriptor-address assertion; experimental ABI hypotheses |
 | First rendered frame | Not verified |
 
 These counts are preparation results, not gameplay or rendering results. Historical measurements in the inherited `docs/` remain attributed to their original authors and hardware.
