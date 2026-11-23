@@ -21,6 +21,9 @@
 //   - --host-import-experiment on|off: device slot 133's opt-in experiment (PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT, set
 //     by CTest for the process, never by the test): the one experimental tuple reaches the handler as UAV / COMMON
 //     only when the variable is "1"; every near miss is refused before the handler either way.
+//   - device slot 127 (ten words, ID3D12Device10::CreateCommittedResource3): every word reaches the PC slot 76 of the
+//     interface pointer QueryInterface returned, unchanged (unknown flags included, refused by the mock backend);
+//     --slot127 runs it with the D3D12 trace on; --env-slots-127 moves a configured route onto 127, which must win.
 // Every device, queue, fence and resource here is a mock that records the calls it gets. No game data, no Xbox DLLs.
 #include "../shims/d3d12_xs_device.h"
 #include "../shims/d3d12_trace.h"
@@ -117,6 +120,11 @@ struct Mock {
     bool create_null;       // device: creation returns create_result with no object
     HRESULT create_result;   // device: what creation returns (S_OK makes the object)
     Mock* last_child;        // device: the object its last creation or open made
+    // device: QueryInterface(ID3D12Device10) is counted, refused when refuse_device10 is set, and answered with
+    // device10_alias (a separate interface object) when that is set.
+    unsigned device10_queries;
+    bool refuse_device10;
+    Mock* device10_alias;
     bool validate_queue_desc;  // device: opt in to the PC queue-description contract
     bool has_queue_desc;
     D3D12_COMMAND_QUEUE_DESC last_queue_desc;  // snapshot before a forwarded local copy expires
@@ -226,6 +234,17 @@ HRESULT mock_query(Mock* m, const IID* riid, void** out) {
             return S_OK;
         }
     }
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+    if (riid && m->kind == Kind::device && IsEqualIID(*riid, __uuidof(ID3D12Device10))) {
+        ++m->device10_queries;
+        if (m->refuse_device10) return E_NOINTERFACE;
+        if (m->device10_alias && mock_has(m, *riid)) {
+            *out = m->device10_alias;
+            ++m->device10_alias->refs;
+            return S_OK;
+        }
+    }
+#endif
     if (!riid || !mock_has(m, *riid)) return E_NOINTERFACE;
     *out = m;
     ++m->refs;
@@ -465,6 +484,54 @@ std::uint64_t WINAPI mock_clear_depth_stencil_view(Mock* self, std::uint64_t dsv
     return 0;
 }
 
+// PC slot 76: on a device, ID3D12Device10::CreateCommittedResource3(heap, flags, desc1, layout, clear, session,
+// castableCount, castableFormats, riid, out), ten words after `this`. The call is recorded as it arrived (the UINT
+// words as 32-bit values, the description's bytes padding included). Like the Vulkan backend, a flag bit outside the
+// PC set (0x7FF) is refused with E_INVALIDARG; a null output is the capability check (S_FALSE). Every other kind
+// shares the table and keeps the generic five-word behaviour.
+struct Committed3Seen {
+    unsigned calls;
+    const Mock* device;  // the object the call arrived on
+    const D3D12_HEAP_PROPERTIES* heap;
+    std::uint32_t heap_flags;
+    const void* desc;
+    unsigned char desc_bytes[sizeof(D3D12_RESOURCE_DESC1)];
+    std::uint32_t layout;
+    const void* clear;
+    const void* session;
+    std::uint32_t castable_count;
+    const void* castable;
+    const IID* riid;
+    void** out;
+};
+Committed3Seen g_committed3;
+
+std::uint64_t WINAPI mock_slot76(Mock* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3, std::uint64_t a4,
+                                 std::uint64_t a5, std::uint64_t a6, std::uint64_t a7, std::uint64_t a8,
+                                 std::uint64_t a9, std::uint64_t a10) {
+    if (self->kind != Kind::device) return mock_slot<76>(self, a1, a2, a3, a4, a5);
+    ++self->calls[76];
+    Committed3Seen& s = g_committed3;
+    ++s.calls;
+    s.device = self;
+    s.heap = reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(a1);
+    s.heap_flags = static_cast<std::uint32_t>(a2);
+    s.desc = reinterpret_cast<const void*>(a3);
+    if (a3) std::memcpy(s.desc_bytes, s.desc, sizeof(s.desc_bytes));
+    s.layout = static_cast<std::uint32_t>(a4);
+    s.clear = reinterpret_cast<const void*>(a5);
+    s.session = reinterpret_cast<const void*>(a6);
+    s.castable_count = static_cast<std::uint32_t>(a7);
+    s.castable = reinterpret_cast<const void*>(a8);
+    s.riid = reinterpret_cast<const IID*>(a9);
+    s.out = reinterpret_cast<void**>(a10);
+    if (!s.out) return S_FALSE;
+    *s.out = nullptr;
+    if (!a3 || (static_cast<std::uint32_t>(reinterpret_cast<const D3D12_RESOURCE_DESC1*>(a3)->Flags) & ~0x7FFu))
+        return static_cast<std::uint32_t>(E_INVALIDARG);
+    return static_cast<std::uint32_t>(mock_create(self, Kind::resource, a9, a10));
+}
+
 // PC ID3D12Device::GetResourceAllocationInfo (slot 25) as the MSVC C++ method is called: `this`, the hidden return
 // buffer, the visible node mask, the count, and the description array as the first stack word. The answer is set per
 // test; the descriptions are copied as they arrived. Other mock kinds keep the generic entry.
@@ -507,6 +574,7 @@ void** mock_vtable() {
         table[25] = reinterpret_cast<void*>(&mock_get_resource_allocation_info);
         table[27] = reinterpret_cast<void*>(&mock_create_committed_resource);
         table[47] = reinterpret_cast<void*>(&mock_clear_depth_stencil_view);
+        table[76] = reinterpret_cast<void*>(&mock_slot76);
         return true;
     }();
     (void)filled;
@@ -524,6 +592,16 @@ std::uint64_t raw(const void* object, unsigned slot, std::uint64_t a1 = 0, std::
     void* const* vtable = *reinterpret_cast<void* const* const*>(object);
     return reinterpret_cast<SlotFn>(vtable[slot])(const_cast<void*>(object), a1, a2, a3, a4, a5, a6, 0, 0, 0, 0, 0,
                                                   0, 0, 0);
+}
+
+// A call with exactly ten words after `this` (device slot 127): the caller's frame ends after the seventh stack word.
+using Slot10Fn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                        std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                        std::uint64_t);
+std::uint64_t raw10(const void* object, unsigned slot, const std::uint64_t (&w)[10]) {
+    void* const* vtable = *reinterpret_cast<void* const* const*>(object);
+    return reinterpret_cast<Slot10Fn>(vtable[slot])(const_cast<void*>(object), w[0], w[1], w[2], w[3], w[4], w[5],
+                                                    w[6], w[7], w[8], w[9]);
 }
 
 HRESULT hr_of(std::uint64_t value) {
@@ -3023,6 +3101,172 @@ int check_srv_at_va() {
 
 // ---- 10. The refused tail and the guard region ----
 
+// ---- Device slot 127: ID3D12Device10::CreateCommittedResource3 called the console's way ----
+//
+// Ten words after `this`, the UINT words with poisoned upper halves, the description with a poisoned padding DWORD.
+// The PC device's ID3D12Device10 is a separate alias object; a call on the base pointer would answer E_UNEXPECTED.
+int check_committed_resource3() {
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+    constexpr std::uint64_t kPoison = 0xA5A5A5A500000000ull;
+    constexpr std::uint32_t kMeasuredFlags = 0x00300005;  // RT | UA and two bits outside the PC set
+    constexpr std::uint32_t kMeasuredLayout = 3;          // the measured initial layout word
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    heap.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    heap.CreationNodeMask = 1;
+    heap.VisibleNodeMask = 1;
+    D3D12_RESOURCE_DESC1 desc;
+    std::memset(&desc, 0xCD, sizeof(desc));  // the padding DWORD at +4 keeps this poison
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Alignment = 0;
+    desc.Width = 3840;
+    desc.Height = 2160;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = static_cast<DXGI_FORMAT>(28);
+    desc.SampleDesc = {1, 0};
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(kMeasuredFlags);
+    desc.SamplerFeedbackMipRegion = {0, 0, 0};
+    D3D12_CLEAR_VALUE clear{};
+    clear.Format = static_cast<DXGI_FORMAT>(28);
+    const D3D12_HEAP_PROPERTIES heap0 = heap;
+    D3D12_RESOURCE_DESC1 desc0;
+    std::memcpy(&desc0, &desc, sizeof(desc));
+    const D3D12_CLEAR_VALUE clear0 = clear;
+    const auto unchanged = [&] {
+        return std::memcmp(&heap, &heap0, sizeof(heap)) == 0 && std::memcmp(&desc, &desc0, sizeof(desc)) == 0 &&
+               std::memcmp(&clear, &clear0, sizeof(clear)) == 0;
+    };
+
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 10, true);
+    EXPECT(device && xs::device_proxy_slot_count(device) == 79);
+    Mock* alias = new_mock(Kind::device);
+    alias->refs = 1;
+    mock->device10_alias = alias;
+    mock->create_result = E_UNEXPECTED;  // the trap: only the alias may create
+    xs::reset_device_proxy_stats();
+    g_committed3 = {};
+    const Committed3Seen& s = g_committed3;
+    const auto proxy_refs = xs::device_proxy_ref_count(device);
+    const long base_refs = mock->refs;
+    void* resource = reinterpret_cast<void*>(1);
+    constexpr auto kDisplay = static_cast<std::uint32_t>(D3D12_HEAP_FLAG_ALLOW_DISPLAY);
+    std::uint64_t w[10] = {word(&heap),  kPoison | kDisplay, word(&desc), kPoison | kMeasuredLayout,
+                           word(&clear), 0, kPoison, 0, word(&kResourceIid), word(&resource)};
+    const auto balanced = [&] {
+        return alias->refs == 1 && mock->refs == base_refs && xs::device_proxy_ref_count(device) == proxy_refs;
+    };
+
+    // The measured request: every word reaches the alias's CreateCommittedResource3 as passed, flags included, and the
+    // backend's refusal of the unknown bits comes back with a null output.
+    EXPECT(hr_of(raw10(device, 127, w)) == E_INVALIDARG && resource == nullptr);
+    EXPECT(s.calls == 1 && s.device == alias && mock->calls[76] == 0 && alias->calls[76] == 1);
+    EXPECT(s.heap == &heap && s.heap_flags == kDisplay && s.desc == &desc);
+    EXPECT(std::memcmp(s.desc_bytes, &desc0, sizeof(desc0)) == 0);  // padding poison included
+    D3D12_RESOURCE_DESC1 seen;
+    std::memcpy(&seen, s.desc_bytes, sizeof(seen));
+    EXPECT(static_cast<std::uint32_t>(seen.Flags) == kMeasuredFlags && seen.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
+    EXPECT(s.layout == kMeasuredLayout && s.clear == &clear && !s.session && s.castable_count == 0 && !s.castable);
+    EXPECT(s.riid == &kResourceIid && s.out == &resource);
+    EXPECT(unchanged() && balanced());
+    EXPECT(xs::device_slot_hits(127) == 1 && xs::device_slot_overridden(127));
+
+    // A PC-shaped request (flags RT | UA) with a session and a castable list: a real mock resource, one reference.
+    desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x5);
+    std::memcpy(&desc0, &desc, sizeof(desc));
+    static const int session_sentinel = 0;  // never dereferenced
+    const DXGI_FORMAT castable[2] = {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB};
+    w[5] = word(&session_sentinel);
+    w[6] = kPoison | 2;
+    w[7] = word(castable);
+    resource = reinterpret_cast<void*>(1);
+    EXPECT(hr_of(raw10(device, 127, w)) == S_OK && resource);
+    EXPECT(s.calls == 2 && s.device == alias && s.session == &session_sentinel && s.castable_count == 2 &&
+           s.castable == castable && s.out == &resource && s.layout == kMeasuredLayout);
+    EXPECT(reinterpret_cast<Mock*>(resource)->kind == Kind::resource && alias->last_child == resource);
+    EXPECT(unchanged() && balanced());
+    EXPECT(release(resource) == 0);
+
+    // The backend's failure comes back as it is, with a null output.
+    alias->create_result = E_OUTOFMEMORY;
+    resource = reinterpret_cast<void*>(1);
+    EXPECT(hr_of(raw10(device, 127, w)) == E_OUTOFMEMORY && !resource && s.calls == 3 && balanced());
+    alias->create_result = S_OK;
+
+    // The optional output: a capability check is forwarded with a null output and its S_FALSE kept.
+    w[9] = 0;
+    EXPECT(hr_of(raw10(device, 127, w)) == S_FALSE && s.calls == 4 && s.out == nullptr && balanced());
+    w[9] = word(&resource);
+
+    // Null heap, description or IID: E_POINTER, no QueryInterface, no backend call; an all-null call is safe too.
+    const unsigned calls = s.calls, queries = mock->device10_queries;
+    for (const int i : {0, 2, 8}) {
+        std::uint64_t bad[10];
+        std::memcpy(bad, w, sizeof(bad));
+        bad[i] = 0;
+        resource = reinterpret_cast<void*>(1);
+        EXPECT(hr_of(raw10(device, 127, bad)) == E_POINTER && !resource);
+    }
+    const std::uint64_t none[10] = {};
+    EXPECT(hr_of(raw10(device, 127, none)) == E_POINTER);
+    EXPECT(s.calls == calls && mock->device10_queries == queries && balanced());
+
+    // The slot count says ID3D12Device10, QueryInterface refuses it: E_NOTIMPL, null output, no other method called.
+    mock->refuse_device10 = true;
+    resource = reinterpret_cast<void*>(1);
+    EXPECT(hr_of(raw10(device, 127, w)) == E_NOTIMPL && !resource && s.calls == calls);
+    EXPECT(mock->device10_queries == queries + 1 && xs::device_proxy_slot_count(device) == 79 && balanced());
+    mock->refuse_device10 = false;
+    EXPECT(release(device) == 0);
+
+    // No alias: QueryInterface answers the device itself, and its reference is given back.
+    Mock* plain = nullptr;
+    void* plain_device = make_device(plain, 10, true);
+    EXPECT(plain_device);
+    const long plain_refs = plain->refs;
+    resource = reinterpret_cast<void*>(1);
+    EXPECT(hr_of(raw10(plain_device, 127, w)) == S_OK && resource && s.device == plain && plain->refs == plain_refs);
+    EXPECT(release(resource) == 0);
+    EXPECT(release(plain_device) == 0);
+
+    // A PC device that stops at ID3D12Device9: E_NOTIMPL with a null output, PC slot 76 never reached.
+    Mock* old_mock = nullptr;
+    void* old_device = make_device(old_mock, 9, true);
+    EXPECT(old_device && xs::device_proxy_slot_count(old_device) == 76);
+    const unsigned old_queries = old_mock->device10_queries, before = s.calls;
+    resource = reinterpret_cast<void*>(1);
+    EXPECT(hr_of(raw10(old_device, 127, w)) == E_NOTIMPL && !resource);
+    EXPECT(s.calls == before && old_mock->calls[76] == 0 && old_mock->device10_queries == old_queries + 1);
+    EXPECT(release(old_device) == 0);
+    std::printf("%s: device slot 127 forwards every word to ID3D12Device10::CreateCommittedResource3 unchanged; "
+                "unknown flags reach the backend, which refuses them\n", g_label);
+#else
+    std::printf("%s: device slot 127 not checked: the SDK has no ID3D12Device10\n", g_label);
+#endif
+    return 0;
+}
+
+// A configured route moved onto 127 (inside 3..127) keeps its priority over the built-in adapter.
+int run_env_slot127() {
+    EXPECT(SetEnvironmentVariableA("PALMWAVE_XS_FRAME_INTERVAL_SLOT", "127") != FALSE);
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 10, true);
+    EXPECT(device && xs::device_proxy_slot_count(device) == 79);
+    xs::reset_device_proxy_stats();
+    g_committed3 = {};
+    const unsigned queries = mock->device10_queries;
+    EXPECT(hr_of(raw(device, 127, 0, 16667, 1, 0)) == S_OK);
+    EXPECT(g_committed3.calls == 0 && mock->calls[76] == 0 && mock->device10_queries == queries &&
+           xs::device_slot_hits(127) == 1);
+    EXPECT(hr_of(raw(device, 78, 0, 16667, 1, 0)) == S_OK && mock->calls[78] == 1);  // the old default: forwarded
+    EXPECT(release(device) == 0);
+    std::printf("%s: a route moved onto device slot 127 takes precedence over CreateCommittedResource3\n", g_label);
+    return 0;
+}
+
 int check_tail(bool want_guarded) {
     Mock* mock = nullptr;
     void* device = make_device(mock, 9, true);
@@ -3147,6 +3391,10 @@ int main(int argc, char** argv) {
         rt::d3d12_trace::set_enabled(true);
         return check_srv_at_va();
     }
+    if (argc == 2 && std::strcmp(argv[1], "--slot127") == 0) {
+        rt::d3d12_trace::set_enabled(true);  // every outcome is a traced line, as under palmwave --trace-d3d12
+        return check_committed_resource3();
+    }
     if (argc == 2 && std::strcmp(argv[1], "--slot25") == 0) return check_resource_allocation_info();
     if (argc == 3 && std::strcmp(argv[1], "--host-import-experiment") == 0) {
         if (std::strcmp(argv[2], "on") == 0) return run_host_import_experiment(true);
@@ -3157,6 +3405,7 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[1], "--env-slots") == 0) return run_env_slots(true);
         if (std::strcmp(argv[1], "--env-slots-invalid") == 0) return run_env_slots(false);
         if (std::strcmp(argv[1], "--env-slots-70") == 0) return run_env_slots(true, true);
+        if (std::strcmp(argv[1], "--env-slots-127") == 0) return run_env_slot127();
         return run_fault_mode(argv[1]);
     }
     if (argc != 1) return 2;
@@ -3164,7 +3413,7 @@ int main(int argc, char** argv) {
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_xbox_queue_descriptions() ||
         check_lists() || check_shared_base_list() || check_experimental_flush() ||
         check_custom_heap_properties() || check_resource_allocation_info() || check_descriptor_heaps() || check_list_descriptor_handles() ||
-        check_srv_at_va())
+        check_srv_at_va() || check_committed_resource3())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;

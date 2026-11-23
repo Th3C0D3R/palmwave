@@ -21,6 +21,11 @@
 //             Only the bounded raw-buffer shape below is supported; anything else is refused with the destination
 //             untouched (see "Device slot 70" further down).
 //   slot 76   resource creation -> PC CreateCommittedResource (PC slot 27), with the Xbox layout word ignored.
+//   slot 127  CreateCommittedResource3(heap, heapFlags, desc1, initialLayout, clear, session, castableCount,
+//             castableFormats, riid, out), the public ID3D12Device10 argument list (PC slot 76), forwarded word for
+//             word through the pointer QueryInterface(ID3D12Device10) returns. Nothing is masked or rewritten: console
+//             flag bits reach the backend, which refuses what it does not know. No ID3D12Device10: E_NOTIMPL. Null
+//             heap/desc/riid: E_POINTER without a backend call. `out` is optional (S_FALSE kept); cleared on failure.
 //   slot 133  CreatePlacedResourceX(va, desc, state, clear, riid, out) -> the registered host-page handler, only for
 //             a plain row-major buffer, supported flags and no clear value. Unknown flags/layouts are refused without
 //             rewriting them. No handler: E_NOTIMPL, null output and an unsupported trace.
@@ -277,8 +282,8 @@ void reset_srv_at_va_stats();
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14, 17-24 (CPU descriptor handles translated), 26 (the console's struct-return
 // form), 31/34/35/45/46/50 (proxies unwrapped),
-// 32 and 36 (fence proxies), 48/73 and 78/79/80 (the Xbox slots above, at their configured indices), 62, 67, 70, 76
-// and 133. A configured route moved onto slot 70 takes precedence over the built-in slot-70 view.
+// 32 and 36 (fence proxies), 48/73 and 78/79/80 (the Xbox slots above, at their configured indices), 62, 67, 70, 76,
+// 127 and 133. A configured route moved onto slot 70 or 127 takes precedence over the built-in handler.
 // Slot 10 is intentionally false: the measured 9/10 handle conversion is on the heap proxy, and device slot 9 is
 // CreateCommandAllocator, which the proxy handles for the allocator proxy.
 bool device_slot_overridden(unsigned slot);

@@ -948,6 +948,8 @@ if(BUILD_TESTING)
     # A configured route moved onto device slot 70 keeps priority over the built-in slot-70 view.
     add_test(NAME xs_proxy_mock_env_slots_70 COMMAND xs_proxy_mock_test --env-slots-70)
     # Device slot 70 (a raw buffer SRV named by GPU VA) with the D3D12 trace on: its refusals are traced explicitly.
+    add_test(NAME xs_proxy_mock_slot127_trace COMMAND xs_proxy_mock_test --slot127)
+    add_test(NAME xs_proxy_mock_env_slots_127 COMMAND xs_proxy_mock_test --env-slots-127)
     add_test(NAME xs_proxy_mock_slot70_trace COMMAND xs_proxy_mock_test --slot70)
     set_tests_properties(xs_proxy_mock_slot70_trace PROPERTIES
                          PASS_REGULAR_EXPRESSION "[(]device slot 70[)] unsupported"

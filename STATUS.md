@@ -209,3 +209,17 @@ events: 2,201 successful, 24 call records and eleven experimental records. Resou
 device slot 127, which is beyond the PC interface and returns E_NOTIMPL; a guest assertion follows. Both existing
 synchronization and host-import diagnostic options remain enabled. No Draw, ExecuteCommandLists, Present or
 rendered game frame is observed.
+
+## Resource-creation route
+
+The typed slot-127 adapter now calls CreateCommittedResource3 through the actual ID3D12Device10 interface returned
+by QueryInterface, retaining all ten arguments and releasing that interface. It preserves protected-session and
+castable-format arguments, the input descriptions and backend errors. Fifteen CPU proxy CTests pass in 0.38 seconds,
+including alias-interface pointers, stack argument positions, null outputs, failure propagation and route overrides.
+
+The offline RTX 5080 / driver 621.14 probe now reaches the real backend instead of the generic out-of-range refusal.
+The backend rejects resource flags 0x00300005 with E_INVALIDARG (0x80070057), then the guest asserts. Its trace has
+2,238 D3D12 events: 2,201 successful, 24 call records, eleven experimental records and two failure records for this
+one request (backend and wrapper). Startup still has 23 events, four successful DLL initializations and no
+unimplemented import. No Draw, ExecuteCommandLists, Present or rendered game frame is observed. The console flags
+and initial-layout word need an explicit compatibility contract; this adapter does not silently strip them.

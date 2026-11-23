@@ -6,7 +6,8 @@
 // arguments only, so the x64 registers and stack words line up exactly; methods that return a struct keep their
 // hidden return pointer in RDX, which is passed through as the first argument unchanged. The measured exceptions
 // are IUnknown (0-2), slot 14 (which wraps the heap), 25/26 (the title passes the return buffer in RCX and the device in
-// RDX), 62, 70 (a raw buffer SRV named by GPU VA, never the PC CreatePlacedResource1), 76 and 133
+// RDX), 62, 70 (a raw buffer SRV named by GPU VA, never the PC CreatePlacedResource1), 76, 127 (the PC
+// ID3D12Device10::CreateCommittedResource3 through its own interface pointer) and 133
 // (CreatePlacedResourceX, handed to the device's registered handler), plus the heap proxy's 9/10 conversion from the PC hidden-pointer form to the Xbox RAX form. Slots
 // 8/75 (command queues), 36 (fences) and 32 (a shared fence) wrap what they create in queue and fence proxies built
 // the same way, and slots 31/34/35/45/46/50 hand the real objects behind heap, queue and fence proxies to the real
@@ -183,6 +184,7 @@ const char* slot_name(unsigned slot) {
         case 78: return "Xbox SetFrameIntervalX";
         case 79: return "Xbox ScheduleFrameEventX";
         case 80: return "Xbox WaitFrameEventX";
+        case 127: return "Xbox CreateCommittedResource3 (device slot 127)";
         case 133: return "Xbox CreatePlacedResourceX (a buffer on the title's own pages)";
         default: return "forwarded";
     }
@@ -2710,6 +2712,77 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
                                                *riid, out);
 }
 
+// Device slot 127: the console call has the argument list of the public ID3D12Device10::CreateCommittedResource3
+// (heap properties, heap flags, desc1, initial layout, clear value, protected session, castable count, castable
+// formats, riid, out), measured on a local offline probe: `this` in RCX, heap properties in RDX, heap flags in R8,
+// desc1 in R9 and the other seven at entry RSP+0x28..+0x58. That is past the PC device's vtable, so the generic thunk
+// refused it. The adapter is strict: every word goes to the PC device's own CreateCommittedResource3 exactly as the
+// title passed it, through the interface pointer QueryInterface(ID3D12Device10) returns (it may differ from the base
+// device and is released after the call). Nothing is copied, masked or rewritten: console flag bits and layout words
+// reach the backend, which decides (the Vulkan device refuses unknown flags). A device without ID3D12Device10 is
+// E_NOTIMPL, never another method. The output is optional (the public contract's capability check, whose S_FALSE is
+// kept); when given it is cleared first and stays null on failure. The ABI layout and the typed QueryInterface call
+// are adapted from upstream PR #7052 (tedin7, 356e77ec34e5959645113d68aed4119fead24d45, GPL-3.0); its layout
+// replacement, flag mask and slot-count guard are not. Words keep their thunk positions (see the top of the file).
+constexpr unsigned kCreateCommittedResource3X = 127;
+
+HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap_word, std::uint64_t heap_flags_word,
+                                           std::uint64_t desc_word, std::uint64_t layout_word,
+                                           std::uint64_t clear_word, std::uint64_t session_word,
+                                           std::uint64_t castable_count_word, std::uint64_t castable_formats_word,
+                                           std::uint64_t riid_word, std::uint64_t out_word) {
+    const char* const method = slot_name(kCreateCommittedResource3X);
+    auto* const out = reinterpret_cast<void**>(out_word);
+    if (out) *out = nullptr;
+    const auto* const heap = reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(heap_word);
+    const auto* const desc = reinterpret_cast<const D3D12_RESOURCE_DESC1*>(desc_word);
+    const auto* const riid = reinterpret_cast<const IID*>(riid_word);
+    const auto heap_flags = static_cast<std::uint32_t>(heap_flags_word);
+    const auto layout = static_cast<std::uint32_t>(layout_word);
+    const auto castable_count = static_cast<std::uint32_t>(castable_count_word);
+    const bool verbose = d3d12_trace::enabled() || trace_enabled();
+    if (!heap || !desc || !riid) {
+        if (verbose)
+            std::fprintf(stderr, "[rt] d3d12_xs: slot 127 refused: heap %p desc %p riid %p (E_POINTER)\n",
+                         static_cast<const void*>(heap), static_cast<const void*>(desc), static_cast<const void*>(riid));
+        return d3d12_trace::result(method, E_POINTER);
+    }
+
+    HRESULT hr = E_NOTIMPL;
+    bool has_device10 = false;
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+    ID3D12Device10* device10 = nullptr;
+    if (FAILED(self->real->QueryInterface(__uuidof(ID3D12Device10), reinterpret_cast<void**>(&device10))))
+        device10 = nullptr;
+    if (device10) {
+        has_device10 = true;
+        hr = device10->CreateCommittedResource3(
+            heap, static_cast<D3D12_HEAP_FLAGS>(heap_flags), desc, static_cast<D3D12_BARRIER_LAYOUT>(layout),
+            reinterpret_cast<const D3D12_CLEAR_VALUE*>(clear_word),
+            reinterpret_cast<ID3D12ProtectedResourceSession*>(session_word), castable_count,
+            reinterpret_cast<const DXGI_FORMAT*>(castable_formats_word), *riid, out);
+        device10->Release();
+        if (FAILED(hr) && out) *out = nullptr;
+    }
+#else
+    (void)self;
+#endif
+    static std::atomic<bool> logged{false};
+    if (first_call(logged) || verbose)
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 127 heap type=%u flags=0x%x dim=%u %llux%ux%u mips=%u format=%u samples=%u/%u "
+                     "layout word=0x%x flags=0x%x initial layout=0x%x clear=%p session=%p castable=%u out=%p -> 0x%08x%s\n",
+                     static_cast<unsigned>(heap->Type), heap_flags, static_cast<unsigned>(desc->Dimension),
+                     static_cast<unsigned long long>(desc->Width), static_cast<unsigned>(desc->Height),
+                     static_cast<unsigned>(desc->DepthOrArraySize), static_cast<unsigned>(desc->MipLevels),
+                     static_cast<unsigned>(desc->Format), static_cast<unsigned>(desc->SampleDesc.Count),
+                     static_cast<unsigned>(desc->SampleDesc.Quality), static_cast<unsigned>(desc->Layout),
+                     static_cast<unsigned>(desc->Flags), layout, reinterpret_cast<const void*>(clear_word),
+                     reinterpret_cast<const void*>(session_word), castable_count, static_cast<const void*>(out),
+                     static_cast<unsigned>(hr), has_device10 ? "" : " (no ID3D12Device10 on the PC device)");
+    return d3d12_trace::result(method, hr);
+}
+
 // Device slot 26, GetCustomHeapProperties. Upstream PR #6964 measured the following call form under
 // palmwave --run with a register probe in this slot's thunk: three calls right after device creation, each with the
 // device proxy in RDX and not in RCX, R8 = 1 and R9 = 1, 2, 3 (node mask 1; DEFAULT, UPLOAD, READBACK). So the
@@ -3178,6 +3251,12 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             static_cast<D3D12_RESOURCE_STATES>(static_cast<std::uint32_t>(a4)),
             reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5), reinterpret_cast<const IID*>(a6),
             reinterpret_cast<void**>(a7)));
+    } else if constexpr (Slot == kCreateCommittedResource3X) {
+        note_slot(Slot);
+        // A configured Xbox route moved onto 127 (in the 3..127 range) keeps its priority, as on slot 70.
+        std::uint64_t routed = 0;
+        if (route_xbox_device_slot(self, Slot, a1, a2, a3, a4, a5, routed)) return routed;
+        return hr_to_u64(proxy_create_committed_resource3_x(self, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10));
     } else if constexpr (Slot == 133) {
         return hr_to_u64(proxy_create_placed_resource_x(
             self, reinterpret_cast<void*>(a1), reinterpret_cast<const D3D12_RESOURCE_DESC*>(a2),
@@ -3411,7 +3490,7 @@ bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || (slot >= 17 && slot <= 24) || slot == 25 || slot == 26 ||
         slot == 31 || slot == 32 || slot == 34 ||
         slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
-        slot == 70 || slot == 75 || slot == 76 || slot == 133)
+        slot == 70 || slot == 75 || slot == 76 || slot == kCreateCommittedResource3X || slot == 133)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||
