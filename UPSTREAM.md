@@ -66,3 +66,14 @@ The adaptation and interface-boundary correction were written with Claude Code (
 ## Project identity and tools
 
 Palmwave is developed under [Moon AI](https://realmoon.ai), the AI platform created by Stellarr Studio. The maintainer account is [fablinoo](https://github.com/fablinoo). The initial setup was AI-assisted with OpenAI Codex and OpenAI image generation; Claude Code was assigned a read-only source review. This records the actual tool provenance.
+
+## Device slot 133 refusal
+
+The callable tail through slot 191 and the slot-133 placement argument positions refer to
+[Leonida PR #7218](https://github.com/ItsNotRexed/Leonida/pull/7218), tibzejoker,
+`a3eae955dcec4fb65864ca6c10b4ca3f2999c2d3` (GPL-3.0). This correction only replaces an absent device-vtable entry
+with an explicit unsupported result and a null output. It imports no memory, creates no stand-in resource and
+assigns no meaning to console flags or the state word. Existing environment remaps remain limited to slots 3..127.
+Implemented and reviewed by OpenAI Codex, with a synthetic raw-ABI regression including a trace assertion.
+Validation: seven `xs_proxy_mock*` CTests passed on Windows/MSVC19.51; CPU only, no GPU or game test in this correction.
+The real host-memory import remains a separate candidate, prepared by Claude Opus5.5 and independently reviewed.

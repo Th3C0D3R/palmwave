@@ -15,6 +15,7 @@
 //     patching this executable's own import table before the first proxy table is built (one process each).
 // Every device, queue, fence and resource here is a mock that records the calls it gets. No game data, no Xbox DLLs.
 #include "../shims/d3d12_xs_device.h"
+#include "../shims/d3d12_trace.h"
 
 #include <d3d12.h>
 #include <windows.h>
@@ -79,7 +80,7 @@ namespace xs = rt::d3d12_xs;
 // GCL7 Barrier are reachable.
 enum class Kind { device, queue, fence, resource, allocator, command_list, list };
 
-constexpr unsigned kMockSlots = 128;
+constexpr unsigned kMockSlots = 192;
 constexpr std::uint64_t kMockGpuBase = 0x00007f0000000000ull;  // mock buffers' GPU addresses, unlike any CPU one
 // The console command-list IID the 1.0.2.1 executable passes to device slot 73 (d3d12_xs_command_list_iid.h).
 constexpr GUID kConsoleListIid{0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
@@ -454,6 +455,32 @@ void* make_fence(void* device, const IID& iid = kFenceIid) {
 
 unsigned long release(void* object) {
     return static_cast<unsigned long>(raw(object, 2));
+}
+
+// Slot 133 is callable even on a base PC device, but never fabricates a placed resource or calls a host slot.
+int check_placed_resource_refusal() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 0, false);
+    EXPECT(device != nullptr);
+    struct Output { std::uint64_t before; void* value; std::uint64_t after; };
+    Output out{0x1122334455667788ull, reinterpret_cast<void*>(1), 0x8877665544332211ull};
+    const auto hits = xs::device_slot_hits(133);
+    const auto refs = xs::device_proxy_ref_count(device);
+    const auto host_refs = mock->refs;
+    rt::d3d12_trace::set_enabled(true);
+    // Deliberately unreadable input pointers: a refused operation must not dereference them. Only out is writable.
+    const HRESULT result = hr_of(raw(device, 133, 0x40000000, 1, 0xFFFFFFFFull, 1, 1, word(&out.value)));
+    rt::d3d12_trace::set_enabled(false);
+    EXPECT(result == E_NOTIMPL && out.value == nullptr);
+    EXPECT(out.before == 0x1122334455667788ull && out.after == 0x8877665544332211ull);
+    EXPECT(xs::device_slot_hits(133) == hits + 1 && xs::device_slot_first_call_seen(133));
+    EXPECT(xs::device_slot_overridden(133) && xs::device_proxy_ref_count(device) == refs && mock->refs == host_refs);
+    EXPECT(hr_of(raw(device, 133)) == E_NOTIMPL);  // null output is safe on an unsupported method
+    EXPECT(hr_of(raw(device, 191)) == E_NOTIMPL);  // the expanded tail also has a callable refusal
+    EXPECT(mock->calls[133] == 0 && mock->calls[191] == 0);
+    EXPECT(release(device) == 0);
+    std::printf("slot 133: unsupported, output cleared, canaries/references intact, no host placement call\n");
+    return 0;
 }
 
 // ---- 1. Device interface levels ----
@@ -1742,13 +1769,14 @@ static void no_dialogs() {
 int main(int argc, char** argv) {
     no_dialogs();
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    if (argc == 2 && std::strcmp(argv[1], "--slot133") == 0) return check_placed_resource_refusal();
     if (argc == 2) {
         if (std::strcmp(argv[1], "--env-slots") == 0) return run_env_slots(true);
         if (std::strcmp(argv[1], "--env-slots-invalid") == 0) return run_env_slots(false);
         return run_fault_mode(argv[1]);
     }
     if (argc != 1) return 2;
-    if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
+    if (check_placed_resource_refusal() || check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_xbox_queue_descriptions() ||
         check_lists() || check_shared_base_list() || check_experimental_flush() ||
         check_custom_heap_properties())

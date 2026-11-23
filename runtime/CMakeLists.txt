@@ -932,6 +932,9 @@ if(BUILD_TESTING)
   endif()
   if(TARGET xs_proxy_mock_test)
     add_test(NAME xs_proxy_mock COMMAND xs_proxy_mock_test)
+    add_test(NAME xs_proxy_mock_slot133_trace COMMAND xs_proxy_mock_test --slot133)
+    set_tests_properties(xs_proxy_mock_slot133_trace PROPERTIES
+                         PASS_REGULAR_EXPRESSION "Xbox CreatePlacedResourceX [(]device slot 133[)] unsupported")
     # The guard region's setup failing (one process each: the tables are built once per process).
     add_test(NAME xs_proxy_mock_no_reserve COMMAND xs_proxy_mock_test --fail-virtualalloc)
     add_test(NAME xs_proxy_mock_no_protect COMMAND xs_proxy_mock_test --fail-virtualprotect)

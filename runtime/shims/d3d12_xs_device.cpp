@@ -48,8 +48,9 @@
 namespace rt::d3d12_xs {
 namespace {
 
-constexpr unsigned kMaxSlots = 128;
-static_assert(kMaxSlots > 83, "the proxy table must cover ID3D12Device14 (83 slots)");
+constexpr unsigned kMaxSlots = 192;  // console slot 133 and a refused tail, not a PC interface claim
+constexpr unsigned kMaxConfiguredSlot = 127;  // keep the existing environment-remap contract
+static_assert(kMaxSlots > 133, "the proxy table must cover console placement slot 133");
 static_assert(sizeof(void*) == 8, "the Xbox-ABI proxy is x64-only");
 static_assert(sizeof(D3D12_CPU_DESCRIPTOR_HANDLE) == 8,
               "the Xbox handle ABI is an 8-byte value in RAX; the heap thunk converts the PC hidden-pointer form");
@@ -156,6 +157,7 @@ const char* slot_name(unsigned slot) {
         case 73: return "Xbox CreateCommandListX -> console list proxy";
         case 75: return "CreateCommandQueue1 -> queue proxy";
         case 76: return "Xbox resource creation";
+        case 133: return "Xbox CreatePlacedResourceX (host-page placement unsupported)";
         case 78: return "Xbox SetFrameIntervalX";
         case 79: return "Xbox ScheduleFrameEventX";
         case 80: return "Xbox WaitFrameEventX";
@@ -197,7 +199,7 @@ unsigned env_device_slot(const char* name, unsigned fallback) {
     errno = 0;
     char* end = nullptr;
     const unsigned long slot = std::strtoul(value, &end, 0);
-    if (errno != 0 || end == value || *end != '\0' || slot < 3 || slot > 127) {
+    if (errno != 0 || end == value || *end != '\0' || slot < 3 || slot > kMaxConfiguredSlot) {
         std::fprintf(stderr, "[rt] d3d12_xs: %s=%s is not a device slot in 3..127; the default is kept\n", name,
                      value);
         return fallback;
@@ -1780,6 +1782,24 @@ HRESULT refuse_beyond_device(unsigned slot, unsigned slot_count) {
     return E_NOTIMPL;
 }
 
+// The console placement ABI (va, desc, state, clear, riid, out) is recorded in upstream #7218
+// (tibzejoker, a3eae955dcec4fb65864ca6c10b4ca3f2999c2d3, GPL-3.0). A 128-entry table did not contain slot 133,
+// so the caller could jump through an absent entry. Keep a callable thunk, clear the output, and refuse: this does
+// not import pages or interpret console resource flags / the initial-state word. The pointed-to inputs are not read.
+HRESULT proxy_refuse_placed_resource_x(std::uint64_t va, std::uint64_t desc, std::uint64_t state,
+                                       std::uint64_t clear, void** out) {
+    note_slot(133);
+    if (out) *out = nullptr;
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true, std::memory_order_relaxed) || trace_enabled())
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: device slot 133 CreatePlacedResourceX refused: host-page placement is not "
+                     "implemented; console flags/state are not translated (va=%p desc=%p state=0x%08x clear=%p)\n",
+                     reinterpret_cast<void*>(va), reinterpret_cast<void*>(desc), static_cast<unsigned>(state),
+                     reinterpret_cast<void*>(clear));
+    return d3d12_trace::result("Xbox CreatePlacedResourceX (device slot 133)", E_NOTIMPL);
+}
+
 // Device slot 8: CreateCommandQueue(desc, riid, out). Without an output it is the device's own capability answer
 // (S_FALSE for a valid description on the PC), as #558 does for slot 14.
 HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_DESC* desc, const IID* riid,
@@ -2232,6 +2252,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return hr_to_u64(proxy_create_compute_pipeline_from_native_code(
             self, reinterpret_cast<const void*>(a1), reinterpret_cast<const IID*>(a2),
             reinterpret_cast<void**>(a3)));
+    } else if constexpr (Slot == 133) {
+        return hr_to_u64(proxy_refuse_placed_resource_x(a1, a2, a3, a4, reinterpret_cast<void**>(a6)));
     } else if constexpr (Slot == 76) {
         return hr_to_u64(proxy_create_resource(
             self, reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(a1),
@@ -2425,7 +2447,7 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 26 || slot == 31 || slot == 32 || slot == 34 ||
         slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
-        slot == 75 || slot == 76)
+        slot == 75 || slot == 76 || slot == 133)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||

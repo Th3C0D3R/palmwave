@@ -27,6 +27,8 @@
 // The slots 48/73/78/79/80 are the public HLE Freminet/ScarlettX's observation, not Microsoft documentation, and can
 // be moved with PALMWAVE_XS_QUEUE_X_SLOT, PALMWAVE_XS_LIST_X_SLOT, PALMWAVE_XS_FRAME_INTERVAL_SLOT,
 // PALMWAVE_XS_SCHEDULE_EVENT_SLOT and PALMWAVE_XS_WAIT_EVENT_SLOT (3..127; anything else is logged once and ignored).
+// The device table has 192 entries; slot 133 refuses host-page placement and clears its output.
+// Only the existing routes are configurable; their 3..127 range is unchanged.
 // The measured slots 9/10 (GetCPU/GPUDescriptorHandleForHeapStart) are ID3D12DescriptorHeap methods, not device
 // methods: the PC device's 9/10 are CreateCommandAllocator/CreateGraphicsPipelineState and are forwarded unchanged.
 // On the PC heap those getters use the hidden return pointer in RDX; the Xbox ABI returns the 8-byte handle in
