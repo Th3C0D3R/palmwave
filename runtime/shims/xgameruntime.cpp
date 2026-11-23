@@ -647,6 +647,10 @@ HRESULT WINAPI GetApiVersionImpl(uint64_t* first, uint64_t* second) {
     return S_OK;
 }
 
+// The GDK thunks look this name up alongside the five runtime entry points and refuse the runtime without it.
+// Share IXErrorImpl slot 3's offline reporting and the callback installed through XErrorSetCallback.
+HRESULT WINAPI XErrorReport(HRESULT hr, const char* message) { return error_report(nullptr, hr, message); }
+
 // HRESULT XGameRuntimeInitialize(). Reference counted, as in the GDK: each call needs an XGameRuntimeUninitialize.
 HRESULT __stdcall XGameRuntimeInitialize() {
     if (g_runtime_refs.fetch_add(1) == 0) std::fprintf(stderr, "[rt] xgameruntime: initialized (offline)\n");
@@ -1324,6 +1328,7 @@ SHIM_TABLE(xgameruntime,
     XGR(InitializeApiImplEx2),
     XGR(UninitializeApiImpl),
     XGR(QueryApiImpl),
+    XGR(XErrorReport),
     // the same runtime through gameplatformservices.dll, which XCurl.dll loads from System32 (GetApiVersionImpl above)
     {"gameplatformservices.dll", "QueryApiImpl", reinterpret_cast<void*>(&QueryApiImpl)},
     {"gameplatformservices.dll", "GetApiVersionImpl", reinterpret_cast<void*>(&GetApiVersionImpl)},

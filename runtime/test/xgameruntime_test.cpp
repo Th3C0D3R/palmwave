@@ -266,8 +266,8 @@ void check_measured_classes(QueryFn query, XSystemAnalyticsInfo (*named_analytic
 }
 
 // xgameruntime.lib's thunks don't import the runtime: they LoadLibraryW(L"xgameruntime.dll") and GetProcAddress five
-// names (measured in the package's libHttpClient.GDK.dll and XCurl.dll). Drive that path through the loader shims,
-// bound by the api set XCurl.dll imports them from, as a mapped image would be.
+// entry points and XErrorReport (measured in the package's libHttpClient.GDK.dll and XCurl.dll). Drive that path
+// through the loader shims, bound by the api set XCurl.dll imports them from, as a mapped image would be.
 void check_run_time_load() {
     using LoadW = HMODULE(WINAPI*)(LPCWSTR);
     using LoadExA = HMODULE(WINAPI*)(LPCSTR, HANDLE, DWORD);
@@ -294,12 +294,15 @@ void check_run_time_load() {
           "the same module for a bare name, a full path in any case, LoadLibraryExA and GetModuleHandleW");
 
     const char* entry_points[] = {"InitializeApiImpl", "InitializeApiImplEx", "InitializeApiImplEx2",
-                                  "UninitializeApiImpl", "QueryApiImpl"};
+                                  "UninitializeApiImpl", "QueryApiImpl", "XErrorReport"};
     bool all = true;
     for (const char* n : entry_points)
         all = all && get_proc(rt_mod, n) &&
               reinterpret_cast<void*>(get_proc(rt_mod, n)) == rt::shims::find("xgameruntime.dll", n);
-    check(all, "GetProcAddress serves the five entry points xgameruntime.lib looks up");
+    check(all, "GetProcAddress serves the six names xgameruntime.lib looks up (five entry points and XErrorReport)");
+    using ReportExport = HRESULT(WINAPI*)(HRESULT, const char*);
+    auto report_export = reinterpret_cast<ReportExport>(get_proc(rt_mod, "XErrorReport"));
+    check(report_export && report_export(E_FAIL, "export") == S_OK, "the XErrorReport export answers S_OK");
     SetLastError(0);
     check(get_proc(rt_mod, "NoSuchRuntimeFunction") == nullptr && GetLastError() == ERROR_PROC_NOT_FOUND,
           "an unserved name is NULL with ERROR_PROC_NOT_FOUND, as from a real module");
@@ -433,6 +436,9 @@ void check_run_time_load() {
         const HRESULT reported = reinterpret_cast<Report>(slot(e, 3))(e, E_FAIL, "offline test");
         check(reported == S_OK && seen.hr == E_FAIL && std::strcmp(seen.msg, "offline test") == 0,
               "slot 3 is XErrorReport and reaches the callback slot 4 (XErrorSetCallback) set");
+        check(report_export && report_export(E_ACCESSDENIED, "export callback") == S_OK &&
+                  seen.hr == E_ACCESSDENIED && std::strcmp(seen.msg, "export callback") == 0,
+              "the XErrorReport export shares the COM callback, message and context");
         reinterpret_cast<SetCallback>(slot(e, 4))(e, nullptr, nullptr);
         using SetOptions = void(STDMETHODCALLTYPE*)(void*, uint32_t, uint32_t);  // void, per Microsoft's page
         reinterpret_cast<SetOptions>(slot(e, 5))(e, 0x01, 0x00);  // OutputDebugStringOnError / None
