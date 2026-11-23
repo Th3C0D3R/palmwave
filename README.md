@@ -13,6 +13,7 @@
   <a href="UPSTREAM.md">Source credits</a>
 </p>
 <p align="center">
+  <img src="https://img.shields.io/badge/boot-graphics_device_reached-08bdb5" alt="Retail startup reaches a graphics device">
   <img src="https://img.shields.io/badge/status-first_frame_unverified-f57962" alt="First frame unverified">
   <img src="https://img.shields.io/badge/backend-Vulkan-08bdb5" alt="Vulkan backend">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-blue" alt="GPL-3.0 license"></a>
@@ -20,7 +21,9 @@
 
 Palmwave is an experimental open-source Xbox Series compatibility layer and shader translation toolchain for PC, developed under **[Moon AI](https://realmoon.ai), the AI platform created by Stellarr Studio**. Its first target is a **verified frame rendered by the Xbox Series build of Xbox Series title on Windows**.
 
-**Retail startup reaches a Vulkan graphics device, five command queues, five fences, a command allocator and the first Xbox command list on RTX 5080. Recording stops at unimplemented Xbox list methods 132 and 131. No rendered frame or playable release is verified.** Progress is recorded from local builds and traces in [STATUS.md](STATUS.md). A successful presentation call alone does not establish a rendered image.
+**Xbox Series title's Xbox Series executable starts on PC and reaches Vulkan graphics initialization on NVIDIA RTX 5080. It then stops during startup. No menu or rendered game frame has been observed.**
+
+**Local compatibility milestone: graphics device reached.** The default run creates five queues, five fences, an allocator and the first Xbox command list, then stops at unimplemented list methods 132 and 131. An explicitly opt-in synchronization experiment reaches **581 command lists created and closed**, then stops at memory-backed resource creation. This experimental result does not establish a stable launch or a first frame. Measurements and limitations are recorded in [STATUS.md](STATUS.md); a successful presentation call alone would not establish a rendered image.
 
 Palmwave starts from the GPL-3.0 [Leonida](https://github.com/ItsNotRexed/Leonida) source at `dde82f27e`, with a new Git history. The loader, translator, runtime, tests and technical documentation originate there. Original copyrights, licenses and third-party notices are retained; see [UPSTREAM.md](UPSTREAM.md).
 
