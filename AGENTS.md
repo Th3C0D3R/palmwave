@@ -1,5 +1,7 @@
 # Palmwave project context
 
+Use Palmwave for active product names, PALMWAVE_ for runtime options, and Palmwave Game Launcher for the window title. Public naming, documentation and commit messages use generic Xbox Series terminology. Required source notices remain in the license and provenance files.
+
 This repository is Palmwave, under the [Moon AI](https://realmoon.ai) project identity. New project documentation is written in English. Preserve accurate source and tool attribution; never claim an unverified boot or frame. Read [UPSTREAM.md](UPSTREAM.md) and [STATUS.md](STATUS.md) for provenance and local measurements.
 
 The inherited instructions below remain applicable to code quality, formats, testing and keeping game data out of Git. Their references to claiming work in upstream coordination issue apply when preparing an original upstream contribution. Palmwave-local work is tracked in [this repository's issues](https://github.com/fablinoo/palmwave/issues). Do not post externally without authorization. Record compatible borrowed code and its source license; do not duplicate an upstream implementation without reviewing it.

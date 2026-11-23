@@ -9126,6 +9126,10 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
     }
     auto window_presenter = std::make_unique<WindowPresenter>(d->holder(), std::move(presenter));
     window_presenter->set_window(window);
+    DWORD window_process = 0;
+    GetWindowThreadProcessId(window, &window_process);
+    if (window_process == GetCurrentProcessId())
+        SetWindowTextW(window, L"Palmwave Game Launcher");
     return window_presenter;
 }
 
