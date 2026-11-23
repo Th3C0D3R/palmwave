@@ -1,0 +1,70 @@
+#version 460
+// Hand-written GLSL contract fixture for d3d12_committed_texture_test (NOT a translated RDNA2 shader). It is written to
+// the translator's runtime contract the way cs_set0_sample.comp is (docs/design.md, "User data", "Xbox GPU addresses"
+// and "Images"): root arguments in the console compute layout from s4,
+//   s4       a root constant: where the UAV's slot starts inside the view table, in dwords
+//   s5       a root constant: the patch index (0..4 are written; patch 5 is left for the clear)
+//   s6:s7    a root UAV (unused here; the read fixture writes it)
+//   s8       the descriptor table of views (its 32-bit console VA): the T# in the first eight dwords of each slot
+// It loads the UAV's T# from the table at heap base + VA, looks it up in the hash table at set 0 binding 2 (FNV-1a over
+// the eight key dwords, eight probes, a miss is index 0 = the fallback image), and stores into the 2D float storage
+// array at set 0 binding 8 (storage_binding(dim_2d, float)) one 64x64 patch of the coordinate pattern
+//   pattern(x, y) = (x & 0xFF, y & 0xFF, (x >> 8) | ((y >> 8) << 4), 0x5A) as RGBA8 UNORM bytes.
+// Alpha 0x5A never equals the test's clear alpha (0xFF), so a computed texel is never mistaken for the clear.
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words {
+    uint w[];
+};
+
+layout(push_constant) uniform UserData {
+    uint s[32];
+    uvec2 heap_base;
+    uvec2 code_base;
+} pc;
+
+layout(set = 0, binding = 2, std430) readonly buffer DescriptorMap {
+    uint map[];  // mask, then 10 uints per slot: key[8], index, pad
+};
+layout(set = 0, binding = 8, rgba8) uniform writeonly image2D storage_float_2d[];
+
+// The six 64x64 patches of the 3840x2160 image: the four corners, the centre, and one only the clear touches.
+const uvec2 kPatch[6] = uvec2[6](uvec2(0u, 0u), uvec2(3776u, 0u), uvec2(0u, 2096u), uvec2(3776u, 2096u),
+                                 uvec2(1888u, 1048u), uvec2(1024u, 512u));
+
+uvec2 add64(uvec2 a, uvec2 b) {
+    uint carry;
+    const uint low = uaddCarry(a.x, b.x, carry);
+    return uvec2(low, a.y + b.y + carry);
+}
+
+Words at(uvec2 va) {
+    return Words(add64(pc.heap_base, va));
+}
+
+uint lookup(uint key[8]) {
+    uint h = 2166136261u;
+    for (int i = 0; i < 8; ++i) h = (h ^ key[i]) * 16777619u;
+    const uint mask = map[0];
+    for (uint k = 0; k < 8; ++k) {
+        const uint slot = 1 + ((h + k) & mask) * 10;
+        bool same = true;
+        for (int i = 0; i < 8; ++i) same = same && map[slot + i] == key[i];
+        if (same) return map[slot + 8];
+    }
+    return 0;
+}
+
+void main() {
+    Words views = at(uvec2(pc.s[8], 0u));
+    uint key[8];
+    for (int k = 0; k < 8; ++k) key[k] = views.w[pc.s[4] + k];
+    const uint image = lookup(key);
+    const uvec2 xy = kPatch[pc.s[5]] + gl_GlobalInvocationID.xy;
+    const uvec4 bytes = uvec4(xy.x & 0xFFu, xy.y & 0xFFu, (xy.x >> 8) | ((xy.y >> 8) << 4), 0x5Au);
+    imageStore(storage_float_2d[image], ivec2(xy), vec4(bytes) / 255.0);
+}

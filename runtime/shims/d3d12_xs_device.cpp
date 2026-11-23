@@ -3022,6 +3022,61 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
 // replacement, flag mask and slot-count guard are not. Words keep their thunk positions (see the top of the file).
 constexpr unsigned kCreateCommittedResource3X = 127;
 
+// ---- EXPERIMENTAL, opt-in: one committed-texture tuple on slot 127 (a hypothesis, not a known console ABI) ----
+//
+// Off by default. Only with PALMWAVE_EXPERIMENTAL_XBOX_COMMITTED_TEXTURE exactly "1" (read on every slot-127 call), and
+// only for the single tuple in experimental_committed_texture_shape, the PC device receives a COPY of the description
+// whose Flags word is 0x5 (ALLOW_RENDER_TARGET | ALLOW_UNORDERED_ACCESS) instead of the title's 0x00300005. Nothing
+// public read for this experiment gives 0x00100000 or 0x00200000 a meaning; dropping them says nothing about the
+// console's DCC, metadata or tiling. Every other word is passed exactly as on the strict path: heap flags 0x8
+// (ALLOW_DISPLAY) kept, initial layout word 3 kept (the public D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS; one public
+// project reads it as RENDER_TARGET, which is unresolved and NOT converted here), the title's clear value, null
+// session, empty castable list, riid and out pointers. The resource returned is the one the backend creates; there is
+// no external address, import, shadow, extra allocation, mask, retry or fallback. Any other value, any other shape,
+// and other experiment variables leave the strict path unchanged byte for byte. See docs/BLOCKERS.md.
+constexpr char kExperimentalCommittedTextureVariable[] = "PALMWAVE_EXPERIMENTAL_XBOX_COMMITTED_TEXTURE";
+constexpr std::uint32_t kExpCommittedTextureFlags = 0x00300005u;  // RT | UA + 0x00300000 (meaning unknown)
+constexpr std::uint32_t kExpCommittedTextureHostFlags = 0x00000005u;  // RT | UA
+constexpr std::uint32_t kExpCommittedTextureLayout = 3;  // passed unchanged (public UNORDERED_ACCESS)
+
+// Exactly "1" enables; unset, empty, "0", "true", "11", "1 " or anything longer disables.
+bool experimental_committed_texture_requested() {
+    char value[4] = {};
+    const DWORD length = GetEnvironmentVariableA(kExperimentalCommittedTextureVariable, value, sizeof(value));
+    return length == 1 && value[0] == '1';
+}
+
+// The whole tuple, named field by named field. The DWORD at +4 of the description (padding after Dimension) and any
+// other padding are not read. The UINT words arrive already truncated to 32 bits by the strict adapter.
+bool experimental_committed_texture_shape(const D3D12_HEAP_PROPERTIES& heap, std::uint32_t heap_flags,
+                                          const D3D12_RESOURCE_DESC1& desc, std::uint32_t layout,
+                                          const D3D12_CLEAR_VALUE* clear, std::uint64_t session_word,
+                                          std::uint32_t castable_count, std::uint64_t castable_formats_word,
+                                          const IID& riid, const void* out) {
+    if (static_cast<std::uint32_t>(heap.Type) != static_cast<std::uint32_t>(D3D12_HEAP_TYPE_DEFAULT) ||
+        static_cast<std::uint32_t>(heap.CPUPageProperty) != 0 ||
+        static_cast<std::uint32_t>(heap.MemoryPoolPreference) != 0 || heap.CreationNodeMask != 1 ||
+        heap.VisibleNodeMask != 1)
+        return false;
+    if (heap_flags != static_cast<std::uint32_t>(D3D12_HEAP_FLAG_ALLOW_DISPLAY)) return false;
+    if (static_cast<std::uint32_t>(desc.Dimension) != static_cast<std::uint32_t>(D3D12_RESOURCE_DIMENSION_TEXTURE2D) ||
+        desc.Alignment != 0 || desc.Width != 3840 || desc.Height != 2160 || desc.DepthOrArraySize != 1 ||
+        desc.MipLevels != 1 || static_cast<std::uint32_t>(desc.Format) != 28 || desc.SampleDesc.Count != 1 ||
+        desc.SampleDesc.Quality != 0 || static_cast<std::uint32_t>(desc.Layout) != 0 ||
+        static_cast<std::uint32_t>(desc.Flags) != kExpCommittedTextureFlags ||
+        desc.SamplerFeedbackMipRegion.Width != 0 || desc.SamplerFeedbackMipRegion.Height != 0 ||
+        desc.SamplerFeedbackMipRegion.Depth != 0)
+        return false;
+    if (layout != kExpCommittedTextureLayout) return false;
+    if (!clear || static_cast<std::uint32_t>(clear->Format) != 28) return false;
+    unsigned char color[sizeof(clear->Color)];
+    std::memcpy(color, clear->Color, sizeof(color));
+    for (const unsigned char b : color)
+        if (b != 0) return false;  // bit compare: -0.0f does not match
+    return session_word == 0 && castable_count == 0 && castable_formats_word == 0 &&
+           IsEqualIID(riid, __uuidof(ID3D12Resource)) && out != nullptr;
+}
+
 HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap_word, std::uint64_t heap_flags_word,
                                            std::uint64_t desc_word, std::uint64_t layout_word,
                                            std::uint64_t clear_word, std::uint64_t session_word,
@@ -3044,6 +3099,20 @@ HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap
         return d3d12_trace::result(method, E_POINTER);
     }
 
+    // The opt-in experiment (see above): only the Flags word of a local copy differs; the title's bytes are not written.
+    const bool experimental =
+        experimental_committed_texture_requested() &&
+        experimental_committed_texture_shape(*heap, heap_flags, *desc, layout,
+                                             reinterpret_cast<const D3D12_CLEAR_VALUE*>(clear_word), session_word,
+                                             castable_count, castable_formats_word, *riid, out);
+    D3D12_RESOURCE_DESC1 host_desc;
+    const D3D12_RESOURCE_DESC1* pc_desc = desc;
+    if (experimental) {
+        std::memcpy(&host_desc, desc, sizeof(host_desc));
+        host_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(kExpCommittedTextureHostFlags);
+        pc_desc = &host_desc;
+    }
+
     HRESULT hr = E_NOTIMPL;
     bool has_device10 = false;
 #ifdef __ID3D12Device10_INTERFACE_DEFINED__
@@ -3053,7 +3122,7 @@ HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap
     if (device10) {
         has_device10 = true;
         hr = device10->CreateCommittedResource3(
-            heap, static_cast<D3D12_HEAP_FLAGS>(heap_flags), desc, static_cast<D3D12_BARRIER_LAYOUT>(layout),
+            heap, static_cast<D3D12_HEAP_FLAGS>(heap_flags), pc_desc, static_cast<D3D12_BARRIER_LAYOUT>(layout),
             reinterpret_cast<const D3D12_CLEAR_VALUE*>(clear_word),
             reinterpret_cast<ID3D12ProtectedResourceSession*>(session_word), castable_count,
             reinterpret_cast<const DXGI_FORMAT*>(castable_formats_word), *riid, out);
@@ -3063,6 +3132,19 @@ HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap
 #else
     (void)self;
 #endif
+    if (experimental) {
+        // Every experimental attempt is logged and traced after the backend has answered; the outcome token marks the
+        // hypothesis, and the backend's real result is traced separately below (never "ok" for the hypothesis).
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 127 EXPERIMENTAL committed texture (PALMWAVE_EXPERIMENTAL_XBOX_COMMITTED_TEXTURE"
+                     "=1; a hypothesis, not a console ABI): exact tuple 3840x2160 format 28 heap flags 0x8 kept; flags "
+                     "0x%08x -> 0x%x on a copy (bits 0x00300000 meaning UNKNOWN, no DCC/metadata/tiling claim); initial "
+                     "layout %u kept -> 0x%08lx%s\n",
+                     kExpCommittedTextureFlags, kExpCommittedTextureHostFlags, kExpCommittedTextureLayout,
+                     static_cast<unsigned long>(hr), has_device10 ? "" : " (no ID3D12Device10)");
+        d3d12_trace::record("Xbox CreateCommittedResource3 (device slot 127) EXPERIMENTAL committed texture",
+                            "experimental-hypothesis");
+    }
     static std::atomic<bool> logged{false};
     if (first_call(logged) || verbose)
         std::fprintf(stderr,

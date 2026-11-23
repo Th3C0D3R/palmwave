@@ -1,0 +1,69 @@
+#version 460
+// Hand-written GLSL contract fixture for d3d12_committed_texture_test (NOT a translated RDNA2 shader), the reading half
+// of cs_committed_texture_write.comp, on the same root arguments:
+//   s4       a root constant: where the SRV's slot starts inside the view table, in dwords
+//   s5       a root constant: the patch index (0..5)
+//   s6:s7    a root UAV: the console VA of the output buffer
+//   s8       the descriptor table of views (its 32-bit console VA)
+// It loads the SRV's T#, looks it up in the hash table at set 0 binding 2, reads the 2D sampled image at set 0
+// binding 0 with texelFetch (no sampler) and writes
+//   out[s5 * 4096 + y * 64 + x] = the texel at the patch's origin + (x, y), as RGBA8 with red in the low byte.
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words {
+    uint w[];
+};
+
+layout(push_constant) uniform UserData {
+    uint s[32];
+    uvec2 heap_base;
+    uvec2 code_base;
+} pc;
+
+layout(set = 0, binding = 0) uniform texture2D images[];
+layout(set = 0, binding = 2, std430) readonly buffer DescriptorMap {
+    uint map[];
+};
+
+const uvec2 kPatch[6] = uvec2[6](uvec2(0u, 0u), uvec2(3776u, 0u), uvec2(0u, 2096u), uvec2(3776u, 2096u),
+                                 uvec2(1888u, 1048u), uvec2(1024u, 512u));
+
+uvec2 add64(uvec2 a, uvec2 b) {
+    uint carry;
+    const uint low = uaddCarry(a.x, b.x, carry);
+    return uvec2(low, a.y + b.y + carry);
+}
+
+Words at(uvec2 va) {
+    return Words(add64(pc.heap_base, va));
+}
+
+uint lookup(uint key[8]) {
+    uint h = 2166136261u;
+    for (int i = 0; i < 8; ++i) h = (h ^ key[i]) * 16777619u;
+    const uint mask = map[0];
+    for (uint k = 0; k < 8; ++k) {
+        const uint slot = 1 + ((h + k) & mask) * 10;
+        bool same = true;
+        for (int i = 0; i < 8; ++i) same = same && map[slot + i] == key[i];
+        if (same) return map[slot + 8];
+    }
+    return 0;
+}
+
+void main() {
+    Words views = at(uvec2(pc.s[8], 0u));
+    uint key[8];
+    for (int k = 0; k < 8; ++k) key[k] = views.w[pc.s[4] + k];
+    const uint image = lookup(key);
+    const uvec2 local = gl_GlobalInvocationID.xy;
+    const uvec2 xy = kPatch[pc.s[5]] + local;
+    const vec4 texel = texelFetch(images[image], ivec2(xy), 0);
+    Words result = at(uvec2(pc.s[6], pc.s[7]));
+    result.w[pc.s[5] * 4096u + local.y * 64u + local.x] = packUnorm4x8(texel);
+}

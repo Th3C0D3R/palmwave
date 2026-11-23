@@ -271,3 +271,24 @@ The integrated build passed 18 focused CPU/WARP CTests in 0.47 seconds, includin
 pointers, missing-interface failures and the combined queue/proxy regressions. No new GPU run was needed for
 these adapters, and no local executable call through these eight routes is yet claimed. The previous RTX 5080
 GPU result and the unresolved imported-address/texture blockers still apply.
+
+## Committed-texture diagnostic and allocation accounting
+
+The opt-in PALMWAVE_EXPERIMENTAL_XBOX_COMMITTED_TEXTURE=1 experiment accepts one measured committed-image
+tuple. It passes a copy with flags 0x00300005 changed to RT|UAV (0x5), preserving every other argument,
+including the numeric initial layout 3 and heap flags 8. The default remains strict. No meaning is claimed
+for the two unknown console bits. The next different tuple or flag requires a common evidenced rule and
+an oracle, not another tuple exception (docs/BLOCKERS.md).
+
+The combined runtime passed 23 targeted CTests in 1.02 seconds. On RTX 5080 / 621.14, Vulkan and synchronization
+validation reported zero errors. The same committed image produced 11,520 exact RTV-clear texels and
+24,576 exact SRV-read texels after UAV writes, including 4,096 untouched-clear control texels.
+This test uses synthetic GLSL and validates neither translated game shaders nor the imported-buffer path.
+
+The offline executable then created two matching 4K images and called their SRV/RTV/UAV creation.
+It stopped at a separate allocation-accounting assertion: the scoped reserved budget remains 64 MiB
+while accounted use remains zero after the two creations. The trace contains 2,249 D3D12 events:
+2,205 ok, 29 called, 12 experimental-hypothesis, one experimental and two refused imported RAW views.
+A repeat with the integrated runtime confirmed the same stop. No Draw, ExecuteCommandLists, Present or
+game image was observed. The signed imported-address correction and true resource-allocation accounting
+are separate remaining requirements.

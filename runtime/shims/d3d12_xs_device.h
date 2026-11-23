@@ -26,6 +26,9 @@
 //             word through the pointer QueryInterface(ID3D12Device10) returns. Nothing is masked or rewritten: console
 //             flag bits reach the backend, which refuses what it does not know. No ID3D12Device10: E_NOTIMPL. Null
 //             heap/desc/riid: E_POINTER without a backend call. `out` is optional (S_FALSE kept); cleared on failure.
+//             EXPERIMENT, opt-in only: with PALMWAVE_EXPERIMENTAL_XBOX_COMMITTED_TEXTURE exactly "1" (read per call),
+//             the one 3840x2160 tuple in experimental_committed_texture_shape goes to the backend as a copy of the
+//             description with Flags 0x00300005 -> 0x5; all other words, and every other request, stay strict.
 //   slot 133  CreatePlacedResourceX(va, desc, state, clear, riid, out) -> the registered host-page handler, only for
 //             a plain row-major buffer, supported flags and no clear value. Unknown flags/layouts are refused without
 //             rewriting them. No handler: E_NOTIMPL, null output and an unsupported trace.

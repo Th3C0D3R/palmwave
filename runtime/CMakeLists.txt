@@ -986,6 +986,17 @@ if(BUILD_TESTING)
     add_test(NAME xs_proxy_mock_host_import_experimental COMMAND xs_proxy_mock_test --host-import-experiment on)
     set_tests_properties(xs_proxy_mock_host_import_experimental PROPERTIES
                          ENVIRONMENT "PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT=1")
+    # Slot 127's opt-in committed-texture experiment (PALMWAVE_EXPERIMENTAL_XBOX_COMMITTED_TEXTURE, read per call): the
+    # test sets and restores the variable itself. The second run adds the slot-133 variable, which must not change it.
+    add_test(NAME xs_proxy_mock_committed_texture_experiment COMMAND xs_proxy_mock_test --committed-texture-experiment)
+    set_tests_properties(xs_proxy_mock_committed_texture_experiment PROPERTIES
+                         ENVIRONMENT_MODIFICATION "PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT=unset:"
+                         FAIL_REGULAR_EXPRESSION "line [0-9]+:")
+    add_test(NAME xs_proxy_mock_committed_texture_with_host_import
+             COMMAND xs_proxy_mock_test --committed-texture-experiment)
+    set_tests_properties(xs_proxy_mock_committed_texture_with_host_import PROPERTIES
+                         ENVIRONMENT "PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT=1"
+                         FAIL_REGULAR_EXPRESSION "line [0-9]+:")
   endif()
   if(TARGET root_sig_test)
     add_test(NAME root_sig COMMAND root_sig_test)
@@ -2810,6 +2821,35 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_set0_compute_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_set0_compute COMMAND d3d12_set0_compute_test)
       set_tests_properties(d3d12_set0_compute PROPERTIES SKIP_RETURN_CODE 77)
+      # Device slot 127's opt-in committed-texture experiment (PALMWAVE_EXPERIMENTAL_XBOX_COMMITTED_TEXTURE, a
+      # hypothesis): strict refusal first, then the one experimental 3840x2160 texture through the proxy's raw slot 127,
+      # and same-image RT clear, copy, UAV write and SRV read through the PC views and two hand-written GLSL contract
+      # fixtures (not translated RDNA2). The test sets and restores the variable itself; CTest starts it unset.
+      set(PALMWAVE_TEST_CS_COMMITTED_TEXTURE_WRITE ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_committed_texture_write.spv)
+      set(PALMWAVE_TEST_CS_COMMITTED_TEXTURE_READ ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_committed_texture_read.spv)
+      foreach(pair "cs_committed_texture_write.comp;${PALMWAVE_TEST_CS_COMMITTED_TEXTURE_WRITE}"
+                   "cs_committed_texture_read.comp;${PALMWAVE_TEST_CS_COMMITTED_TEXTURE_READ}")
+        list(GET pair 0 source)
+        list(GET pair 1 output)
+        add_custom_command(
+          OUTPUT ${output}
+          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${output}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+          DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+          COMMENT "Compiling the committed-texture GLSL fixture ${source}"
+          VERBATIM)
+      endforeach()
+      add_executable(d3d12_committed_texture_test test/d3d12_committed_texture_test.cpp shims/d3d12_xs_device.cpp
+                     ${PALMWAVE_TEST_CS_COMMITTED_TEXTURE_WRITE} ${PALMWAVE_TEST_CS_COMMITTED_TEXTURE_READ})
+      target_link_libraries(d3d12_committed_texture_test PRIVATE palmwave_d3d12_com)
+      target_compile_definitions(d3d12_committed_texture_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+        PALMWAVE_TEST_CS_COMMITTED_TEXTURE_WRITE_SPV="${PALMWAVE_TEST_CS_COMMITTED_TEXTURE_WRITE}"
+        PALMWAVE_TEST_CS_COMMITTED_TEXTURE_READ_SPV="${PALMWAVE_TEST_CS_COMMITTED_TEXTURE_READ}")
+      target_compile_options(d3d12_committed_texture_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_committed_texture COMMAND d3d12_committed_texture_test)
+      set_tests_properties(d3d12_committed_texture PROPERTIES SKIP_RETURN_CODE 77
+                           FAIL_REGULAR_EXPRESSION "Validation Error;VUID-"
+                           ENVIRONMENT_MODIFICATION "PALMWAVE_EXPERIMENTAL_XBOX_COMMITTED_TEXTURE=unset:")
       # Bindless table churn on a direct and a compute queue: the table grows and live keys move without a
       # device-idle wait (D3D-314); the same shader, run twice (deferred retirement, and the old wait for timing).
       add_executable(d3d12_bindless_churn_test test/d3d12_bindless_churn_test.cpp shims/d3d12_xs_device.cpp

@@ -26,6 +26,9 @@
 //   - device slot 127 (ten words, ID3D12Device10::CreateCommittedResource3): every word reaches the PC slot 76 of the
 //     interface pointer QueryInterface returned, unchanged (unknown flags included, refused by the mock backend);
 //     --slot127 runs it with the D3D12 trace on; --env-slots-127 moves a configured route onto 127, which must win.
+//   - --committed-texture-experiment: slot 127's opt-in experiment (PALMWAVE_EXPERIMENTAL_XBOX_COMMITTED_TEXTURE, set
+//     and restored by the test itself): only exactly "1" with the one exact tuple reaches the alias as a copy with
+//     Flags 0x5; every other value and every one-field change is the strict path above.
 // Every device, queue, fence and resource here is a mock that records the calls it gets. No game data, no Xbox DLLs.
 #include "../shims/d3d12_xs_device.h"
 #include "../shims/d3d12_trace.h"
@@ -3762,12 +3765,39 @@ int check_resource_routes() {
 
 // ---- 10. The refused tail and the guard region ----
 
+// Slot 127's opt-in experiment variable (read on every call). The strict checks pin it unset for their duration and
+// give the process's value back on every return path, so the other checks in this process see what they saw before.
+constexpr char kCommittedTextureEnv[] = "PALMWAVE_EXPERIMENTAL_XBOX_COMMITTED_TEXTURE";
+
+class EnvRestore {
+public:
+    explicit EnvRestore(const char* name) : name_(name) {
+        SetLastError(ERROR_SUCCESS);
+        const DWORD n = GetEnvironmentVariableA(name, value_, sizeof(value_));
+        present_ = n != 0 || GetLastError() != ERROR_ENVVAR_NOT_FOUND;
+        ok_ = n < sizeof(value_);  // a longer value could not be restored exactly
+    }
+    ~EnvRestore() { SetEnvironmentVariableA(name_, present_ ? value_ : nullptr); }
+    EnvRestore(const EnvRestore&) = delete;
+    EnvRestore& operator=(const EnvRestore&) = delete;
+    bool ok() const { return ok_; }
+
+private:
+    const char* name_;
+    char value_[256] = {};
+    bool present_ = false;
+    bool ok_ = false;
+};
+
 // ---- Device slot 127: ID3D12Device10::CreateCommittedResource3 called the console's way ----
 //
 // Ten words after `this`, the UINT words with poisoned upper halves, the description with a poisoned padding DWORD.
 // The PC device's ID3D12Device10 is a separate alias object; a call on the base pointer would answer E_UNEXPECTED.
 int check_committed_resource3() {
 #ifdef __ID3D12Device10_INTERFACE_DEFINED__
+    const EnvRestore saved_texture(kCommittedTextureEnv);  // strict regardless of the caller's environment
+    EXPECT(saved_texture.ok());
+    SetEnvironmentVariableA(kCommittedTextureEnv, nullptr);
     constexpr std::uint64_t kPoison = 0xA5A5A5A500000000ull;
     constexpr std::uint32_t kMeasuredFlags = 0x00300005;  // RT | UA and two bits outside the PC set
     constexpr std::uint32_t kMeasuredLayout = 3;          // the measured initial layout word
@@ -3906,6 +3936,273 @@ int check_committed_resource3() {
                 "unknown flags reach the backend, which refuses them\n", g_label);
 #else
     std::printf("%s: device slot 127 not checked: the SDK has no ID3D12Device10\n", g_label);
+#endif
+    return 0;
+}
+
+// ---- Device slot 127: the opt-in committed-texture EXPERIMENT (PALMWAVE_EXPERIMENTAL_XBOX_COMMITTED_TEXTURE) ----
+//
+// The variable is read on every call, so this test sets it itself and gives the process's value back on every return
+// path (EnvRestore). Exactly "1" plus the one exact tuple reaches the alias as a different description pointer whose
+// bytes equal the title's except Flags 0x5; every other value, every one-field change, and the other experiment
+// variables leave the strict path: the title's own pointer, bytes and words, and the mock backend's own answer.
+int check_committed_texture_experiment() {
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+    const EnvRestore saved_texture(kCommittedTextureEnv);
+    const EnvRestore saved_flush(kFlushEnv);
+    EXPECT(saved_texture.ok() && saved_flush.ok());
+    constexpr std::uint64_t kPoison = 0xA5A5A5A500000000ull;
+    constexpr std::uint64_t kOtherPoison = 0x5A5A5A5A00000000ull;
+
+    // The measured tuple (sizes and enum values only), with poison in the padding and in the UINT words' upper halves.
+    struct Tuple {
+        D3D12_HEAP_PROPERTIES heap;
+        std::uint64_t heap_flags_word;
+        D3D12_RESOURCE_DESC1 desc;
+        std::uint64_t layout_word;
+        D3D12_CLEAR_VALUE clear;
+        bool null_clear;
+        std::uint64_t session_word;
+        std::uint64_t count_word;
+        std::uint64_t list_word;
+        const IID* riid;
+        bool null_out;
+    };
+    Tuple base;
+    std::memset(&base, 0xCD, sizeof(base));  // every padding byte poisoned
+    base.heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    base.heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    base.heap.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    base.heap.CreationNodeMask = 1;
+    base.heap.VisibleNodeMask = 1;
+    base.heap_flags_word = kPoison | static_cast<std::uint32_t>(D3D12_HEAP_FLAG_ALLOW_DISPLAY);
+    base.desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    base.desc.Alignment = 0;
+    base.desc.Width = 3840;
+    base.desc.Height = 2160;
+    base.desc.DepthOrArraySize = 1;
+    base.desc.MipLevels = 1;
+    base.desc.Format = static_cast<DXGI_FORMAT>(28);
+    base.desc.SampleDesc = {1, 0};
+    base.desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    base.desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x00300005);
+    base.desc.SamplerFeedbackMipRegion = {0, 0, 0};
+    base.layout_word = kPoison | 3;
+    std::memset(&base.clear, 0, sizeof(base.clear));
+    base.clear.Format = static_cast<DXGI_FORMAT>(28);
+    base.null_clear = false;
+    base.session_word = 0;
+    base.count_word = kPoison;  // count 0 in the low half
+    base.list_word = 0;
+    base.riid = &kResourceIid;
+    base.null_out = false;
+
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 10, true);
+    EXPECT(device && xs::device_proxy_slot_count(device) == 79);
+    Mock* alias = new_mock(Kind::device);
+    alias->refs = 1;
+    mock->device10_alias = alias;
+    mock->create_result = E_UNEXPECTED;  // only the alias may create
+    g_committed3 = {};
+    const Committed3Seen& s = g_committed3;
+    const auto proxy_refs = xs::device_proxy_ref_count(device);
+    const long base_refs = mock->refs;
+    void* resource = nullptr;
+    const auto balanced = [&] {
+        return alias->refs == 1 && mock->refs == base_refs && xs::device_proxy_ref_count(device) == proxy_refs;
+    };
+    const auto words_of = [&](const Tuple& t, std::uint64_t (&w)[10]) {
+        w[0] = word(&t.heap);
+        w[1] = t.heap_flags_word;
+        w[2] = word(&t.desc);
+        w[3] = t.layout_word;
+        w[4] = t.null_clear ? 0 : word(&t.clear);
+        w[5] = t.session_word;
+        w[6] = t.count_word;
+        w[7] = t.list_word;
+        w[8] = word(t.riid);
+        w[9] = t.null_out ? 0 : word(&resource);
+    };
+    // The nine words other than the description reach the alias exactly as the strict adapter passes them.
+    const auto same_other_words = [&](const std::uint64_t (&w)[10]) {
+        return s.device == alias && s.heap == reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(w[0]) &&
+               s.heap_flags == static_cast<std::uint32_t>(w[1]) && s.layout == static_cast<std::uint32_t>(w[3]) &&
+               s.clear == reinterpret_cast<const void*>(w[4]) && s.session == reinterpret_cast<const void*>(w[5]) &&
+               s.castable_count == static_cast<std::uint32_t>(w[6]) &&
+               s.castable == reinterpret_cast<const void*>(w[7]) && s.riid == reinterpret_cast<const IID*>(w[8]) &&
+               s.out == reinterpret_cast<void**>(w[9]);
+    };
+    // Calls once and checks the strict path: the title's description pointer and bytes, the mock backend's answer
+    // (S_FALSE without an output, E_INVALIDARG for a flag outside 0x7FF, otherwise one real mock resource).
+    const auto strict = [&](Tuple& t) -> bool {
+        Tuple before;
+        std::memcpy(&before, &t, sizeof(t));
+        std::uint64_t w[10];
+        words_of(t, w);
+        const unsigned calls = s.calls;
+        resource = reinterpret_cast<void*>(1);
+        const HRESULT hr = hr_of(raw10(device, 127, w));
+        const auto flags = static_cast<std::uint32_t>(t.desc.Flags);
+        const HRESULT want = t.null_out ? S_FALSE : (flags & ~0x7FFu) ? E_INVALIDARG : S_OK;
+        bool ok = hr == want && s.calls == calls + 1 && same_other_words(w) && s.desc == &t.desc &&
+                  std::memcmp(s.desc_bytes, &before.desc, sizeof(before.desc)) == 0 &&
+                  std::memcmp(&t, &before, sizeof(t)) == 0;
+        if (!t.null_out) {
+            if (SUCCEEDED(hr)) {
+                ok = ok && resource && resource == alias->last_child;
+                if (resource && resource != reinterpret_cast<void*>(1)) ok = release(resource) == 0 && ok;
+            } else {
+                ok = ok && resource == nullptr;
+            }
+        }
+        return ok && balanced();
+    };
+    // Calls once and checks the experiment: a different description pointer, the title's bytes except Flags 0x5
+    // (padding poison included), the other nine words unchanged, one backend call, the backend's own resource.
+    const auto experimental = [&](Tuple& t, HRESULT want) -> bool {
+        Tuple before;
+        std::memcpy(&before, &t, sizeof(t));
+        D3D12_RESOURCE_DESC1 expected;
+        std::memcpy(&expected, &t.desc, sizeof(expected));
+        expected.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x5);
+        std::uint64_t w[10];
+        words_of(t, w);
+        const unsigned calls = s.calls;
+        resource = reinterpret_cast<void*>(1);
+        const HRESULT hr = hr_of(raw10(device, 127, w));
+        bool ok = hr == want && s.calls == calls + 1 && same_other_words(w) && s.desc && s.desc != &t.desc &&
+                  std::memcmp(s.desc_bytes, &expected, sizeof(expected)) == 0 &&
+                  std::memcmp(&t, &before, sizeof(t)) == 0 &&
+                  static_cast<std::uint32_t>(t.desc.Flags) == 0x00300005u;
+        if (SUCCEEDED(hr)) {
+            ok = ok && resource && resource == alias->last_child &&
+                 reinterpret_cast<Mock*>(resource)->kind == Kind::resource;
+            if (resource && resource != reinterpret_cast<void*>(1)) ok = release(resource) == 0 && ok;
+        } else {
+            ok = ok && resource == nullptr;
+        }
+        return ok && balanced();
+    };
+
+    // 1. Anything but exactly "1" (unset, empty, "0", "true", "11", "1 ", " 1", "01"): the measured tuple stays
+    //    strict and the mock backend refuses the unknown bits as before. The flush experiment's variable does not
+    //    broaden this one.
+    {
+        Tuple t = base;
+        EXPECT(SetEnvironmentVariableA(kFlushEnv, nullptr) != FALSE || GetLastError() == ERROR_ENVVAR_NOT_FOUND);
+        SetEnvironmentVariableA(kCommittedTextureEnv, nullptr);
+        EXPECT(strict(t));
+        for (const char* value : {"", "0", "true", "11", "1 ", " 1", "01", "TRUE", "yes"}) {
+            EXPECT(SetEnvironmentVariableA(kCommittedTextureEnv, value) != FALSE);
+            if (!strict(t)) {
+                std::fprintf(stderr, "%s line %d: value \"%s\" was not strict\n", g_label, __LINE__, value);
+                return 1;
+            }
+        }
+        SetEnvironmentVariableA(kCommittedTextureEnv, nullptr);
+        EXPECT(SetEnvironmentVariableA(kFlushEnv, "1") != FALSE);
+        EXPECT(strict(t));
+        EXPECT(SetEnvironmentVariableA(kFlushEnv, nullptr) != FALSE);
+    }
+
+    // 2. Exactly "1" and the exact tuple: the experiment. Read per call: twice in a row, back to strict with "0", and
+    //    on again; the flush variable set as well changes nothing.
+    EXPECT(SetEnvironmentVariableA(kCommittedTextureEnv, "1") != FALSE);
+    {
+        Tuple t = base;
+        EXPECT(experimental(t, S_OK));
+        EXPECT(experimental(t, S_OK));
+        EXPECT(SetEnvironmentVariableA(kCommittedTextureEnv, "0") != FALSE);
+        EXPECT(strict(t));
+        EXPECT(SetEnvironmentVariableA(kCommittedTextureEnv, "1") != FALSE);
+        EXPECT(SetEnvironmentVariableA(kFlushEnv, "1") != FALSE);
+        EXPECT(experimental(t, S_OK));
+        EXPECT(SetEnvironmentVariableA(kFlushEnv, nullptr) != FALSE);
+
+        // Padding only (the DWORD at +4), and other poison in the UINT words' upper halves: still the
+        // tuple, and the copy carries the title's padding bytes.
+        auto* const bytes = reinterpret_cast<unsigned char*>(&t.desc);
+        bytes[4] = 0x11;
+        bytes[7] = 0x77;
+        t.heap_flags_word = kOtherPoison | static_cast<std::uint32_t>(t.heap_flags_word);
+        t.layout_word = kOtherPoison | 3;
+        t.count_word = kOtherPoison;
+        EXPECT(experimental(t, S_OK));
+
+        // The backend's failure stays the failure, with a null output and one call (no retry, no fallback).
+        alias->create_result = E_OUTOFMEMORY;
+        EXPECT(experimental(t, E_OUTOFMEMORY));
+        alias->create_result = S_OK;
+    }
+
+    // 3. One field changed per case, the variable still "1": each is the strict path with the title's own values.
+    const auto negative = [&](const char* name, auto mutate) -> bool {
+        Tuple t = base;
+        mutate(t);
+        if (strict(t)) return true;
+        std::fprintf(stderr, "%s line %d: negative case '%s' was not strict\n", g_label, __LINE__, name);
+        return false;
+    };
+    const auto flags_case = [&](std::uint32_t value) {
+        return negative("flags", [value](Tuple& t) { t.desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(value); });
+    };
+    EXPECT(negative("heap type", [](Tuple& t) { t.heap.Type = D3D12_HEAP_TYPE_UPLOAD; }));
+    EXPECT(negative("heap cpu page", [](Tuple& t) { t.heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE; }));
+    EXPECT(negative("heap pool", [](Tuple& t) { t.heap.MemoryPoolPreference = D3D12_MEMORY_POOL_L0; }));
+    EXPECT(negative("heap creation node", [](Tuple& t) { t.heap.CreationNodeMask = 2; }));
+    EXPECT(negative("heap visible node", [](Tuple& t) { t.heap.VisibleNodeMask = 3; }));
+    EXPECT(negative("heap flags 0", [](Tuple& t) { t.heap_flags_word = kPoison; }));
+    EXPECT(negative("heap flags 0xC", [](Tuple& t) { t.heap_flags_word = kPoison | 0xC; }));
+    EXPECT(negative("heap flags 0x9", [](Tuple& t) { t.heap_flags_word = kPoison | 0x9; }));
+    EXPECT(negative("dimension 1D", [](Tuple& t) { t.desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE1D; }));
+    EXPECT(negative("dimension 3D", [](Tuple& t) { t.desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D; }));
+    EXPECT(negative("alignment", [](Tuple& t) { t.desc.Alignment = 65536; }));
+    EXPECT(negative("width", [](Tuple& t) { t.desc.Width = 3839; }));
+    EXPECT(negative("height", [](Tuple& t) { t.desc.Height = 2161; }));
+    EXPECT(negative("depth", [](Tuple& t) { t.desc.DepthOrArraySize = 2; }));
+    EXPECT(negative("mips 0", [](Tuple& t) { t.desc.MipLevels = 0; }));
+    EXPECT(negative("mips 2", [](Tuple& t) { t.desc.MipLevels = 2; }));
+    EXPECT(negative("format", [](Tuple& t) { t.desc.Format = static_cast<DXGI_FORMAT>(29); }));
+    EXPECT(negative("sample count", [](Tuple& t) { t.desc.SampleDesc.Count = 4; }));
+    EXPECT(negative("sample quality", [](Tuple& t) { t.desc.SampleDesc.Quality = 1; }));
+    EXPECT(negative("desc layout", [](Tuple& t) { t.desc.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE; }));
+    EXPECT(negative("feedback width", [](Tuple& t) { t.desc.SamplerFeedbackMipRegion.Width = 1; }));
+    EXPECT(negative("feedback height", [](Tuple& t) { t.desc.SamplerFeedbackMipRegion.Height = 1; }));
+    EXPECT(negative("feedback depth", [](Tuple& t) { t.desc.SamplerFeedbackMipRegion.Depth = 1; }));
+    for (const std::uint32_t f : {0x00300004u, 0x00300001u, 0x00100005u, 0x00200005u, 0x00700005u, 0x00300015u, 0x5u})
+        EXPECT(flags_case(f));
+    for (const std::uint32_t l : {0u, 2u, 4u, 0xFFFFFFFFu})
+        EXPECT(negative("initial layout", [l](Tuple& t) { t.layout_word = kPoison | l; }));
+    EXPECT(negative("clear null", [](Tuple& t) { t.null_clear = true; }));
+    EXPECT(negative("clear format", [](Tuple& t) { t.clear.Format = static_cast<DXGI_FORMAT>(29); }));
+    EXPECT(negative("clear nonzero", [](Tuple& t) { t.clear.Color[1] = 1.0f; }));
+    EXPECT(negative("clear -0", [](Tuple& t) { t.clear.Color[3] = -0.0f; }));
+    static const int session_sentinel = 0;  // never dereferenced
+    static const DXGI_FORMAT castable_list[1] = {DXGI_FORMAT_R8G8B8A8_UNORM};
+    EXPECT(negative("session", [](Tuple& t) { t.session_word = word(&session_sentinel); }));
+    EXPECT(negative("count 1, list null", [](Tuple& t) { t.count_word = kPoison | 1; }));
+    EXPECT(negative("count 0, list", [](Tuple& t) { t.list_word = word(castable_list); }));
+    EXPECT(negative("riid", [](Tuple& t) { t.riid = &kUnknownIid; }));
+    EXPECT(negative("out null", [](Tuple& t) { t.null_out = true; }));
+
+    // 4. No ID3D12Device10 behind the device with the variable "1": E_NOTIMPL, a null output, no backend call.
+    {
+        Tuple t = base;
+        std::uint64_t w[10];
+        words_of(t, w);
+        const unsigned calls = s.calls, queries = mock->device10_queries;
+        mock->refuse_device10 = true;
+        resource = reinterpret_cast<void*>(1);
+        EXPECT(hr_of(raw10(device, 127, w)) == E_NOTIMPL && !resource && s.calls == calls);
+        EXPECT(mock->device10_queries == queries + 1 && balanced());
+        mock->refuse_device10 = false;
+    }
+    EXPECT(release(device) == 0);
+    std::printf("%s: committed-texture experiment: PASS (exactly \"1\" and the exact tuple reach the backend as a "
+                "copy with flags 0x00300005 -> 0x5; every other value and one-field change stays strict)\n", g_label);
+#else
+    std::printf("%s: committed-texture experiment not checked: the SDK has no ID3D12Device10\n", g_label);
 #endif
     return 0;
 }
@@ -4070,6 +4367,10 @@ int main(int argc, char** argv) {
         rt::d3d12_trace::set_enabled(true);  // every outcome is a traced line, as under palmwave --trace-d3d12
         return check_committed_resource3();
     }
+    if (argc == 2 && std::strcmp(argv[1], "--committed-texture-experiment") == 0) {
+        rt::d3d12_trace::set_enabled(true);  // each experimental attempt and its real result are traced lines
+        return check_committed_texture_experiment();
+    }
     if (argc == 2 && std::strcmp(argv[1], "--slot25") == 0) return check_resource_allocation_info();
     if (argc == 2 && std::strcmp(argv[1], "--resource-routes") == 0) return check_resource_routes();
     if (argc == 3 && std::strcmp(argv[1], "--host-import-experiment") == 0) {
@@ -4089,7 +4390,7 @@ int main(int argc, char** argv) {
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_xbox_queue_descriptions() ||
         check_lists() || check_shared_base_list() || check_experimental_flush() ||
         check_custom_heap_properties() || check_resource_allocation_info() || check_descriptor_heaps() || check_list_descriptor_handles() ||
-        check_srv_at_va() || check_committed_resource3())
+        check_srv_at_va() || check_committed_resource3() || check_committed_texture_experiment())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;
