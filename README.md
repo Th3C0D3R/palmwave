@@ -18,7 +18,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-blue" alt="GPL-3.0 license"></a>
 </p>
 
-Palmwave is an experimental open-source Xbox Series compatibility layer and shader translation toolchain for PC, developed under the **[Moon AI](https://realmoon.ai)** project identity. Its first target is a **verified frame rendered by the Xbox Series build of Xbox Series title on Windows**.
+Palmwave is an experimental open-source Xbox Series compatibility layer and shader translation toolchain for PC, developed under **[Moon AI](https://realmoon.ai), the AI platform created by Stellarr Studio**. Its first target is a **verified frame rendered by the Xbox Series build of Xbox Series title on Windows**.
 
 **The game is not currently confirmed to boot or render in Palmwave. No playable release is available.** Progress is recorded from local builds and traces in [STATUS.md](STATUS.md). A successful presentation call alone does not establish a rendered image.
 
@@ -82,7 +82,7 @@ Project discussions and issues: [fablinoo/palmwave](https://github.com/fablinoo/
 
 ## Credits and license
 
-**Project identity:** [Moon AI](https://realmoon.ai). **Maintainer:** [fablinoo](https://github.com/fablinoo).
+**Project:** [Moon AI](https://realmoon.ai), created by **Stellarr Studio**. **Maintainer:** [fablinoo](https://github.com/fablinoo).
 
 **Foundation:** ItsNotRexed and the upstream contributors; the vendored projects retain their own notices. **AI assistance for the initial setup:** OpenAI Codex and image generation; Claude Code was assigned a source review.
 

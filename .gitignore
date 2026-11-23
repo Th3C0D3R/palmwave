@@ -4,6 +4,7 @@ reports/
 work/
 /assets/*
 !/assets/logo.png
+!/assets/palmwave-logo.png
 carve/
 *.rpf
 *.ttpf
