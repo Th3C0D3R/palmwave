@@ -86,3 +86,30 @@ The resource request is a 174 MiB row-major buffer with unordered-access and an 
 ## Explicit resource-placement stop
 
 The device table now contains 192 callable entries. Slot 133 clears its output and reports unsupported host-page placement instead of jumping through a missing entry; it does not allocate a substitute buffer. Seven focused CPU mock modes pass. The integrated build passes five focused CTests in 1.11 seconds, including the RTX 5080 Vulkan copy regression with validation enabled. The next offline experimental run retains 581 created/closed lists and reports the placement refusal in its D3D12 trace, followed by the guest's failure handling. The null-target access violation is gone; resource placement remains the blocker. No Draw, submission, Present or first frame is claimed.
+## Strict host-page buffer import
+
+The slot-133 handler now imports tracked caller-owned buffers through `VK_EXT_external_memory_host`, with no
+stand-in resource or fallback copy. It requires coherent host-visible memory, an importable external buffer that
+does not require a dedicated allocation, a valid supported buffer description, and pages whose lifetime the
+served memory shims can hold. Unknown console flags/state words, textures, unmanaged memory, write-combined
+or uncached pages remain refused. Pins are logical shim reservations, not OS page locks; raw host/NT invalidation
+paths remain outside their contract. Shader V# address translation is still open.
+
+Integrated on Palmwave `b852eef`, built with MSVC 19.51, Windows SDK 10.0.26100 and Vulkan SDK 1.4.363.0:
+- Ten CPU CTests pass in 0.61 seconds: xmem, device proxy/trace and all seven Xbox proxy cases, including the
+  slot-133 unsupported trace. The queue, list, shared-IID and experimental synchronization regressions remain.
+- Four GPU CTests pass in 15.32 seconds on NVIDIA GeForce RTX 5080, driver 621.14, with Vulkan validation enabled
+  and no validation errors: host-page import, existing-heap refusals, queue proxy and allocator proxy.
+- The host-page test checks CPU writes before and after import through real GPU readback, GPU copies observed at
+  the same CPU address after a fence, shared lifetime, remapping after release, and refusals while pinned.
+  The allocator test also retains the existing experimental barrier path with eight copies and 1024 readback bytes.
+
+A separate offline retail probe used the new strict runtime with the synchronization diagnostic enabled and no
+host-import experiment. It recorded 21 startup events with four successful DLL initializations, and 1783 D3D12
+events: 1761 `ok`, 11 `called`, 10 `experimental`, one `unsupported`. Slot 133 refuses flags `0x20004` and logs
+the third word `0xffffffff`; neither is silently translated. The guest then reaches its assertion. No Draw,
+Submit or Present is observed, and no first frame is verified. This confirms that the real strict handler is reached;
+it does not establish the console placement contract or successful retail import.
+
+The import implementation and its revision were written with Claude Code (Claude Opus 5.5), independently
+reviewed, integrated and tested with OpenAI Codex. Compatible source attribution is in `UPSTREAM.md`.

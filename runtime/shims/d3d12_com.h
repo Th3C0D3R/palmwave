@@ -187,6 +187,10 @@ struct VulkanDeviceInfo {
     // colours fall back to transparent black.
     bool custom_border_color = false;
     bool custom_border_color_without_format = false;
+    // VK_EXT_external_memory_host is enabled on `device` when this is non-zero: its minImportedHostPointerAlignment
+    // (a power of two). Xbox device slot 133 imports the title's own pages with it (create_buffer_at_host_address).
+    // Zero: slot 133 fails with E_NOTIMPL. Field from upstream #7218 (tibzejoker, a3eae955, GPL-3.0).
+    VkDeviceSize host_pointer_alignment = 0;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive
@@ -220,6 +224,35 @@ const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device);
 bool device_supports_ray_tracing(ID3D12Device* device);
 // The VkAccelerationStructureKHR registered for `va` on `device`, or VK_NULL_HANDLE. For tests.
 VkAccelerationStructureKHR vulkan_acceleration_structure(ID3D12Device* device, D3D12_GPU_VIRTUAL_ADDRESS va);
+
+// Xbox device slot 133 (CreatePlacedResourceX): a buffer whose VkDeviceMemory is the caller's own pages at `address`,
+// imported with VK_EXT_external_memory_host into a HOST_VISIBLE | HOST_COHERENT memory type, so what the CPU writes there
+// is what the GPU reads and the reverse after a fence, with no copy. Its GetGPUVirtualAddress is `address`.
+//
+// The imported range is `address` rounded out to minImportedHostPointerAlignment. It must lie wholly inside ONE
+// allocation the title shims own (a title VirtualAlloc / XMemVirtualAlloc allocation, xmem-mapped physical pages, or a
+// live XMemAlloc block; host_pins.h) and be committed PAGE_READWRITE throughout (no guard page). It is pinned before it
+// is checked and stays pinned, with the title memory shims refusing to unmap, free, reprotect or replace it, until the
+// last resource on it is released and the GPU work submitted before that release has retired. Resources on the same
+// or a contained range share one import; a partial overlap, or pages that already back another import at another
+// address, are refused. The device must report host-allocation import as supported and not dedicated-only for the
+// buffer's exact flags and usage, and the buffer must not require a dedicated allocation.
+//
+// `desc` must be a plain buffer (Width > 0, Height/DepthOrArraySize/MipLevels 1, Format UNKNOWN, one sample at quality
+// 0, ROW_MAJOR, Alignment 0 or 64 KiB) with flags among ALLOW_UNORDERED_ACCESS and DENY_SHADER_RESOURCE.
+// `initial_state` must be D3D12_RESOURCE_STATE_COMMON (0): the console word's meaning is not established, so the
+// retail 0xFFFFFFFF is refused (docs/d3d12_vulkan.md 4.2, "Slot 133").
+//
+// Every failure returns null in *out and creates nothing: E_POINTER (no output or device), E_NOTIMPL (not this layer's
+// device, no extension or capability, a texture, an unimplemented flag or initial state, memory no shim owns, a
+// write-combined or uncached range, a range overlapping another import or the arena's console VAs, a placement the
+// driver cannot bind, a dedicated-only or dedicated-required import, no coherent host memory type), E_INVALIDARG (a
+// malformed buffer description, a null address, overflowing width, pages that are not committed read-write) or
+// E_OUTOFMEMORY. Raw shader V# addressing of these buffers (heap_base + VA) is not provided: docs/d3d12_vulkan.md 3.3.
+HRESULT create_buffer_at_host_address(ID3D12Device* device, void* address, const D3D12_RESOURCE_DESC& desc,
+                                      std::uint32_t initial_state, REFIID riid, void** out);
+// Live slot-133 host imports on `device` (each shared by one or more resources). For tests.
+std::size_t host_import_count(ID3D12Device* device);
 
 // The property flags of the Vulkan memory type behind a resource created by such a device, or 0. For tests.
 VkMemoryPropertyFlags vulkan_memory_flags(ID3D12Resource* resource);

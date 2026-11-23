@@ -545,6 +545,123 @@ int check_levels() {
             EXPECT(r75 == E_NOTIMPL && !queue1 && mock->calls[75] == 0);
         }
 
+        // 133 CreatePlacedResourceX, past every PC device vtable. With no handler: refused, the output cleared, not a
+        // jump through a missing entry (the table had 128 entries).
+        {
+            void* placed = reinterpret_cast<void*>(1);
+            const GUID resource_iid = __uuidof(ID3D12Resource);
+            D3D12_RESOURCE_DESC none{};
+            xs::set_placed_at_va_handler(nullptr);
+            EXPECT(hr_of(raw(device, 133, 0x7f0000000000ull, word(&none), 0xFFFFFFFFull, 0, word(&resource_iid),
+                             word(&placed))) == E_NOTIMPL &&
+                   !placed && mock->calls[127] == 0);
+            EXPECT(xs::device_slot_overridden(133));
+        }
+        // With a handler: a description the proxy implements reaches it unchanged, byte for byte, with the real
+        // device and the title's va, state word and riid in their positions. Everything else is refused by the proxy
+        // itself: the output null and the handler never called. A failing handler's result comes back with the
+        // output null.
+        {
+            static int handler_calls = 0;
+            static void* seen_real = nullptr;
+            static void* seen_va = nullptr;
+            static D3D12_RESOURCE_DESC seen_desc{};
+            static GUID seen_iid{};
+            static std::uint32_t seen_state = 0;
+            static HRESULT handler_result = S_OK;
+            const xs::PlacedAtVaHandler handler = [](ID3D12Device* real_device, void* va,
+                                                     const D3D12_RESOURCE_DESC& desc, std::uint32_t state,
+                                                     REFIID iid, void** out) -> HRESULT {
+                ++handler_calls;
+                seen_real = real_device;
+                seen_va = va;
+                seen_desc = desc;
+                seen_iid = iid;
+                seen_state = state;
+                if (FAILED(handler_result)) {
+                    *out = reinterpret_cast<void*>(0xbad);  // a sloppy handler: the proxy must still return null
+                    return handler_result;
+                }
+                *out = reinterpret_cast<void*>(0x1330);
+                return S_OK;
+            };
+            xs::set_placed_at_va_handler(handler);
+            D3D12_RESOURCE_DESC buffer{};
+            buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            buffer.Width = 0x10000;
+            buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
+            buffer.SampleDesc.Count = 1;
+            buffer.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x1);  // the console's row-major word, = PC ROW_MAJOR
+            const GUID resource_iid = __uuidof(ID3D12Resource);
+            void* const va = reinterpret_cast<void*>(0x7f0000000000ull);
+            const auto call = [&](const D3D12_RESOURCE_DESC* desc, std::uint64_t state, const void* clear,
+                                  void** placed) {
+                return hr_of(raw(device, 133, word(va), word(desc), state, word(clear), word(&resource_iid),
+                                 word(placed)));
+            };
+
+            // Forwarded unchanged: each implemented flag set, and both state words (the proxy does not judge it).
+            const std::uint32_t accepted_flags[] = {0x0, 0x4, 0x8, 0xC};
+            for (const std::uint32_t flags : accepted_flags) {
+                for (const std::uint64_t state : {std::uint64_t{0}, std::uint64_t{0xFFFFFFFFull}}) {
+                    D3D12_RESOURCE_DESC desc = buffer;
+                    desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(flags);
+                    void* placed = nullptr;
+                    const int before = handler_calls;
+                    EXPECT(call(&desc, state, nullptr, &placed) == S_OK && placed == reinterpret_cast<void*>(0x1330));
+                    EXPECT(handler_calls == before + 1);
+                    EXPECT(std::memcmp(&seen_desc, &desc, sizeof(desc)) == 0);
+                    EXPECT(seen_real == xs::device_proxy_real_device(device) && seen_va == va &&
+                           seen_state == static_cast<std::uint32_t>(state));
+                    EXPECT(std::memcmp(&seen_iid, &resource_iid, sizeof(GUID)) == 0);
+                }
+            }
+
+            // Refused by the proxy: unknown flag bits (the console's 0x20000 alone and with UAV, PC bits this path
+            // does not implement), a non-row-major layout word, a texture, a clear value, null pointers.
+            const auto refused = [&](const D3D12_RESOURCE_DESC* desc, const void* clear, HRESULT want) {
+                void* placed = reinterpret_cast<void*>(1);
+                const int before = handler_calls;
+                const HRESULT hr = call(desc, 0, clear, &placed);
+                return hr == want && !placed && handler_calls == before;
+            };
+            for (const std::uint32_t flags : {0x20000u, 0x20004u, 0x20204u, 0x200u, 0x1u, 0x2u, 0x10u, 0x20u, 0x100u,
+                                              0x400u, 0x80000000u}) {
+                D3D12_RESOURCE_DESC desc = buffer;
+                desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(flags);
+                EXPECT(refused(&desc, nullptr, E_NOTIMPL));
+            }
+            for (const std::uint32_t layout : {0x0u, 0x2u, 0x3u, 0x101u, 0xFFFFFFFFu}) {
+                D3D12_RESOURCE_DESC desc = buffer;
+                desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(layout);
+                EXPECT(refused(&desc, nullptr, E_NOTIMPL));
+            }
+            D3D12_RESOURCE_DESC texture = buffer;
+            texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            texture.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);  // the Xbox tiled word
+            EXPECT(refused(&texture, nullptr, E_NOTIMPL));
+            const D3D12_CLEAR_VALUE clear_value{};
+            EXPECT(refused(&buffer, &clear_value, E_INVALIDARG));
+            EXPECT(refused(nullptr, nullptr, E_POINTER));
+            {
+                const int before = handler_calls;
+                void* placed = reinterpret_cast<void*>(1);
+                EXPECT(hr_of(raw(device, 133, word(va), word(&buffer), 0, 0, 0, word(&placed))) == E_POINTER &&
+                       !placed && handler_calls == before);  // null riid
+                EXPECT(hr_of(raw(device, 133, word(va), word(&buffer), 0, 0, word(&resource_iid), 0)) == E_POINTER &&
+                       handler_calls == before);  // null output
+            }
+
+            // The handler's failure comes back as it is, with the output null even if the handler wrote it.
+            handler_result = E_NOTIMPL;
+            {
+                void* placed = reinterpret_cast<void*>(1);
+                EXPECT(call(&buffer, 0xFFFFFFFFull, nullptr, &placed) == E_NOTIMPL && !placed);
+            }
+            handler_result = S_OK;
+            xs::set_placed_at_va_handler(nullptr);
+        }
+
         Mock* const queue_mock = reinterpret_cast<Mock*>(real_queue);
         Mock* const fence_mock = reinterpret_cast<Mock*>(real_fence);
         EXPECT(release(queue) == 0 && release(fence) == 0);

@@ -15,6 +15,7 @@
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
 #include "dxgi_com.h"
+#include "host_pins.h"
 #include "../src/arena_size.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/depth24_fragment.h"
@@ -46,6 +47,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <cstring>
 #include <memory>
@@ -637,6 +639,188 @@ struct DeviceState {
     PFN_vkCopyMemoryToImageEXT copy_memory_to_image = nullptr;
     PFN_vkCopyImageToMemoryEXT copy_image_to_memory = nullptr;
     PFN_vkTransitionImageLayoutEXT transition_image_layout = nullptr;
+
+    // VK_EXT_external_memory_host (Xbox slot 133); null unless info.host_pointer_alignment is set and it loaded. Slot 133
+    // also needs the two Vulkan 1.1 queries below (core, or their KHR names): the external-buffer capability of the exact
+    // buffer it creates, and that buffer's dedicated-allocation requirement. With any of the three missing it is
+    // E_NOTIMPL.
+    PFN_vkGetMemoryHostPointerPropertiesEXT get_host_pointer_properties = nullptr;
+    PFN_vkGetPhysicalDeviceExternalBufferProperties external_buffer_properties = nullptr;
+    PFN_vkGetBufferMemoryRequirements2 buffer_requirements2 = nullptr;
+
+    // Slot-133 imports of the title's pages (create_buffer_at_host_address). One VkDeviceMemory per pinned range,
+    // shared by every resource whose own range it contains; counted by hand under host_import_mutex so an import is
+    // never looked up while it is being freed. begin -> import.
+    struct HostImport {
+        std::uintptr_t end = 0;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        std::uint32_t memory_type = 0;
+        VkMemoryPropertyFlags flags = 0;
+        std::uint32_t refs = 0;
+    };
+    std::mutex host_import_mutex;
+    std::map<std::uintptr_t, HostImport> host_imports;
+
+    // The pages [begin, end) for an import: committed PAGE_READWRITE throughout. E_INVALIDARG for a page that is
+    // free, reserved, guarded, or not read-write (the GPU writes these buffers too), E_NOTIMPL for a write-combined or
+    // uncached page (an upstream RTX 5090 report: such an import read wrong bytes on the GPU).
+    static HRESULT check_host_pages(std::uintptr_t begin, std::uintptr_t end) {
+        for (std::uintptr_t at = begin; at < end;) {
+            MEMORY_BASIC_INFORMATION region{};
+            if (!VirtualQuery(reinterpret_cast<const void*>(at), &region, sizeof(region))) {
+                log_once("slot 133: VirtualQuery failed inside the range; error", int(GetLastError()));
+                return E_INVALIDARG;
+            }
+            if (region.State != MEM_COMMIT) {
+                log_once("slot 133: a page of the range is not committed; state", int(region.State));
+                return E_INVALIDARG;
+            }
+            if (region.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE)) {
+                log_once("slot 133: write-combined or uncached pages are not imported; protection", int(region.Protect));
+                return E_NOTIMPL;
+            }
+            if ((region.Protect & PAGE_GUARD) || (region.Protect & 0xff) != PAGE_READWRITE) {
+                log_once("slot 133: a page of the range is not plain read-write; protection", int(region.Protect));
+                return E_INVALIDARG;
+            }
+            const auto region_end = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
+            if (region_end <= at) return E_INVALIDARG;
+            at = region_end;
+        }
+        return S_OK;
+    }
+
+    // A share of the import holding [begin, end), made if none does. `buffer_types` is the buffer's memoryTypeBits.
+    // On success `import_begin` names the import for release_host_import and `memory` is its VkDeviceMemory.
+    HRESULT acquire_host_import(std::uintptr_t begin, std::uintptr_t end, std::uint32_t buffer_types, bool need_bda,
+                                std::uintptr_t& import_begin, std::uintptr_t& import_end, VkDeviceMemory& out_memory,
+                                VkMemoryPropertyFlags& out_flags) {
+        std::lock_guard lock(host_import_mutex);
+        // An import that overlaps the range: shared when it holds all of it, refused otherwise.
+        auto it = host_imports.upper_bound(begin);
+        if (it != host_imports.begin()) --it;
+        for (; it != host_imports.end() && it->first < end; ++it) {
+            if (it->second.end <= begin) continue;
+            if (it->first <= begin && end <= it->second.end) {
+                if (!(buffer_types & (1u << it->second.memory_type))) {
+                    log_once("slot 133: an existing import of the range has a memory type the buffer cannot use; type",
+                             int(it->second.memory_type));
+                    return E_NOTIMPL;
+                }
+                ++it->second.refs;
+                import_begin = it->first;
+                import_end = it->second.end;
+                out_memory = it->second.memory;
+                out_flags = it->second.flags;
+                return S_OK;
+            }
+            log_once("slot 133: the range partly overlaps another import of this device; refused", 0);
+            return E_NOTIMPL;
+        }
+
+        // Pinned before the pages are checked, so they cannot be unmapped, freed, reprotected or replaced in between.
+        // The provider grants a pin only for a range the title shims own end to end (host_pins.h).
+        switch (rt::host_pins::pin(begin, end)) {
+            case rt::host_pins::PinResult::pinned: break;
+            case rt::host_pins::PinResult::invalid: return E_INVALIDARG;
+            case rt::host_pins::PinResult::overlaps:
+                log_once("slot 133: the range overlaps pages another device's import holds; refused", 0);
+                return E_NOTIMPL;
+            case rt::host_pins::PinResult::aliases:
+                log_once("slot 133: the range's physical pages already back another import at another address; refused",
+                         0);
+                return E_NOTIMPL;
+            case rt::host_pins::PinResult::unmanaged:
+                log_once("slot 133: the range is not wholly inside one title VirtualAlloc/XMemVirtualAlloc allocation, "
+                         "xmem-mapped pages or a live XMemAlloc block, so its lifetime cannot be held; refused", 0);
+                return E_NOTIMPL;
+            case rt::host_pins::PinResult::no_provider:
+                log_once("slot 133: no host-page lifetime provider (the xmem shim) is linked; refused", 0);
+                return E_NOTIMPL;
+            case rt::host_pins::PinResult::out_of_memory: return E_OUTOFMEMORY;
+            default: return E_NOTIMPL;
+        }
+        // The registry entry is made before any Vulkan memory, so recording it cannot fail with memory to free.
+        std::map<std::uintptr_t, HostImport>::iterator slot;
+        try {
+            slot = host_imports.try_emplace(begin).first;
+        } catch (const std::bad_alloc&) {
+            rt::host_pins::unpin(begin, end);
+            return E_OUTOFMEMORY;
+        }
+        const auto fail = [&](HRESULT hr) {
+            host_imports.erase(slot);
+            rt::host_pins::unpin(begin, end);
+            return hr;
+        };
+        if (const HRESULT pages = check_host_pages(begin, end); FAILED(pages)) return fail(pages);
+
+        auto* const base = reinterpret_cast<void*>(begin);
+        VkMemoryHostPointerPropertiesEXT host{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+        const VkResult properties = get_host_pointer_properties(
+            info.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, base, &host);
+        if (properties != VK_SUCCESS) {
+            log_once("slot 133: vkGetMemoryHostPointerPropertiesEXT refused the range; VkResult", int(properties));
+            return fail(E_NOTIMPL);
+        }
+        // Only a HOST_VISIBLE | HOST_COHERENT type: the title keeps reading and writing these pages with no flush or
+        // invalidate, and a non-host-visible import neither keeps the contents nor allows host access (Vulkan spec).
+        constexpr VkMemoryPropertyFlags coherent = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
+        import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        import.pHostPointer = base;
+        VkMemoryAllocateFlagsInfo address_flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &import};
+        address_flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        VkResult last = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        bool any_type = false;
+        for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+            const VkMemoryPropertyFlags type_flags = memory.memoryTypes[i].propertyFlags;
+            if (!(host.memoryTypeBits & buffer_types & (1u << i)) || (type_flags & coherent) != coherent) continue;
+            any_type = true;
+            VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                          need_bda ? static_cast<const void*>(&address_flags) : &import};
+            allocate.allocationSize = end - begin;
+            allocate.memoryTypeIndex = i;
+            VkDeviceMemory made = VK_NULL_HANDLE;
+            last = context->vk.vkAllocateMemory(info.device, &allocate, nullptr, &made);
+            if (last != VK_SUCCESS) continue;
+            slot->second = HostImport{end, made, i, type_flags, 1};
+            import_begin = begin;
+            import_end = end;
+            out_memory = made;
+            out_flags = type_flags;
+            return S_OK;
+        }
+        if (!any_type) {
+            log_once("slot 133: no HOST_VISIBLE | HOST_COHERENT memory type imports the range for a buffer; host types",
+                     int(host.memoryTypeBits));
+            return fail(E_NOTIMPL);
+        }
+        log_once("slot 133: importing the host range failed; VkResult", int(last));
+        return fail(last == VK_ERROR_OUT_OF_HOST_MEMORY || last == VK_ERROR_OUT_OF_DEVICE_MEMORY ? E_OUTOFMEMORY
+                                                                                                 : E_NOTIMPL);
+    }
+
+    // Drops one share. The last one frees the memory and unpins the pages; the caller has already waited for the GPU
+    // work that may use them (Resource::~Resource).
+    void release_host_import(std::uintptr_t import_begin) {
+        std::uintptr_t end = 0;
+        {
+            std::lock_guard lock(host_import_mutex);
+            const auto it = host_imports.find(import_begin);
+            if (it == host_imports.end() || !it->second.refs) return;
+            if (--it->second.refs) return;
+            context->vk.vkFreeMemory(info.device, it->second.memory, nullptr);
+            end = it->second.end;
+            host_imports.erase(it);
+        }
+        rt::host_pins::unpin(import_begin, end);  // after the free: the pages stay valid for the memory's lifetime
+    }
+
+    std::size_t host_import_count() {
+        std::lock_guard lock(host_import_mutex);
+        return host_imports.size();
+    }
 
     // WriteToSubresource/ReadFromSubresource without host image copy: one staging copy at a time, submitted to
     // the device's VkQueue and waited for. Created on first use.
@@ -1724,6 +1908,7 @@ public:
         }
         if (image_address_) device_.forget_image(image_address_);
         device_.context->remove_resource(id());
+        if (host_import_) release_host_buffer();
         if (in_arena_) device_.arena_release(arena_offset_, desc_.Width, DeviceState::arena_buffer);
         if (image_ && !sparse_image_)
             device_.context->defer_destroy(palmwave::DeferredDeletionQueue::Kind::image, image_);
@@ -1983,6 +2168,144 @@ public:
                                   heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
         device_.context->add_resource(id(), binding);
         return S_OK;
+    }
+
+    // Xbox device slot 133 (create_buffer_at_host_address): a buffer bound to an import of the caller's own pages at
+    // `address`, so the CPU's writes there are the GPU's reads and the GPU's writes land there, with no copy. Adapted
+    // from upstream #7218's create_host_buffer (tibzejoker, a3eae955dcec4fb65864ca6c10b4ca3f2999c2d3, GPL-3.0), made
+    // strict: coherent host memory only, the range validated while pinned, shared imports, no fallback.
+    //
+    // Its console VA is `address`, the VA the title chose, so copies, vertex/index views and root arguments the title
+    // names by that VA find this buffer (VulkanContext::buffer_at). A shader that adds heap_base to a VA it read from a
+    // V# does not reach it: that needs the single address space of docs/d3d12_vulkan.md section 3.3, not decided here.
+    // The pages stay the caller's: nothing is zeroed.
+    HRESULT create_host_buffer(void* address) {
+        auto& vk = device_.context->vk;
+        const VkDeviceSize alignment = device_.info.host_pointer_alignment;
+        if (!device_.get_host_pointer_properties || !device_.external_buffer_properties ||
+            !device_.buffer_requirements2 || !alignment || (alignment & (alignment - 1)))
+            return E_NOTIMPL;
+        const auto start = reinterpret_cast<std::uintptr_t>(address);
+        constexpr std::uintptr_t most = (std::numeric_limits<std::uintptr_t>::max)();
+        if (!address || !desc_.Width || desc_.Width > most - start || start + desc_.Width > most - (alignment - 1))
+            return E_INVALIDARG;
+        if (desc_.SampleDesc.Count != 1 || desc_.SampleDesc.Quality != 0) return E_INVALIDARG;
+        // The import starts at the aligned page that holds `address`; the buffer is bound at the offset inside it.
+        const std::uintptr_t begin = start & ~std::uintptr_t(alignment - 1);
+        const std::uintptr_t end = (start + desc_.Width + alignment - 1) & ~std::uintptr_t(alignment - 1);
+        // These VAs share the context's VA index with arena ranges, whose VAs are offsets in [0, arena size).
+        if (device_.arena.size && start < device_.arena.size) {
+            log_once("slot 133: the title VA falls inside the arena's console VA range; refused, VA in KiB",
+                     int(start / 1024));
+            return E_NOTIMPL;
+        }
+        const bool need_bda = device_.info.buffer_device_address || device_.arena.buffer != VK_NULL_HANDLE;
+        VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+        external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
+        info.size = desc_.Width;
+        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                     VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+        if (device_.info.conditional_rendering) info.usage |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
+        if (need_bda) info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        device_.share(info);
+        // The device must report that a buffer with exactly these flags and usage can import host allocations
+        // (VUID-VkImportMemoryHostPointerInfoEXT-handleType-01747 requires the support VkExternalMemoryProperties
+        // reports). The usage is never reduced to make this pass: the buffer is what the title's VA may be used as.
+        {
+            VkPhysicalDeviceExternalBufferInfo query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO};
+            query.flags = info.flags;
+            query.usage = info.usage;
+            query.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+            VkExternalBufferProperties answer{VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES};
+            device_.external_buffer_properties(device_.info.physical, &query, &answer);
+            const VkExternalMemoryProperties& support = answer.externalMemoryProperties;
+            if (!(support.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) ||
+                !(support.compatibleHandleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT)) {
+                log_once("slot 133: the device does not report host-allocation import for this buffer usage; usage",
+                         int(info.usage));
+                return E_NOTIMPL;
+            }
+            if (support.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT) {
+                log_once("slot 133: host-allocation import is dedicated-only for this buffer usage (not implemented); "
+                         "usage", int(info.usage));
+                return E_NOTIMPL;
+            }
+        }
+        if (vk.vkCreateBuffer(device_.info.device, &info, nullptr, &buffer_) != VK_SUCCESS) {
+            buffer_ = VK_NULL_HANDLE;
+            return E_OUTOFMEMORY;
+        }
+        VkMemoryDedicatedRequirements dedicated{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS};
+        VkMemoryRequirements2 requirements2{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, &dedicated};
+        VkBufferMemoryRequirementsInfo2 which{VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2};
+        which.buffer = buffer_;
+        device_.buffer_requirements2(device_.info.device, &which, &requirements2);
+        if (dedicated.requiresDedicatedAllocation) {
+            log_once("slot 133: the buffer requires a dedicated allocation (not implemented for host imports)", 0);
+            return E_NOTIMPL;  // the destructor destroys the buffer; nothing is pinned yet
+        }
+        const VkMemoryRequirements& requirements = requirements2.memoryRequirements;
+        std::uintptr_t import_begin = 0, import_end = 0;
+        VkDeviceMemory imported = VK_NULL_HANDLE;
+        if (const HRESULT hr = device_.acquire_host_import(begin, end, requirements.memoryTypeBits, need_bda,
+                                                           import_begin, import_end, imported, memory_flags_);
+            FAILED(hr))
+            return hr;
+        // From here the destructor releases the share (and waits for the GPU first).
+        host_import_ = true;
+        host_import_begin_ = import_begin;
+        const VkDeviceSize offset = start - import_begin;
+        if (requirements.alignment && offset % requirements.alignment) {
+            log_once("slot 133: the VA is off the buffer's binding alignment inside the import; alignment",
+                     int(requirements.alignment));
+            return E_NOTIMPL;
+        }
+        if (requirements.size > import_end - import_begin - offset) {
+            log_once("slot 133: the driver's buffer size does not fit the imported pages; size in KiB",
+                     int(requirements.size / 1024));
+            return E_NOTIMPL;
+        }
+        if (vk.vkBindBufferMemory(device_.info.device, buffer_, imported, offset) != VK_SUCCESS) return E_OUTOFMEMORY;
+        mapped_ = address;
+        va_ = start;
+        if (need_bda && vk.vkGetBufferDeviceAddress) {
+            VkBufferDeviceAddressInfo bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+            bda.buffer = buffer_;
+            buffer_va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &bda);
+            gpu_va_ = buffer_va_;
+        }
+        device_.log_va("title-placed buffer", va_, desc_.Width);
+        palmwave::ResourceBinding binding{};
+        binding.buffer = buffer_;
+        binding.size = desc_.Width;
+        binding.host = static_cast<const std::uint8_t*>(address);  // the CPU writes it
+        binding.host_readable = true;  // the CPU reads what the GPU wrote: a host-read barrier after GPU writes
+        binding.va = va_;
+        device_.context->add_resource(id(), binding);
+        return S_OK;
+    }
+
+    // The import's pages must stay valid while the GPU may still use them: wait for everything submitted so far, then
+    // destroy the buffer and drop the share (the last share frees the memory and unpins the pages). If the wait cannot
+    // be confirmed on a live device, the buffer and the share are kept for the process's life, so the pages stay
+    // pinned rather than being pulled from under the GPU.
+    void release_host_buffer() {
+        auto& context = *device_.context;
+        const std::uint64_t ticket = context.submitted_retire_ticket();
+        const bool retired = context.wait_retire_ticket(ticket) >= ticket || context.is_device_lost();
+        if (!retired) {
+            log_once("slot 133: GPU work on a released title-placed buffer did not retire; its pages stay pinned", 0);
+            buffer_ = VK_NULL_HANDLE;
+            host_import_ = false;
+            return;
+        }
+        if (buffer_) context.vk.vkDestroyBuffer(device_.info.device, buffer_, nullptr);
+        buffer_ = VK_NULL_HANDLE;
+        device_.release_host_import(host_import_begin_);
+        host_import_ = false;
     }
 
     HRESULT create_texture(const Format& format, const std::vector<VkFormat>& castable = {}) {
@@ -2415,6 +2738,10 @@ private:
     VkImageAspectFlags aspects_ = 0;
     std::uint64_t buffer_va_ = 0;
     std::uint64_t gpu_va_ = 0;
+    // A slot-133 buffer: bound to a share of DeviceState::host_imports[host_import_begin_], released in the
+    // destructor after the GPU work submitted before it has retired (release_host_buffer). memory_ stays null.
+    bool host_import_ = false;
+    std::uintptr_t host_import_begin_ = 0;
     bool reserved_ = false;
     bool sparse_image_ = false;
     bool placed_ = false;
@@ -4749,6 +5076,10 @@ public:
     static constexpr GUID kTag{0xc58e1d27, 0x3a96, 0x4b4f, {0x9e, 0x72, 0x6d, 0x0a, 0x8b, 0x5f, 0x3c, 0x61}};
 
     explicit Device(const VulkanDeviceInfo& info) {
+        // Every Vulkan device serves Xbox device slot 133, whichever entry made it (create_vulkan_device and the
+        // standalone device palmwave --run uses both come through here; upstream #7218). The handler refuses a device
+        // that is not this layer's.
+        rt::d3d12_xs::set_placed_at_va_handler(&create_buffer_at_host_address);
         state_.info = info;
         queue_users_.resize(info.command_queues.size(), 0);
         compute_users_.resize(info.compute_queues.size(), 0);
@@ -4877,6 +5208,25 @@ public:
             }
         }
         if (info.host_image_copy) load_host_image_copy(get_device);
+        if (info.host_pointer_alignment) {
+            state_.get_host_pointer_properties = reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(
+                get_device(info.device, "vkGetMemoryHostPointerPropertiesEXT"));
+            if (!state_.get_host_pointer_properties)
+                std::fprintf(stderr, "[rt] d3d12: VK_EXT_external_memory_host was announced but "
+                                     "vkGetMemoryHostPointerPropertiesEXT did not load; slot 133 is E_NOTIMPL\n");
+            for (const char* name : {"vkGetPhysicalDeviceExternalBufferProperties",
+                                     "vkGetPhysicalDeviceExternalBufferPropertiesKHR"})
+                if (!state_.external_buffer_properties)
+                    state_.external_buffer_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceExternalBufferProperties>(
+                        info.get_instance_proc(info.instance, name));
+            for (const char* name : {"vkGetBufferMemoryRequirements2", "vkGetBufferMemoryRequirements2KHR"})
+                if (!state_.buffer_requirements2)
+                    state_.buffer_requirements2 =
+                        reinterpret_cast<PFN_vkGetBufferMemoryRequirements2>(get_device(info.device, name));
+            if (!state_.external_buffer_properties || !state_.buffer_requirements2)
+                std::fprintf(stderr, "[rt] d3d12: vkGetPhysicalDeviceExternalBufferProperties or "
+                                     "vkGetBufferMemoryRequirements2 did not load; slot 133 is E_NOTIMPL\n");
+        }
         // Depth <-> colour copies are staged through scratch buffers (vulkan_scratch.h), on every GPU.
         state_.context->enable_copy_scratch(get_device, [this](const VkMemoryRequirements& requirements) {
             return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -6711,6 +7061,83 @@ public:
         return d3d12_trace::result(method, E_NOTIMPL);
     }
 
+    // Xbox device slot 133 (create_buffer_at_host_address). A buffer only: a texture placed on the title's pages is
+    // refused with a null output, never replaced by a committed texture the title's writes would not reach. The
+    // resource reports a CUSTOM / WRITE_BACK / L0 heap, as the pages are the CPU's ordinary cached memory.
+    //
+    // The description must be a plain buffer, checked here rather than assumed from the caller: nonzero Width, Height,
+    // DepthOrArraySize and MipLevels 1, Format UNKNOWN, one sample at quality 0, ROW_MAJOR, Alignment 0 or 64 KiB (the
+    // PC runtime's buffer rules, as committed_resource_refusal applies them), and only the flags this path implements:
+    // none, ALLOW_UNORDERED_ACCESS (the buffer always has storage usage) and DENY_SHADER_RESOURCE (a restriction the
+    // view code honours). Anything else is E_INVALIDARG for a malformed buffer, E_NOTIMPL for an unimplemented flag.
+    //
+    // `initial_state` is the call's third word. Retail measured 0xFFFFFFFF there (retail_boot_chain.md section 3.4), but
+    // what that word means on the console is not established: as a legacy D3D12_RESOURCE_STATES it is invalid, as a
+    // D3D12_BARRIER_LAYOUT it would be UNDEFINED, and no source settles which. Buffers have no layout in this layer
+    // (their barriers are global memory barriers), so only kHostBufferInitialState, D3D12_RESOURCE_STATE_COMMON (0), is
+    // accepted; every other value, the retail 0xFFFFFFFF included, is E_NOTIMPL until its meaning is measured.
+    static constexpr std::uint32_t kHostBufferInitialState = D3D12_RESOURCE_STATE_COMMON;
+
+    HRESULT create_at_host_address(void* address, const D3D12_RESOURCE_DESC& desc, std::uint32_t initial_state,
+                                   REFIID riid, void** out) {
+        constexpr auto method = "Xbox CreatePlacedResourceX (device slot 133)";
+        *out = nullptr;
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+            log_once("slot 133: a texture on the title's pages is not supported (no resource is made); dimension",
+                     int(desc.Dimension));
+            return d3d12_trace::result(method, E_NOTIMPL);
+        }
+        if (!desc.Width || desc.Height != 1 || desc.DepthOrArraySize != 1 || desc.MipLevels != 1 ||
+            desc.Format != DXGI_FORMAT_UNKNOWN || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality != 0 ||
+            desc.Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR ||
+            (desc.Alignment && desc.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)) {
+            log_once("slot 133: not a plain row-major buffer description (no resource is made)", 0);
+            return d3d12_trace::result(method, E_INVALIDARG);
+        }
+        constexpr UINT kHostBufferFlags =
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+        if (UINT(desc.Flags) & ~kHostBufferFlags) {
+            log_once("slot 133: resource flags this path does not implement (no resource is made); flags",
+                     int(desc.Flags));
+            return d3d12_trace::result(method, E_NOTIMPL);
+        }
+        if (initial_state != kHostBufferInitialState) {
+            log_once("slot 133: an initial-state word other than COMMON (0) is not interpreted (no resource is made); "
+                     "word", int(initial_state));
+            return d3d12_trace::result(method, E_NOTIMPL);
+        }
+        if (!state_.get_host_pointer_properties) {
+            log_once("slot 133: no VK_EXT_external_memory_host on this device (no resource is made)", 0);
+            return d3d12_trace::result(method, E_NOTIMPL);
+        }
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_CUSTOM;
+        heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+        heap.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+        // No exception leaves this COM entry: an allocation failure is E_OUTOFMEMORY, and a half-made resource is
+        // released through its destructor (which drops any share it took, after the GPU retires).
+        Resource* resource = nullptr;
+        try {
+            resource = new Resource(state_, desc, heap, D3D12_HEAP_FLAG_NONE);
+        } catch (const std::bad_alloc&) {
+            return d3d12_trace::result(method, E_OUTOFMEMORY);
+        }
+        resource->attach_device(identity());
+        HRESULT hr = E_OUTOFMEMORY;
+        try {
+            hr = resource->create_host_buffer(address);
+        } catch (const std::bad_alloc&) {
+            hr = E_OUTOFMEMORY;
+        }
+        if (FAILED(hr)) {
+            resource->Release();  // waits for nothing it submitted, frees what it made, unpins
+            return d3d12_trace::result(method, hr);
+        }
+        return d3d12_trace::result(method, hand_out(resource, riid, out));
+    }
+
+    std::size_t host_import_count() { return state_.host_import_count(); }
+
     HRESULT STDMETHODCALLTYPE OpenExistingHeapFromFileMapping(HANDLE file_mapping, REFIID, void** out) override {
         constexpr auto method = "ID3D12Device3::OpenExistingHeapFromFileMapping";
         if (out) *out = nullptr;
@@ -8373,6 +8800,23 @@ VkAccelerationStructureKHR vulkan_acceleration_structure(ID3D12Device* device, D
     return VK_NULL_HANDLE;
 }
 
+HRESULT create_buffer_at_host_address(ID3D12Device* device, void* address, const D3D12_RESOURCE_DESC& desc,
+                                      std::uint32_t initial_state, REFIID riid, void** out) {
+    if (out) *out = nullptr;
+    if (!device || !out) return E_POINTER;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    auto* d = Device::from<Device>(real ? real : device);
+    if (!d) return E_NOTIMPL;  // a PC runtime device behind the proxy: it cannot place on the title's pages
+    return d->create_at_host_address(address, desc, initial_state, riid, out);
+}
+
+std::size_t host_import_count(ID3D12Device* device) {
+    if (!device) return 0;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    auto* d = Device::from<Device>(real ? real : device);
+    return d ? d->host_import_count() : 0;
+}
+
 bool color_resolve_format_is_integer(DXGI_FORMAT format) {
     return DeviceState::numeric_class(vulkan_format(format, false).format) != 0;
 }
@@ -9329,6 +9773,23 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                      "[rt] d3d12: no VK_EXT_custom_border_color; custom sampler border colours fall back to transparent black\n");
     }
 
+    // Optional: VK_EXT_external_memory_host lets Xbox device slot 133 import the title's own pages as a buffer's
+    // memory (create_buffer_at_host_address). Without it, or with an alignment that is not a power of two, slot 133
+    // fails with E_NOTIMPL. Having the extension is not a successful import: every import is checked when it is made.
+    if (std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+            return std::strcmp(e.extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) == 0;
+        })) {
+        VkPhysicalDeviceExternalMemoryHostPropertiesEXT host_memory{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &host_memory};
+        vkGetPhysicalDeviceProperties2(info.physical, &properties);
+        const VkDeviceSize alignment = host_memory.minImportedHostPointerAlignment;
+        if (alignment && !(alignment & (alignment - 1))) info.host_pointer_alignment = alignment;
+    }
+    std::fprintf(stderr, "[rt] d3d12: VK_EXT_external_memory_host %s (minImportedHostPointerAlignment %llu)\n",
+                 info.host_pointer_alignment ? "enabled for slot 133" : "unavailable: slot 133 is E_NOTIMPL",
+                 static_cast<unsigned long long>(info.host_pointer_alignment));
+
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
     device_info.queueCreateInfoCount = std::uint32_t(queue_infos.size());
     device_info.pQueueCreateInfos = queue_infos.data();
@@ -9364,6 +9825,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     info.presentation = has_swapchain && instance_has_surface;
     info.swapchain_colorspace = info.presentation && swapchain_colorspace_enabled;
     if (info.custom_border_color) device_extensions.push_back(custom_border_name);
+    if (info.host_pointer_alignment) device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)

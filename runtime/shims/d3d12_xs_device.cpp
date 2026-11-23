@@ -6,7 +6,7 @@
 // arguments only, so the x64 registers and stack words line up exactly; methods that return a struct keep their
 // hidden return pointer in RDX, which is passed through as the first argument unchanged. The measured exceptions
 // are IUnknown (0-2), slot 14 (which wraps the heap), 26 (the title passes the return buffer in RCX and the device in
-// RDX), 62 and 76, plus the heap proxy's 9/10 conversion from the PC hidden-pointer form to the Xbox RAX form. Slots
+// RDX), 62, 76 and 133 (CreatePlacedResourceX, handed to the device's registered handler), plus the heap proxy's 9/10 conversion from the PC hidden-pointer form to the Xbox RAX form. Slots
 // 8/75 (command queues), 36 (fences) and 32 (a shared fence) wrap what they create in queue and fence proxies built
 // the same way, and slots 31/34/35/45/46/50 hand the real objects behind heap, queue and fence proxies to the real
 // device (see the command queue and fence section).
@@ -157,10 +157,10 @@ const char* slot_name(unsigned slot) {
         case 73: return "Xbox CreateCommandListX -> console list proxy";
         case 75: return "CreateCommandQueue1 -> queue proxy";
         case 76: return "Xbox resource creation";
-        case 133: return "Xbox CreatePlacedResourceX (host-page placement unsupported)";
         case 78: return "Xbox SetFrameIntervalX";
         case 79: return "Xbox ScheduleFrameEventX";
         case 80: return "Xbox WaitFrameEventX";
+        case 133: return "Xbox CreatePlacedResourceX (a buffer on the title's own pages)";
         default: return "forwarded";
     }
 }
@@ -1793,8 +1793,8 @@ HRESULT proxy_refuse_placed_resource_x(std::uint64_t va, std::uint64_t desc, std
     static std::atomic<bool> warned{false};
     if (!warned.exchange(true, std::memory_order_relaxed) || trace_enabled())
         std::fprintf(stderr,
-                     "[rt] d3d12_xs: device slot 133 CreatePlacedResourceX refused: host-page placement is not "
-                     "implemented; console flags/state are not translated (va=%p desc=%p state=0x%08x clear=%p)\n",
+                     "[rt] d3d12_xs: device slot 133 CreatePlacedResourceX refused: a host-page placement handler is not "
+                     "available on this device; console flags/state are not translated (va=%p desc=%p state=0x%08x clear=%p)\n",
                      reinterpret_cast<void*>(va), reinterpret_cast<void*>(desc), static_cast<unsigned>(state),
                      reinterpret_cast<void*>(clear));
     return d3d12_trace::result("Xbox CreatePlacedResourceX (device slot 133)", E_NOTIMPL);
@@ -2211,6 +2211,68 @@ D3D12_HEAP_PROPERTIES* proxy_get_custom_heap_properties(D3D12_HEAP_PROPERTIES* o
     return out;
 }
 
+// Device slot 133 is the console's CreatePlacedResourceX: (va, desc, state, clear, riid, out), measured on the retail
+// executable (docs/retail_boot_chain.md section 3.4: riid IID_ID3D12Resource, the third word 0xFFFFFFFF, whose meaning
+// is not established). `va` is the start of memory the title has just mapped and `desc` a 56-byte description. The
+// proxy does not make the resource: the device behind it does, through the handler it registered
+// (set_placed_at_va_handler). Without one the slot refuses like any slot past the PC vtable. The route follows Palmwave
+// #7218 (tibzejoker, a3eae955dcec4fb65864ca6c10b4ca3f2999c2d3, GPL-3.0); its flag mask and layout rewrite are not kept.
+// Every word keeps its thunk position (see "A thunk declares 14 argument words" at the top).
+//
+// Only semantics this path implements are passed, unchanged (d3d12_xs_device.h): a buffer, layout word 0x1 (ROW_MAJOR,
+// the same value in the console's row-major word and the PC enum), flags among ALLOW_UNORDERED_ACCESS and
+// DENY_SHADER_RESOURCE, no clear value. Nothing is masked or rewritten: a console bit whose meaning is not established
+// (0x20000 included) is refused, not stripped. Every refusal leaves *out null and never reaches the handler.
+std::atomic<PlacedAtVaHandler> g_placed_at_va{nullptr};
+
+HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_RESOURCE_DESC* xbox_desc,
+                                       std::uint32_t initial_state, const void* clear, const IID* riid, void** out) {
+    const PlacedAtVaHandler handler = g_placed_at_va.load(std::memory_order_acquire);
+    if (!handler)
+        return proxy_refuse_placed_resource_x(reinterpret_cast<std::uint64_t>(va),
+                                             reinterpret_cast<std::uint64_t>(xbox_desc), initial_state,
+                                             reinterpret_cast<std::uint64_t>(clear), out);
+    note_slot(133);
+    if (out) *out = nullptr;
+    if (!out || !xbox_desc || !riid)
+        return d3d12_trace::result("Xbox CreatePlacedResourceX (device slot 133)", E_POINTER);
+    const D3D12_RESOURCE_DESC desc = *xbox_desc;
+    const auto flags = static_cast<std::uint32_t>(desc.Flags);
+    const auto layout_word = static_cast<std::uint32_t>(desc.Layout);
+    constexpr std::uint32_t kBufferFlags =
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+    const char* refusal = nullptr;
+    HRESULT hr = S_OK;
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+        refusal = "not a buffer";
+        hr = E_NOTIMPL;
+    } else if (layout_word != static_cast<std::uint32_t>(D3D12_TEXTURE_LAYOUT_ROW_MAJOR)) {
+        refusal = "layout word is not row-major (0x1)";
+        hr = E_NOTIMPL;
+    } else if (flags & ~kBufferFlags) {
+        refusal = "flag bits outside ALLOW_UNORDERED_ACCESS | DENY_SHADER_RESOURCE";
+        hr = E_NOTIMPL;
+    } else if (clear) {
+        refusal = "a clear value on a buffer";
+        hr = E_INVALIDARG;
+    } else {
+        hr = handler(self->real, va, desc, initial_state, *riid, out);
+    }
+    // Every failure is logged (not only the first call): a refused placement leaves the title without its resource,
+    // and the reason is the proxy's refusal or the device's [rt] line just before this one.
+    static std::atomic<bool> logged{false};
+    if (FAILED(hr) || !logged.exchange(true, std::memory_order_relaxed) || trace_enabled())
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 133 CreatePlacedResourceX: va=%p dimension=%d width=%llu flags=0x%x "
+                     "layout word=0x%x state word=0x%x clear=%p -> 0x%08lx%s%s\n",
+                     va, static_cast<int>(desc.Dimension), static_cast<unsigned long long>(desc.Width), flags,
+                     layout_word, initial_state, clear, static_cast<unsigned long>(hr), refusal ? " refused: " : "",
+                     refusal ? refusal : "");
+    if (FAILED(hr)) *out = nullptr;
+    // A proxy refusal never reaches the backend's trace; keep it visible just like the no-handler refusal.
+    return refusal ? d3d12_trace::result("Xbox CreatePlacedResourceX (device slot 133)", hr) : hr;
+}
+
 template <unsigned Slot>
 std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -2252,8 +2314,6 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return hr_to_u64(proxy_create_compute_pipeline_from_native_code(
             self, reinterpret_cast<const void*>(a1), reinterpret_cast<const IID*>(a2),
             reinterpret_cast<void**>(a3)));
-    } else if constexpr (Slot == 133) {
-        return hr_to_u64(proxy_refuse_placed_resource_x(a1, a2, a3, a4, reinterpret_cast<void**>(a6)));
     } else if constexpr (Slot == 76) {
         return hr_to_u64(proxy_create_resource(
             self, reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(a1),
@@ -2262,6 +2322,11 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             static_cast<D3D12_RESOURCE_STATES>(static_cast<std::uint32_t>(a4)),
             reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5), reinterpret_cast<const IID*>(a6),
             reinterpret_cast<void**>(a7)));
+    } else if constexpr (Slot == 133) {
+        return hr_to_u64(proxy_create_placed_resource_x(
+            self, reinterpret_cast<void*>(a1), reinterpret_cast<const D3D12_RESOURCE_DESC*>(a2),
+            static_cast<std::uint32_t>(a3), reinterpret_cast<const void*>(a4), reinterpret_cast<const IID*>(a5),
+            reinterpret_cast<void**>(a6)));
     } else {
         if constexpr (Slot == 26) {
             // The console form has the device in RDX. A PC C++ caller has the proxy in RCX and its return buffer in
@@ -2442,6 +2507,10 @@ unsigned device_proxy_slot_count(const void* device) {
 ID3D12Device* device_proxy_real_device(const void* device) {
     if (!is_device_proxy(device)) return nullptr;
     return static_cast<const DeviceProxy*>(device)->real;
+}
+
+void set_placed_at_va_handler(PlacedAtVaHandler handler) {
+    g_placed_at_va.store(handler, std::memory_order_release);
 }
 
 bool device_slot_overridden(unsigned slot) {

@@ -108,6 +108,7 @@ if(WIN32 AND PALMWAVE_BUILD_WINDOWS_RUNTIME)
     shims/file_system.cpp
     shims/winhttp_offline.cpp
     shims/xmem.cpp
+    shims/host_pins.h
     shims/d3d12_xs.cpp
     shims/d3d12_xs_device.cpp
     shims/xgameruntime.cpp
@@ -209,6 +210,7 @@ if(WIN32 AND PALMWAVE_BUILD_WINDOWS_RUNTIME)
   add_executable(xmem_test
     test/xmem_test.cpp
     shims/xmem.cpp
+    shims/host_pins.h
     shims/registry.cpp
   )
   target_include_directories(xmem_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
@@ -1562,7 +1564,7 @@ if(TARGET Vulkan::Headers)
       COMMENT "Generating D3D12 COM stubs"
       VERBATIM)
     add_library(palmwave_d3d12_com STATIC shims/d3d12_com.cpp shims/d3d12_vulkan_device.cpp shims/d3d12_xs_device.cpp shims/xbox_present.cpp
-                shims/dxgi_com.cpp ${PALMWAVE_STUBS})   # d3d12_vulkan_device.cpp reads the PC device behind the proxy (#224)
+                shims/dxgi_com.cpp shims/host_pins.h ${PALMWAVE_STUBS})   # d3d12_vulkan_device.cpp reads the PC device behind the proxy (#224)
     target_include_directories(palmwave_d3d12_com PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
     target_link_libraries(palmwave_d3d12_com PUBLIC Vulkan::Headers palmwave_root_signature)
     target_compile_definitions(palmwave_d3d12_com PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -1816,6 +1818,20 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_existing_heap_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_existing_heap COMMAND d3d12_existing_heap_test)
     set_tests_properties(d3d12_existing_heap PROPERTIES SKIP_RETURN_CODE 77)
+
+    # Xbox slot 133 (CreatePlacedResourceX) on the caller's own pages with VK_EXT_external_memory_host: CPU -> GPU
+    # before and after creation, GPU -> CPU, shared imports, the title-memory pin refusals, unmanaged memory and the
+    # failure cases. xmem.cpp and registry.cpp are compiled in for the served title-memory shims and the pin provider
+    # (as d3d12_boot_movie_test does). Skips (77) only without a Vulkan device or the extension; validation messages fail.
+    add_executable(d3d12_host_placed_test test/d3d12_host_placed_test.cpp shims/xmem.cpp shims/host_pins.h
+                   shims/registry.cpp)
+    target_link_libraries(d3d12_host_placed_test PRIVATE palmwave_d3d12_com psapi)
+    target_compile_definitions(d3d12_host_placed_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_host_placed_test PRIVATE /W4 /permissive- /utf-8)
+    target_link_options(d3d12_host_placed_test PRIVATE /OPT:NOREF)  # keep the self-registering shim tables
+    add_test(NAME d3d12_host_placed COMMAND d3d12_host_placed_test)
+    set_tests_properties(d3d12_host_placed PROPERTIES SKIP_RETURN_CODE 77
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
 
     # Fences and timing (D3D-30): multiple-fence waits, clock calibration, adapter LUID, custom heap properties.
     add_executable(d3d12_fence_timing_test test/d3d12_fence_timing_test.cpp)

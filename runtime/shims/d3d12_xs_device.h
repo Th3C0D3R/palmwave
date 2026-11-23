@@ -13,6 +13,9 @@
 //             (+0x00 root signature, +0x28 code, +0x30 size) to D3D12_COMPUTE_PIPELINE_STATE_DESC and forwards
 //             to PC CreateComputePipelineState (slot 11). The PC slot 67 is CreateProtectedResourceSession1.
 //   slot 76   resource creation -> PC CreateCommittedResource (PC slot 27), with the Xbox layout word ignored.
+//   slot 133  CreatePlacedResourceX(va, desc, state, clear, riid, out) -> the registered host-page handler, only for
+//             a plain row-major buffer, supported flags and no clear value. Unknown flags/layouts are refused without
+//             rewriting them. No handler: E_NOTIMPL, null output and an unsupported trace.
 //   slot 48   CreateCommandQueueX(desc, riid, out) -> the same queue proxy as slot 8. The Xbox desc's first fields are
 //             D3D12_COMMAND_QUEUE_DESC's (public HLE).
 //   slot 73   CreateCommandListX(desc, allocator, initialState, riid, out) -> PC CreateCommandList(0, type, allocator,
@@ -27,7 +30,7 @@
 // The slots 48/73/78/79/80 are the public HLE Freminet/ScarlettX's observation, not Microsoft documentation, and can
 // be moved with PALMWAVE_XS_QUEUE_X_SLOT, PALMWAVE_XS_LIST_X_SLOT, PALMWAVE_XS_FRAME_INTERVAL_SLOT,
 // PALMWAVE_XS_SCHEDULE_EVENT_SLOT and PALMWAVE_XS_WAIT_EVENT_SLOT (3..127; anything else is logged once and ignored).
-// The device table has 192 entries; slot 133 refuses host-page placement and clears its output.
+// The device table has 192 entries; slot 133 clears its output on refusal and never creates a stand-in resource.
 // Only the existing routes are configurable; their 3..127 range is unchanged.
 // The measured slots 9/10 (GetCPU/GPUDescriptorHandleForHeapStart) are ID3D12DescriptorHeap methods, not device
 // methods: the PC device's 9/10 are CreateCommandAllocator/CreateGraphicsPipelineState and are forwarded unchanged.
@@ -116,9 +119,27 @@ unsigned device_proxy_slot_count(const void* device);
 // The PC device behind a proxy. Null when `device` is not a proxy.
 ID3D12Device* device_proxy_real_device(const void* device);
 
+// Device slot 133 (the console's CreatePlacedResourceX) places a resource at the title's VA `va`. The proxy does not
+// create it: the device behind it does, through this handler, which the Vulkan layer registers
+// (rt::d3d12::create_buffer_at_host_address). With none registered the slot answers E_NOTIMPL.
+//
+// The proxy is strict and passes only semantics it knows, unchanged: a BUFFER description whose layout word is 0x1
+// (ROW_MAJOR, which the console's row-major word and the PC enum share) and whose flags are none, ALLOW_UNORDERED_ACCESS
+// or DENY_SHADER_RESOURCE, with a null clear value. Any other dimension, layout word or flag bit (the console's bits
+// above the PC flags included, since their meaning is not established) is E_NOTIMPL, a clear value is E_INVALIDARG,
+// and null desc/riid/out are E_POINTER; on every refusal *out is null and the handler is not called. `initial_state` is
+// the title's third word, passed through unchanged: the handler decides which values it accepts (the Vulkan layer only
+// COMMON, 0; its meaning on the console is not established, retail_boot_chain.md section 3.4). A failing handler must
+// leave *out null; the proxy clears it again on failure. Shape from upstream #7218 (tibzejoker,
+// a3eae955dcec4fb65864ca6c10b4ca3f2999c2d3, GPL-3.0).
+using PlacedAtVaHandler = HRESULT (*)(ID3D12Device* real, void* va, const D3D12_RESOURCE_DESC& desc,
+                                      std::uint32_t initial_state, REFIID riid, void** out);
+void set_placed_at_va_handler(PlacedAtVaHandler handler);
+
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14, 26 (the console's struct-return form), 31/34/35/45/46/50 (proxies unwrapped),
-// 32 and 36 (fence proxies), 48/73 and 78/79/80 (the Xbox slots above, at their configured indices), 62, 67 and 76.
+// 32 and 36 (fence proxies), 48/73 and 78/79/80 (the Xbox slots above, at their configured indices), 62, 67, 76
+// and 133.
 // Slot 10 is intentionally false: the measured 9/10 handle conversion is on the heap proxy, and device slot 9 is
 // CreateCommandAllocator, which the proxy handles for the allocator proxy.
 bool device_slot_overridden(unsigned slot);

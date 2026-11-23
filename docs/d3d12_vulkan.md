@@ -1499,6 +1499,12 @@ a console client can address is an arena range, whichever heap it comes from.
 Why not give each buffer its own BDA and set `heap_base = 0`? Because 25,865 of the 26,503 shaders (97.6%)
 truncate descriptor-table pointers to 32 bits, and host BDAs are not guaranteed to be below 4 GB. The arena keeps console VAs low and stable.
 
+**Slot-133 buffers are outside this equation (open).** A buffer on the title's own pages (section 4.2, "Slot 133")
+is its own imported `VkBuffer`, and its console VA is the title's host address. Copies, views and root arguments
+that name it by VA find it through the VA index. A shader that reads that VA from a V# adds `heap_base` and misses
+it. Importing the pages does not fix this, and setting `heap_base` to 0 doesn't either, for the reason above. One
+address space covering both the arena and the title's pages (for example #5378's sparse arena) is separate work.
+
 Why one arena rather than several? Because the shader gets exactly one `heap_base` for buffer, descriptor-table and
 code accesses. A draw can reference a descriptor table in one heap and a vertex buffer in another; both must
 satisfy the same `heap_base + va` equation. Several non-contiguous VkBuffers cannot provide that equation.
@@ -2317,6 +2323,91 @@ The trace will enumerate them.
   64 KiB-aligned offset; a texture at a multiple of its `GetResourceAllocationInfo` alignment (4 KiB for a small
   texture), in a heap aligned at least as much, and whole inside the heap; the heap's `DENY` flags against the
   resource; then a null output is `E_UNEXPECTED` and nothing is made.
+- **Slot 133: Xbox `CreatePlacedResourceX` on the title's own pages.** The call is `(va, desc, state, clear, riid,
+  out)` ([retail_boot_chain.md](retail_boot_chain.md#34-device-slot-133-places-a-resource-at-a-virtual-address)).
+  The device hands it to `rt::d3d12::create_buffer_at_host_address`. That function makes a buffer whose
+  `VkDeviceMemory` imports the caller's pages with `VK_EXT_external_memory_host`. Adapted from upstream #7218 and made
+  strict (provenance in `UPSTREAM.md`):
+  - **Call contract.** The proxy forwards the description unchanged, and only when it can: a buffer, layout word
+    `0x1` (`ROW_MAJOR` in both the console's word and the PC enum), flags among `ALLOW_UNORDERED_ACCESS` and
+    `DENY_SHADER_RESOURCE`, and a null clear value. It doesn't mask or rewrite anything. Any other dimension,
+    layout word or flag bit is `E_NOTIMPL`, including the console bits above the PC flags (such as `0x20000`),
+    whose meaning isn't established. A clear value is `E_INVALIDARG`. The device is never called on a refusal.
+    The device checks the description again: `Width` > 0, `Height`, `DepthOrArraySize` and `MipLevels` 1, `Format`
+    `UNKNOWN`, one sample at quality 0, `ROW_MAJOR`, `Alignment` 0 or 64 KiB, the same flags. A malformed field is
+    `E_INVALIDARG` and an unimplemented flag `E_NOTIMPL`.
+  - **Third word (open).** Retail passes `0xFFFFFFFF`. Read as a `D3D12_RESOURCE_STATES` value it is invalid. Read
+    as a `D3D12_BARRIER_LAYOUT` it would be `UNDEFINED`. No source establishes which reading is right. Buffers have
+    no layout in this layer, so the device accepts only `D3D12_RESOURCE_STATE_COMMON` (0) and refuses everything
+    else with `E_NOTIMPL`, including the retail value. **The retail call is therefore refused** until the word's
+    meaning is measured. The console flag bits in its description are refused too.
+  - **Capability.** Before the buffer is created, `vkGetPhysicalDeviceExternalBufferProperties` is queried with the
+    buffer's exact flags and usage and `HOST_ALLOCATION_BIT_EXT`. The result must report `IMPORTABLE` and the handle
+    type in `compatibleHandleTypes` (VUID-VkImportMemoryHostPointerInfoEXT-handleType-01747). `DEDICATED_ONLY` is
+    `E_NOTIMPL`, because dedicated imports aren't implemented. After creation, `vkGetBufferMemoryRequirements2` with
+    `VkMemoryDedicatedRequirements` must not report `requiresDedicatedAllocation`. The usage is never reduced to
+    make the query pass. If any of the three entry points is missing, slot 133 is `E_NOTIMPL`.
+  - **Memory.** Only `HOST_VISIBLE | HOST_COHERENT` types. The title keeps reading and writing the pages with no flush
+    or invalidate. The resource is `host_readable`, so a GPU write is followed by a host-read barrier before a fence
+    the CPU waits on. `GetGPUVirtualAddress` and `Map` return the title's VA; the reported heap is `CUSTOM` /
+    `WRITE_BACK` / `L0`.
+  - **Range.** `va` rounded out to `minImportedHostPointerAlignment` (4096 on the target RTX 5080 with driver 621.14,
+    per the maintainer's capability query). The whole range must be committed `PAGE_READWRITE`, with no guard page;
+    width overflow, a null `va` and a multisampled buffer are `E_INVALIDARG`. Write-combined or uncached pages are
+    `E_NOTIMPL`: an upstream RTX 5090 report says such an import read wrong bytes. A VA inside the arena's console
+    VAs `[0, arena size)` is `E_NOTIMPL`, so the two kinds of VA never collide in the VA index.
+  - **Ownership.** The range is pinned (`runtime/shims/host_pins.h`) before it is checked. The pin provider is the
+    xmem shim, and it grants a pin only when the whole rounded range lies inside one thing the title shims own:
+    - a live allocation made through the served `VirtualAlloc` or `XMemVirtualAlloc`;
+    - physical pages xmem mapped into one of its windows;
+    - a live tracked `XMemAlloc` block (one of at least 4 KiB).
+
+    Anything else is `E_NOTIMPL` with nothing pinned: a raw host `VirtualAlloc`, a section view, the CRT heap, a range
+    that spans two owners. It is also `E_NOTIMPL` when no provider is linked. Ownership is recorded under xmem's
+    locks. The order is the physical-page lock, then the block lock, then the pin registry's lock, and the provider
+    takes all three. A served `VirtualFree` release or `UnmapViewOfFile*` drops the ownership record. A deferred
+    `XMemFree` keeps it until the real free.
+  - **Lifetime.** While the range is pinned, the shims refuse with `ERROR_BUSY` and change nothing. Each refusal is
+    decided under the pin lock held across the host call:
+    - the xmem calls that would unmap or remap its pages (`XMemMapPhysicalPages`, `…Scatter`);
+    - `XMemFreePhysicalPages` of a page mapped in the range;
+    - an explicit-address `XMemVirtualAlloc` or title `VirtualAlloc`;
+    - the title's `VirtualFree` (the whole allocation when the size is 0);
+    - `VirtualProtect` of any page in the range, whatever the new protection;
+    - `UnmapViewOfFile` and `UnmapViewOfFileEx`, tested against the whole view, not just the page named.
+
+    `XMemFree` of a pinned block is deferred to the unpin. A pin is a logical reservation, not an OS page lock.
+    Raw host or NT calls (`VirtualProtectEx`, `UnmapViewOfFile2`, `NtUnmapViewOfSection`, another process) can
+    still invalidate the range, and that is outside the shim contract. Releasing the last resource waits for every
+    submission so far to retire, destroys the buffer, frees the memory, then unpins. If that wait can't be
+    confirmed on a live device, the memory and the pin are kept.
+  - **Sharing.** Resources whose ranges are identical or contained in a live import share it, with a counted owner.
+    A partial overlap is refused. So is a range whose physical pages already back an import at another address:
+    Vulkan doesn't promise that a second import of one payload works.
+  - **No fallback.** A texture, a device without the extension or capability, and every failed import return an
+    error with a null output. No committed stand-in is made, because the title's writes would not reach it.
+    Allocation failures in the import or pin registries are `E_OUTOFMEMORY`, with no memory or pin left behind and
+    no exception crossing the COM boundary.
+  - **Not covered.** Textures on the title's pages. Dedicated-only or dedicated-required imports. Memory no title
+    shim owns. Pages changed behind the shims by raw host or NT calls. The retail third word (above). Raw shader
+    V#s that name these VAs: the shader adds `heap_base`, so the gap in section 3.3 stays open whether or not the
+    import succeeds.
+  - **Tests.** `d3d12_host_placed_test` allocates its positive cases through the served shims: a title
+    `VirtualAlloc` range, xmem physical pages and an `XMemAlloc` block. It covers:
+    - CPU writes before and after creation reaching a GPU copy, and GPU writes reaching the CPU;
+    - refusals while the resource lives: the xmem calls, `VirtualFree`, `VirtualProtect` and `UnmapViewOfFile`;
+    - a reverse remap after release;
+    - alias, shared and partial-overlap imports;
+    - unmanaged memory (a raw `VirtualAlloc`, a raw section view, a range past a block);
+    - every malformed or unimplemented description field and initial state;
+    - the proxy call shape and its refusals.
+
+    `xmem_test` covers ownership, the no-provider refusal, deferred frees, the refusals and the saturated range
+    arithmetic on the CPU alone. `xs_proxy_mock_test` covers the proxy's forwarding and refusals without calling the
+    device. On the integrated Palmwave runtime, ten focused CPU CTests and four GPU CTests pass on NVIDIA GeForce
+    RTX 5080, driver 621.14, with Vulkan validation enabled and no validation errors (23 November 2026).
+    These synthetic copies establish buffer visibility and lifetime behaviour; they do not establish the console
+    flag/state contract or shader V# addressing. See `STATUS.md` for the separate offline retail refusal.
 - `CreateReservedResource` **implemented** (`d3d12_vulkan_device.cpp`, `src/resource_tiling.h`, checked by
   `d3d12_vulkan_device_test` and `resource_tiling_test`):
   - `CreateReservedResource`, `CreateReservedResource1` (no protected sessions) and `CreateReservedResource2`

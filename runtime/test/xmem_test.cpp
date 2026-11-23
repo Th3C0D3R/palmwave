@@ -7,7 +7,9 @@
 // XMemTransferMemory follows the call shape in Microsoft's public samples: TRUE for any direction and size, with
 // nothing committed, and one trace event per distinct (type, size). XMemVirtualAlloc accepts attribute words and console
 // graphics protection bits and commits 2 MiB guest pages; the placeholder flags pass through; physical pages keep their
-// contents across unmap and remap, alias when mapped twice, and scatter-map per address.
+// contents across unmap and remap, alias when mapped twice, and scatter-map per address. GPU-import pins
+// (host_pins.h) are granted only over memory the shims own and refused otherwise (or with no provider); while one lives
+// the served VirtualAlloc, VirtualFree, VirtualProtect, UnmapViewOfFile(Ex) and the xmem calls refuse to change it.
 #include <windows.h>
 #include <psapi.h>
 
@@ -18,7 +20,9 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <utility>
 
+#include "host_pins.h"
 #include "shims.h"
 #include "startup_trace.h"
 
@@ -57,6 +61,14 @@ void check(bool condition, const char* what) {
 }
 
 bool aligned_64(const void* p) { return p && (reinterpret_cast<uintptr_t>(p) & 63u) == 0; }
+
+// Releases what a served allocation call returned through the served kernel32!VirtualFree, as a title does, so the
+// shim's record of the title's own allocations (the owners a GPU-import pin may have, host_pins.h) stays exact.
+BOOL title_release(void* p) {
+    using Fn = BOOL(WINAPI*)(void*, SIZE_T, DWORD);
+    static const auto title_free = reinterpret_cast<Fn>(rt::shims::find("kernel32.dll", "VirtualFree"));
+    return title_free ? title_free(p, 0, MEM_RELEASE) : FALSE;
+}
 
 void test_alloc(XMemAllocFn alloc, XMemFreeFn free_mem) {
     void* const zero = alloc(0, 0);
@@ -228,7 +240,7 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
               reinterpret_cast<uintptr_t>(watched[0]) == reinterpret_cast<uintptr_t>(base) + page_size,
           "write-watch records writes again after reset");
 
-    check(VirtualFree(base, 0, MEM_RELEASE), "release the synthetic write-watch region");
+    check(title_release(base), "release the synthetic write-watch region");
 
     // 2 MiB guest pages: the region is 2 MiB-aligned, rounded up to whole 2 MiB pages and committed.
     void* const large_page = virtual_alloc(nullptr, kPage2m + page_size, MEM_RESERVE | MEM_COMMIT | kXmemLargePages,
@@ -241,7 +253,7 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
         check(info.State == MEM_COMMIT && info.RegionSize >= 2 * kPage2m && info.Protect == PAGE_READWRITE,
               "a 2 MiB-page region is rounded up to whole pages, committed read-write without the graphics bits");
         static_cast<volatile uint8_t*>(large_page)[2 * kPage2m - 1] = 0x77;
-        check(VirtualFree(large_page, 0, MEM_RELEASE), "release the 2 MiB-page region");
+        check(title_release(large_page), "release the 2 MiB-page region");
     }
 
     // The attribute word is accepted (every measured call passes a nonzero one) and the protection loses its graphics
@@ -255,7 +267,7 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
         check(info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE,
               "the region is committed PAGE_READWRITE (graphics bits dropped)");
         static_cast<volatile uint8_t*>(attributed)[0] = 0x42;
-        check(VirtualFree(attributed, 0, MEM_RELEASE), "release the attributed region");
+        check(title_release(attributed), "release the attributed region");
     }
 
     // The retail executable's GPU pools: the attribute word is recorded, and the PAGE_GRAPHICS_* bits are dropped.
@@ -264,7 +276,7 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
     check(pool != nullptr, "attributes 0x21 with 64 KiB pages reserves 8 GiB");
     if (pool) {
         check(VirtualQuery(pool, &mbi, sizeof mbi) && mbi.State == MEM_RESERVE, "the 8 GiB pool is reserve-only");
-        check(VirtualFree(pool, 0, MEM_RELEASE), "release the 8 GiB pool");
+        check(title_release(pool), "release the 8 GiB pool");
     }
 
     void* const noaccess = virtual_alloc(nullptr, 0x10000, MEM_RESERVE | 0x20400000, 0x3, 0x801);
@@ -272,7 +284,7 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
     if (noaccess) {
         check(VirtualQuery(noaccess, &mbi, sizeof mbi) && mbi.AllocationProtect == PAGE_NOACCESS,
               "protect 0x801 becomes PAGE_NOACCESS");
-        check(VirtualFree(noaccess, 0, MEM_RELEASE), "release the PAGE_NOACCESS pool");
+        check(title_release(noaccess), "release the PAGE_NOACCESS pool");
     }
 
     void* const gpu = virtual_alloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, 0x183, 0x22004);
@@ -281,7 +293,7 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
         check(VirtualQuery(gpu, &mbi, sizeof mbi) && mbi.Protect == PAGE_READWRITE, "protect 0x22004 becomes PAGE_READWRITE");
         static_cast<volatile uint8_t*>(gpu)[0] = 0x5a;
         check(static_cast<volatile uint8_t*>(gpu)[0] == 0x5a, "the 0x183 allocation is writable");
-        check(VirtualFree(gpu, 0, MEM_RELEASE), "release the 0x183 allocation");
+        check(title_release(gpu), "release the 0x183 allocation");
     }
 
     SetLastError(ERROR_SUCCESS);
@@ -440,6 +452,305 @@ void test_physical_pages(const PhysicalApi& api) {
     // The windows were split into one placeholder per page; the process exit releases them.
 }
 
+using TitleVirtualFreeFn = BOOL(WINAPI*)(void*, SIZE_T, DWORD);
+using TitleVirtualAllocFn = void*(WINAPI*)(void*, SIZE_T, DWORD, DWORD);
+using TitleVirtualProtectFn = BOOL(WINAPI*)(void*, SIZE_T, DWORD, DWORD*);
+using TitleUnmapViewOfFileFn = BOOL(WINAPI*)(const void*);
+using TitleUnmapViewOfFileExFn = BOOL(WINAPI*)(void*, ULONG);
+
+DWORD protection_of(const void* address) {
+    MEMORY_BASIC_INFORMATION info{};
+    return VirtualQuery(address, &info, sizeof(info)) ? info.Protect : 0;
+}
+
+// The pin provider accepts only memory the title shims own end to end (host_pins.h): a title VirtualAlloc /
+// XMemVirtualAlloc allocation, xmem-mapped pages, a live tracked XMemAlloc block. Everything else, and every pin with
+// no provider linked, is refused. Ownership follows the served release calls.
+void test_pin_ownership(const PhysicalApi& api, XMemAllocFn alloc, XMemFreeFn free_mem) {
+    namespace pins = rt::host_pins;
+    using pins::PinResult;
+    const auto title_alloc = reinterpret_cast<TitleVirtualAllocFn>(rt::shims::find("kernel32.dll", "VirtualAlloc"));
+    const auto title_free = reinterpret_cast<TitleVirtualFreeFn>(rt::shims::find("kernel32.dll", "VirtualFree"));
+    const auto title_unmap = reinterpret_cast<TitleUnmapViewOfFileFn>(rt::shims::find("kernel32.dll", "UnmapViewOfFile"));
+    if (!title_alloc || !title_free || !title_unmap) return;
+    const auto range = [](const void* p, size_t bytes) {
+        return std::pair{reinterpret_cast<uintptr_t>(p), reinterpret_cast<uintptr_t>(p) + bytes};
+    };
+    const auto pin = [&](const void* p, size_t bytes) {
+        const auto [b, e] = range(p, bytes);
+        return pins::pin(b, e);
+    };
+    const auto unpin = [&](const void* p, size_t bytes) {
+        const auto [b, e] = range(p, bytes);
+        return pins::unpin(b, e);
+    };
+
+    // Unmanaged: a raw host VirtualAlloc, a raw section view, the stack. Nothing is recorded.
+    void* const raw = VirtualAlloc(nullptr, kPage64k, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    const HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, DWORD(kPage64k), nullptr);
+    void* const view = section ? MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, kPage64k) : nullptr;
+    uint8_t stack[64]{};
+    check(raw && view, "ownership: raw allocation and raw section view made");
+    if (raw) check(pin(raw, 0x1000) == PinResult::unmanaged, "a raw host VirtualAlloc is not owned: refused");
+    if (view) check(pin(view, 0x1000) == PinResult::unmanaged, "a raw section view is not owned: refused");
+    check(pin(stack, sizeof stack) == PinResult::unmanaged, "stack memory is not owned: refused");
+    check(pins::pin_count() == 0, "no unmanaged range was recorded");
+    if (view) check(title_unmap(view) == TRUE, "the served UnmapViewOfFile unmaps an unpinned raw view");
+    if (section) CloseHandle(section);
+    if (raw) VirtualFree(raw, 0, MEM_RELEASE);
+
+    // No provider linked: refused, nothing recorded.
+    auto* const owned = static_cast<uint8_t*>(title_alloc(nullptr, 2 * kPage64k, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    check(owned != nullptr, "ownership: title VirtualAlloc");
+    if (!owned) return;
+    const pins::PinProvider provider = pins::registry().provider.exchange(nullptr);
+    check(pin(owned, kPage64k) == PinResult::no_provider && pins::pin_count() == 0,
+          "with no lifetime provider linked a pin is refused and nothing is recorded");
+    pins::registry().provider.store(provider);
+
+    // A title allocation is owned; a range running past it is not; after the served release it is not any more.
+    check(pin(owned, 2 * kPage64k + 0x1000) == PinResult::unmanaged, "a range past the end of the allocation: refused");
+    check(pin(owned + kPage64k, kPage64k) == PinResult::pinned, "a title VirtualAlloc range pins");
+    check(unpin(owned + kPage64k, kPage64k), "and unpins");
+    check(title_free(owned, 0, MEM_RELEASE) == TRUE, "the served VirtualFree releases it");
+    check(pin(owned, 0x1000) == PinResult::unmanaged, "after the served release the range is no longer owned");
+
+    // XMemVirtualAlloc allocations are owned too.
+    auto* const xmem_owned = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPage64k, MEM_RESERVE | MEM_COMMIT | kXmem64kPages, 0x23, PAGE_READWRITE));
+    if (xmem_owned) {
+        check(pin(xmem_owned, kPage64k) == PinResult::pinned, "an XMemVirtualAlloc allocation pins");
+        check(unpin(xmem_owned, kPage64k), "and unpins");
+        check(title_release(xmem_owned) == TRUE, "and is released");
+    }
+
+    // XMemAlloc blocks: a range inside a live tracked block is owned, past its end or in a small block is not.
+    auto* const small = static_cast<uint8_t*>(alloc(0x200, 0));
+    if (small) {
+        check(pin(small, 0x100) == PinResult::unmanaged, "a block smaller than a page is not tracked: refused");
+        free_mem(small, 0);
+    }
+    constexpr size_t kBlock = 0x3000;
+    auto* const block = static_cast<uint8_t*>(alloc(kBlock, 0));
+    if (!block) return;
+    check(pin(block, kBlock + 0x40) == PinResult::unmanaged, "a range past the end of a block: refused");
+    std::memset(block, 0x5a, kBlock);
+    check(pin(block, kBlock) == PinResult::pinned, "a range inside a live XMemAlloc block pins");
+    free_mem(block, 0);  // deferred: the block stays allocated, owned, and unchanged until the unpin
+    bool kept = true;
+    for (size_t i = 0; i < kBlock; ++i) kept &= block[i] == 0x5a;
+    check(kept, "XMemFree of a pinned block keeps it, contents intact");
+    auto* const other = static_cast<uint8_t*>(alloc(kBlock, 0));
+    check(other && (other + kBlock <= block || other >= block + kBlock),
+          "while the free is deferred the heap does not hand the block's memory out again");
+    if (other) free_mem(other, 0);
+    check(unpin(block, kBlock), "the block unpins (and the deferred free runs)");
+    check(pin(block, kBlock) == PinResult::unmanaged, "after the real free the block's range is no longer owned");
+    check(pins::pin_count() == 0, "ownership test leaves no pin");
+}
+
+// VirtualProtect and UnmapViewOfFile(Ex) through the served shims: refused (ERROR_BUSY, nothing changed) while a pin
+// overlaps the pages or the view, allowed after the release. The whole view is tested, not just the page named.
+void test_pin_protect_and_unmap(const PhysicalApi& api) {
+    namespace pins = rt::host_pins;
+    using pins::PinResult;
+    const auto title_alloc = reinterpret_cast<TitleVirtualAllocFn>(rt::shims::find("kernel32.dll", "VirtualAlloc"));
+    const auto title_free = reinterpret_cast<TitleVirtualFreeFn>(rt::shims::find("kernel32.dll", "VirtualFree"));
+    const auto title_protect = reinterpret_cast<TitleVirtualProtectFn>(rt::shims::find("kernel32.dll", "VirtualProtect"));
+    const auto title_unmap = reinterpret_cast<TitleUnmapViewOfFileFn>(rt::shims::find("kernel32.dll", "UnmapViewOfFile"));
+    const auto title_unmap_ex =
+        reinterpret_cast<TitleUnmapViewOfFileExFn>(rt::shims::find("kernel32.dll", "UnmapViewOfFileEx"));
+    for (const char* dll : {"kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-l1-1-0.dll",
+                            "api-ms-win-core-memory-l1-1-1.dll"}) {
+        bool all = true;
+        for (const char* name : {"VirtualAlloc", "VirtualFree", "VirtualProtect", "UnmapViewOfFile", "UnmapViewOfFileEx"})
+            all &= rt::shims::find(dll, name) != nullptr;
+        char what[160];
+        std::snprintf(what, sizeof what, "registry serves the title memory calls under %s", dll);
+        check(all, what);
+    }
+    if (!title_alloc || !title_free || !title_protect || !title_unmap || !title_unmap_ex) return;
+    const auto busy = [](bool refused) { return refused && GetLastError() == ERROR_BUSY; };
+
+    // VirtualProtect on a title allocation, pinned in its first 64 KiB only.
+    auto* const pages = static_cast<uint8_t*>(title_alloc(nullptr, 2 * kPage64k, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    check(pages != nullptr, "protect test: title VirtualAlloc");
+    if (!pages) return;
+    fill_page(pages, 0x9100u);
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(pages);
+    check(pins::pin(begin, begin + kPage64k) == PinResult::pinned, "protect test: the first half pins");
+    DWORD old = 0;
+    SetLastError(ERROR_SUCCESS);
+    check(busy(title_protect(pages + 0x2000, 1, PAGE_READONLY, &old) == FALSE),
+          "VirtualProtect of one byte of a pinned page is refused");
+    SetLastError(ERROR_SUCCESS);
+    check(busy(title_protect(pages + kPage64k - 0x1000, 0x2000, PAGE_READWRITE, &old) == FALSE),
+          "VirtualProtect straddling the pin's end is refused, even to the same protection");
+    check(protection_of(pages) == PAGE_READWRITE && page_holds(pages, 0x9100u),
+          "after the refusals the pinned pages keep their protection and contents");
+    check(title_protect(pages + kPage64k, kPage64k, PAGE_READONLY, &old) == TRUE && old == PAGE_READWRITE &&
+              protection_of(pages + kPage64k) == PAGE_READONLY,
+          "VirtualProtect of the unpinned half goes to the host");
+    title_protect(pages + kPage64k, kPage64k, PAGE_READWRITE, &old);
+    SetLastError(ERROR_SUCCESS);
+    check(busy(title_free(pages, 0, MEM_RELEASE) == FALSE),
+          "VirtualFree of the whole allocation is refused although only part of it is pinned");
+    // Saturated range arithmetic: calls near the top of the address space are passed on (and refused by the host),
+    // never wrapped onto a pin.
+    constexpr uintptr_t kTop = (std::numeric_limits<uintptr_t>::max)() & ~uintptr_t{0xfff};
+    SetLastError(ERROR_SUCCESS);
+    check(title_protect(reinterpret_cast<void*>(kTop), (std::numeric_limits<SIZE_T>::max)(), PAGE_READONLY, &old) ==
+                  FALSE &&
+              GetLastError() != ERROR_BUSY,
+          "a VirtualProtect range running past the top of the address space does not wrap onto the pin");
+    SetLastError(ERROR_SUCCESS);
+    check(title_free(reinterpret_cast<void*>(kTop), (std::numeric_limits<SIZE_T>::max)(), MEM_DECOMMIT) == FALSE &&
+              GetLastError() != ERROR_BUSY,
+          "a VirtualFree range running past the top does not wrap onto the pin");
+    SetLastError(ERROR_SUCCESS);
+    check(title_alloc(reinterpret_cast<void*>(kTop), (std::numeric_limits<SIZE_T>::max)(), MEM_COMMIT, PAGE_READWRITE) ==
+                  nullptr &&
+              GetLastError() != ERROR_BUSY,
+          "a VirtualAlloc range running past the top does not wrap onto the pin");
+    check(pins::pin(kTop, (std::numeric_limits<uintptr_t>::max)()) == PinResult::unmanaged,
+          "a pin at the top of the address space is refused without wrapping");
+    check(pins::unpin(begin, begin + kPage64k), "protect test: unpinned");
+    check(title_protect(pages, 0x1000, PAGE_READONLY, &old) == TRUE && protection_of(pages) == PAGE_READONLY,
+          "after the release VirtualProtect of the page goes to the host");
+    title_protect(pages, 0x1000, PAGE_READWRITE, &old);
+    check(title_free(pages, 0, MEM_RELEASE) == TRUE, "after the release the allocation frees");
+
+    // UnmapViewOfFile(Ex) on xmem-mapped pages: each page is its own 64 KiB view. A pin on the view's second 4 KiB page
+    // refuses an unmap named by the view's base (whose own page is not pinned).
+    auto* const window = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE));
+    uint64_t page = 0;
+    uint64_t count = 1;
+    check(window && api.allocate(0x280, &count, &page) == TRUE && count == 1 && api.map(window, 1, &page) == window,
+          "unmap test: one xmem page mapped");
+    if (!window || count != 1) return;
+    fill_page(window, 0x9200u);
+    const uintptr_t w = reinterpret_cast<uintptr_t>(window);
+    check(pins::pin(w + 0x1000, w + 0x2000) == PinResult::pinned, "unmap test: an inner 4 KiB page of the view pins");
+    SetLastError(ERROR_SUCCESS);
+    check(busy(title_unmap(window) == FALSE), "UnmapViewOfFile of a view with a pinned page is refused");
+    SetLastError(ERROR_SUCCESS);
+    check(busy(title_unmap_ex(window, MEM_PRESERVE_PLACEHOLDER) == FALSE),
+          "UnmapViewOfFileEx of a view with a pinned page is refused");
+    SetLastError(ERROR_SUCCESS);
+    check(busy(title_protect(window, kPage64k, PAGE_READONLY, &old) == FALSE),
+          "VirtualProtect over the pinned view is refused");
+    check(page_holds(window, 0x9200u) && protection_of(window) == PAGE_READWRITE,
+          "after the refusals the view is mapped read-write with its contents");
+    check(pins::unpin(w + 0x1000, w + 0x2000), "unmap test: unpinned");
+    check(title_unmap_ex(window, MEM_PRESERVE_PLACEHOLDER) == TRUE && reserved_only(window),
+          "after the release UnmapViewOfFileEx unmaps the view and keeps the placeholder");
+    check(pins::pin(w, w + 0x1000) == PinResult::unmanaged, "the unmapped page is no longer xmem's: a pin is refused");
+    check(api.map(window, 1, &page) == window && page_holds(window, 0x9200u),
+          "xmem maps the page again into the kept placeholder, contents intact");
+    check(api.map(window, 1, nullptr) == window && api.free_pages(1, &page) == TRUE, "unmap test: cleaned up");
+    check(pins::pin_count() == 0, "protect and unmap tests leave no pin");
+}
+
+// Host pins (host_pins.h): while a GPU import holds pages, every xmem call that would unmap, remap, free or replace
+// them fails with ERROR_BUSY and changes nothing; an XMemFree of a pinned block is deferred to the unpin. A pin over
+// pages that already back another pin at another address is refused. After the unpin everything works again.
+void test_pins(const PhysicalApi& api, XMemAllocFn alloc, XMemFreeFn free_mem) {
+    namespace pins = rt::host_pins;
+    using pins::PinResult;
+    check(pins::registry().provider.load() != nullptr, "xmem installs its page-table pin provider");
+    check(pins::pin_count() == 0, "no pin is held before the test");
+    const auto title_free = reinterpret_cast<TitleVirtualFreeFn>(rt::shims::find("kernel32.dll", "VirtualFree"));
+    const auto title_alloc = reinterpret_cast<TitleVirtualAllocFn>(rt::shims::find("kernel32.dll", "VirtualAlloc"));
+    check(title_free != nullptr, "registry exposes kernel32.dll!VirtualFree");
+    if (!title_free || !title_alloc) return;
+
+    constexpr uint64_t kPages = 2;
+    auto* const window = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPages * kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE));
+    auto* const other = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE));
+    uint64_t pages[kPages]{};
+    uint64_t count = kPages;
+    check(window && other && api.allocate(0x280, &count, pages) == TRUE && count == kPages,
+          "pin test: windows reserved and pages allocated");
+    if (!window || !other || count != kPages) return;
+    check(api.map(window, kPages, pages) == window, "pin test: pages mapped");
+    fill_page(window, 0x7100u);
+    fill_page(window + kPage64k, 0x7200u);
+
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(window);
+    const uintptr_t end = begin + kPages * kPage64k;
+    check(pins::pin(begin, end) == PinResult::pinned, "the mapped range pins");
+    check(pins::pin(begin + 0x1000, begin + 0x2000) == PinResult::overlaps, "an overlapping pin is refused");
+    check(pins::pin(begin, begin) == PinResult::invalid, "an empty pin is refused");
+
+    // The same physical page at another address may be mapped, but not pinned a second time.
+    check(api.map(other, 1, &pages[0]) == other, "a pinned page still maps at an unpinned second address");
+    check(pins::pin(reinterpret_cast<uintptr_t>(other), reinterpret_cast<uintptr_t>(other) + kPage64k) ==
+              PinResult::aliases,
+          "a pin over a physical page another pin holds is refused (one payload, one import)");
+    check(api.map(other, 1, nullptr) == other, "the unpinned alias unmaps");
+
+    const auto busy = [](bool refused) { return refused && GetLastError() == ERROR_BUSY; };
+    SetLastError(ERROR_SUCCESS);
+    check(busy(api.map(window, 1, nullptr) == nullptr), "XMemMapPhysicalPages refuses to unmap a pinned page");
+    const uint64_t swapped[kPages] = {pages[1], pages[0]};
+    SetLastError(ERROR_SUCCESS);
+    check(busy(api.map(window, kPages, swapped) == nullptr), "XMemMapPhysicalPages refuses to remap pinned pages");
+    void* const addresses[2] = {other, window + kPage64k};
+    const uint64_t scattered[2] = {pages[1], 0};
+    SetLastError(ERROR_SUCCESS);
+    check(busy(api.scatter(addresses, 2, scattered) == FALSE),
+          "XMemMapPhysicalPagesScatter refuses a call with one pinned entry");
+    check(reserved_only(other), "the refused scatter changed nothing, not even its unpinned entry");
+    SetLastError(ERROR_SUCCESS);
+    check(busy(api.free_pages(1, &pages[1]) == FALSE), "XMemFreePhysicalPages refuses a page mapped inside a pin");
+    SetLastError(ERROR_SUCCESS);
+    check(busy(api.virtual_alloc(window, kPage64k, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | kXmem64kPages, 0x23,
+                                 PAGE_READWRITE) == nullptr),
+          "XMemVirtualAlloc refuses to replace a pinned window");
+    SetLastError(ERROR_SUCCESS);
+    check(busy(title_alloc(window, 0x1000, MEM_COMMIT, PAGE_READONLY) == nullptr),
+          "the title's VirtualAlloc refuses to recommit pinned pages");
+    SetLastError(ERROR_SUCCESS);
+    check(busy(title_free(window + kPage64k, 0, MEM_RELEASE) == FALSE),
+          "the title's VirtualFree refuses to release pinned pages");
+    check(page_holds(window, 0x7100u) && page_holds(window + kPage64k, 0x7200u),
+          "after every refusal the pinned pages hold their mapping and contents");
+
+    // The served UnmapViewOfFile of one of the pinned pages (each is its own view) is refused too.
+    if (const auto title_unmap =
+            reinterpret_cast<TitleUnmapViewOfFileFn>(rt::shims::find("kernel32.dll", "UnmapViewOfFile"))) {
+        SetLastError(ERROR_SUCCESS);
+        check(busy(title_unmap(window + kPage64k) == FALSE), "the title's UnmapViewOfFile refuses a pinned page");
+        check(page_holds(window + kPage64k, 0x7200u), "the refused unmap left the page mapped with its contents");
+    }
+
+    // XMemFree of a pinned block (ownership, deferral and the real free: test_pin_ownership).
+    constexpr size_t kBlock = 0x3000;
+    auto* const block = static_cast<uint8_t*>(alloc(kBlock, 0));
+    if (block) {
+        std::memset(block, 0x5a, kBlock);
+        const uintptr_t block_begin = reinterpret_cast<uintptr_t>(block);
+        check(pins::pin(block_begin, block_begin + kBlock) == PinResult::pinned, "an XMemAlloc block pins");
+        free_mem(block, 0);
+        bool kept = true;
+        for (size_t i = 0; i < kBlock; ++i) kept &= block[i] == 0x5a;
+        check(kept, "XMemFree of a pinned block keeps it, contents intact, until the unpin");
+        check(pins::unpin(block_begin, block_begin + kBlock), "the block unpins (and the deferred free runs)");
+    }
+
+    check(pins::unpin(begin, end), "the range unpins");
+    check(!pins::unpin(begin, end), "a second unpin of the same range fails");
+    check(pins::pin_count() == 0, "no pin is left");
+    check(api.map(window, kPages, swapped) == window && page_holds(window, 0x7200u) &&
+              page_holds(window + kPage64k, 0x7100u),
+          "after the unpin the pages remap in reverse order with their contents");
+    check(api.map(window, kPages, nullptr) == window, "after the unpin the pages unmap");
+    check(api.free_pages(kPages, pages) == TRUE, "after the unpin the pages free");
+}
+
 // The placeholder flags pass through: reserve a placeholder, carve windows and committed memory out of it.
 void test_placeholders(const PhysicalApi& api) {
     auto* const base = static_cast<uint8_t*>(
@@ -496,7 +807,7 @@ void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAll
     free_mem(nullptr, 0x77);  // a free-only word is recorded too
     void* const v = virtual_alloc ? virtual_alloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT, 0x183, PAGE_READWRITE)
                                   : nullptr;
-    if (v) VirtualFree(v, 0, MEM_RELEASE);
+    if (v) title_release(v);
     rt::startup_trace::close();
 
     std::ifstream in(path);
@@ -624,7 +935,7 @@ void test_title_virtual_alloc() {
             MEMORY_BASIC_INFORMATION mbi{};
             check(VirtualQuery(gfx, &mbi, sizeof mbi) && mbi.Protect == PAGE_READWRITE,
                   "protect 0x2004 commits PAGE_READWRITE");
-            VirtualFree(gfx, 0, MEM_RELEASE);
+            title_release(gfx);
         }
         for (const DWORD bits : {kMemGraphics, kMemTitle, kMemGraphics | kMemTitle, DWORD{0}}) {
             void* const p = alloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT | bits, PAGE_READWRITE);
@@ -634,7 +945,7 @@ void test_title_virtual_alloc() {
             if (!p) continue;
             static_cast<volatile uint8_t*>(p)[0] = 0x5a;
             check(static_cast<volatile uint8_t*>(p)[0] == 0x5a, "the allocation is committed and writable");
-            check(VirtualFree(p, 0, MEM_RELEASE), "release the allocation");
+            check(title_release(p), "release the allocation");
         }
     }
 }
@@ -719,6 +1030,9 @@ int main() {
     if (virtual_alloc && physical.allocate && physical.free_pages && physical.map && physical.scatter) {
         test_physical_pages(physical);
         test_placeholders(physical);
+        test_pins(physical, alloc, free_mem);
+        test_pin_ownership(physical, alloc, free_mem);
+        test_pin_protect_and_unmap(physical);
     }
 
     print_result();

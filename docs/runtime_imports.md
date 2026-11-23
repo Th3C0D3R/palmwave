@@ -123,6 +123,30 @@ Seven more `xmem.dll` imports follow argument shapes measured locally at a title
   console's `PAGE_GRAPHICS_*` bits are dropped from the protection, as before.
 - `XMemIsToolsMemAvailable()` is `FALSE`: a PC has no development-kit tools memory. The measured title asks only
   on an out-of-memory path, after an allocation has already failed.
+- **Host pins.** A slot-133 GPU import pins its range (`runtime/shims/host_pins.h`,
+  [d3d12_vulkan.md](d3d12_vulkan.md#42-resources-heaps-placed-and-reserved)). xmem grants the pin only for a range
+  wholly inside one thing the shims own: an allocation made through the served `VirtualAlloc` or
+  `XMemVirtualAlloc`, xmem-mapped physical pages, or a live `XMemAlloc` block of at least 4 KiB. Other memory, and
+  every pin when no provider is linked, is refused.
+
+  While the pin lives, these calls fail with `ERROR_BUSY` and change nothing:
+  - the map calls that would unmap or remap its pages;
+  - `XMemFreePhysicalPages` of a page mapped in it;
+  - an explicit-address `XMemVirtualAlloc` over it;
+  - the title's own `VirtualAlloc` at an explicit address;
+  - `VirtualFree` over it;
+  - `VirtualProtect` of any of its pages;
+  - `UnmapViewOfFile` and `UnmapViewOfFileEx` of a view that contains any of it (the whole view is tested).
+
+  `XMemFree`/`XMemFreeDefault` of a pinned block is deferred until the pin goes; the block stays owned until then.
+
+  `VirtualFree`, `VirtualProtect`, `UnmapViewOfFile` and `UnmapViewOfFileEx` are now shims, next to `VirtualAlloc`
+  in the same kernel32, kernelbase and `api-ms-win-core-memory-*` names. The shim and host counts in the tables
+  above were measured before these shims existed, so they are off by up to four imports for a module that imports
+  them. With no pin, the shims call the host functions unchanged. The served `VirtualAlloc`, `XMemVirtualAlloc`,
+  `VirtualFree` and unmap calls also keep xmem's record of which allocations belong to the title. A release done
+  through raw host or NT calls leaves that record stale, which is outside the contract. A pin is a logical
+  reservation, not an OS page lock. `xmem_test` covers each refusal.
 
 ## The retail executable (RT-5)
 
