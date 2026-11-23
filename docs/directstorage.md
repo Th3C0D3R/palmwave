@@ -15,21 +15,42 @@ upstream PR #4348 ([UPSTREAM.md](../UPSTREAM.md#directstorage-factory)).
 | Factory id `{62959d11-d45f-4884-a0a3-f7862ea243ae}` | measured | the local offline boot (the id the title passes). The public OpenScarlett header (MIT) names it `IDStorageFactoryX2` |
 | Factory slot 8 `SetStagingBufferSize(UINT32)` and slot 10 `CreateQueue1(desc1, REFIID, void**)` | sourced, reviewed | the PR's declaration order. The native review matched it against FiveStar (GPL-3.0-or-later) and OpenScarlett. `dstorage_test` pins both slots through the raw vtable |
 | Factory slots 3-7 and 9 | PR order, unverified | PC `dstorage.h` order plus the GDK overview. FiveStar agrees on 4 (`OpenFile`) and 5 (`CreateStatusArray`) |
-| Queue and status-array interface ids | **not measured locally** | none is accepted yet; see below |
-| Queue and file signatures | primary Xbox documentation | Microsoft documents `HANDLE GetHandle()` on FileX and adds `EnqueueSetEvent` in QueueX1 after base QueueX methods. Other projects disagree, so their alternate tables are not adopted. Exact ordinals remain source-derived. |
+| File id `{43704f9f-27c6-4a9f-8815-d16527894df4}` | measured | the local `OpenFile` request; the public OpenScarlett header names it `IDStorageFileX_Xbox` |
+| Queue and status-array interface ids | **not measured** | none is accepted yet; see below |
+| File API | primary documentation; ordinal sourced | Microsoft's Xbox `IDStorageFileX` exposes `Close()` and `HANDLE GetHandle()`. The PR places these at slots 3 and 4; the synthetic test pins this table, without claiming a local retail slot measurement |
+| Queue inheritance | primary documentation; ordinals sourced | Microsoft's `IDStorageQueueX` includes `EnqueueSignal`; X1 adds `EnqueueSetEvent`, and X2 adds `Query1`. This matches the PR's inheritance, not OpenScarlett's swapped signal/event methods or additional slots 14-15 |
 | Struct layouts, `E_DSTORAGE_*` values, capacity bounds | sourced | the GDK reference and the PC `dstorage.h`/`dstorageerr.h` 1.3.0, pinned with `static_assert` in `dstorage_xs_abi.h` |
 
 ## Interface ids: strict
 
 The creating calls (`DStorageGetFactory`, `CreateQueue`, `CreateQueue1`, `OpenFile`, `CreateStatusArray`) and every
 `QueryInterface` apply the same rule. They accept `IUnknown`, or an id that `kKnownInterfaceIds` in `dstorage_xs_abi.h`
-lists for that kind of object. Today that list has only the retail factory id. Any other id gets `E_NOINTERFACE`,
+lists for that kind of object. Today that list has the factory and file ids above. Any other id gets `E_NOINTERFACE`,
 with `*ppv` cleared and nothing created or opened. Refused ids include unknown ones, another kind's id, system COM
 ids, and every PC DirectStorage id, including `IDStorageStatusArray`, whose shape happens to match. Each refusal is
 logged once per caller as `[rt] dstorage: <caller> asked for {id}: <reason> (E_NOINTERFACE)`. Nothing is learned at
 run time, so the same id is refused again. The PR's policy of accepting and remembering any new id was removed.
 
-**Measured next blocker:** the offline probe reaches `OpenFile` and requests file id `{43704f9f-27c6-4a9f-8815-d16527894df4}`. This revision refuses it. The follow-up must pair that id with the documented Xbox `GetHandle` contract. Queue and status ids have not yet been observed locally.
+An unrecognized queue or status-array id still returns `E_NOINTERFACE` and is logged for the next investigation.
+Published candidate ids do not establish their whole method table. A new supported id needs evidence for its API
+and tests of the corresponding table; the next local call determines which interface needs attention.
+
+## File API and handle ownership
+
+The public Xbox reference specifies [`IDStorageFileX::GetHandle()`][file-handle], returning a readable Win32 handle
+with no output-buffer parameter. The caller owns and closes that handle. The PC API instead has
+[`IDStorageFile::GetFileInformation(BY_HANDLE_FILE_INFORMATION*)`][pc-file-info]. FiveStar explicitly marks its
+corresponding method unobserved, and OpenScarlett substitutes its own eight-byte `DSTORAGE_FILE_INFO`. Neither
+substitution establishes an Xbox output structure, so this shim retains the documented `GetHandle` signature.
+
+[`IDStorageFileX::Close()`][file-close] closes the file regardless of COM reference count, waits for outstanding I/O,
+and prevents later DirectStorage requests. Final `Release` also closes it. Here, `ReOpenFile` gives each `GetHandle`
+caller an independently owned handle and file position; those handles remain valid after the object closes or is
+released. The existing pending-request accounting and close behavior are unchanged.
+
+[file-handle]: https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/dstorage/interfaces/idstoragefilex/methods/idstoragefilex_gethandle?view=gdk-2510
+[file-close]: https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/dstorage/interfaces/idstoragefilex/methods/idstoragefilex_close?view=gdk-2510
+[pc-file-info]: https://learn.microsoft.com/en-us/windows/win32/dstorage/dstorage/nf-dstorage-idstoragefile-getfileinformation
 
 ## What the shim does
 
@@ -77,6 +98,8 @@ Nothing here goes online, sends telemetry or touches the GPU. Logging goes to st
 - **Added for Palmwave:**
   - Raw-vtable calls to slot 8 and slot 10 on the factory that `xcrdapi.dll` returns for the retail id. The test
     checks size validation and the lock, and that the queue slot 10 creates really reads file bytes.
+  - The named file IID and raw slots 0/2/3/4: interface identity, rejected-IID output clearing, readable handles,
+    independent file positions, and caller-owned handles surviving explicit `Close` and final `Release`.
   - Strict-id rejection: each id is asked twice, every refused output is cleared, and a refused id creates no queue
     and opens no file.
   - Unsupported requests leave a sentinel destination unchanged and are recorded as failures.
@@ -86,7 +109,7 @@ an HRESULT, and that other `xcrdapi.dll` names are not.
 
 ## Not done
 
-- The queue, file and status interface ids and their vtables, as described above.
+- The queue and status interface ids and local verification of sourced method ordinals, as described above.
 - zlib/DEFLATE, then BCPack (`tools/bcpack.py` is the reference decoder), then swizzle, as stages between the read
   and the destination write.
 - Physical pages (this needs `xmem` page-number translation).
@@ -98,8 +121,10 @@ an HRESULT, and that other `xcrdapi.dll` names are not.
 | Source | Use |
 |---|---|
 | [upstream PR #4348](https://github.com/ItsNotRexed/Leonida/pull/4348), mariuslozo-boop, commit `45c39cf6f4148aebbc8a88d476bea755887d35bd`, GPL-3.0 | Code adapted (`dstorage.cpp`, `dstorage_xs_abi.h`, `dstorage_test.cpp`) |
-| ThatRecompDev/five-star-recomp `ff2a5dd95094fdceb5efdca9fd3236b7fa97076e`, GPL-3.0-or-later | Slot facts cited by the native review; no code copied |
-| californiaAlmonds/OpenScarlett `0cbc742aa607bb19e3a580bfb81442cfcd99e39c`, MIT | Interface name and slot facts cited by the native review; no code copied |
+| ThatRecompDev/five-star-recomp `ff2a5dd95094fdceb5efdca9fd3236b7fa97076e`, GPL-3.0-or-later | Factory slots corroborated by source review; its unobserved file method is distinguished from the Xbox API; no code copied |
+| californiaAlmonds/OpenScarlett `0cbc742aa607bb19e3a580bfb81442cfcd99e39c`, MIT | Interface ids and names; conflicting method assumptions are not adopted; no code copied |
 | GDK DStorage reference and overview on Microsoft Learn; PC `dstorage.h`/`dstorageerr.h` 1.3.0 | Names, signatures, structures, error values (as recorded by the PR); facts only |
+| Microsoft [QueueX1][queue-x1] and [QueueX2][queue-x2] interface references | Xbox inheritance: X1 adds `EnqueueSetEvent`, X2 adds `Query1`; no speculative auto-submit methods appended |
 
-Xbox file signature reference: [Microsoft IDStorageFileX::GetHandle](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/dstorage/interfaces/idstoragefilex/methods/idstoragefilex_gethandle?view=gdk-2510).
+[queue-x1]: https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/dstorage/interfaces/idstoragequeuex1/idstoragequeuex1?view=gdk-2604
+[queue-x2]: https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/dstorage/interfaces/idstoragequeuex2/idstoragequeuex2?view=gdk-2604

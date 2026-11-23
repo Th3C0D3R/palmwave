@@ -25,12 +25,12 @@ The early TLS-index-zero reservation, host-template clone and synthetic `/GA` lo
 A local offline boot stopped at `xcrdapi.dll!DStorageGetFactory`, with factory id `62959d11-d45f-4884-a0a3-f7862ea243ae`. The PR's CPU file and memory queues, status arrays, fences, events, cancellation and error records are kept as written.
 
 Palmwave changed the following:
-- The PR learned unknown interface ids at run time and accepted the PC `IDStorageStatusArray` id. Both are replaced by a strict table that holds only the measured retail factory id.
+- The PR learned unknown interface ids at run time and accepted the PC `IDStorageStatusArray` id. Both are replaced by a strict table that holds the measured factory and file ids for their respective objects.
 - `OpenFile` no longer falls back to the host `CreateFileW` when the file-system shim is absent.
 - `xcrdapi.dll` is registered as the primary name.
-- Tests were added for raw factory slots 8 and 10, strict-id rejection and unsupported-request sentinels.
+- Tests were added for raw factory slots 8 and 10, the named file IID and raw `GetHandle` slot 4, strict-id rejection and unsupported-request sentinels. The file test checks caller-owned handle lifetime across explicit close and final release.
 
-FiveStar (GPL-3.0-or-later) and OpenScarlett (MIT) were consulted for ABI facts only, through the native review; no code was copied from either. The adaptation was written with Claude Code (Claude Opus 5.5). Test results are recorded where root runs them, not here. See [docs/directstorage.md](docs/directstorage.md).
+FiveStar (GPL-3.0-or-later) and OpenScarlett (MIT) were consulted for ABI facts only, through source review; no code was copied from either. Microsoft's public Xbox documentation confirms `GetHandle`, whose signature differs from the siblings' `GetFileInformation` assumptions. The base adaptation was written with Claude Code (Claude Opus 5.5); OpenAI Codex added the measured file IID, handle-ownership tests and documentation correction. Test results are recorded separately. See [docs/directstorage.md](docs/directstorage.md).
 
 ## Project identity and tools
 

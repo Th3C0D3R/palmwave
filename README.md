@@ -49,7 +49,7 @@ Measured on **Ryzen 9 9950X3D / NVIDIA RTX 5080 16 GB / driver 621.14 / Windows 
 | Embedded FSPX shaders | 29 / 29 translated and SPIR-V valid with the native decoder; GPU semantics not yet verified |
 | GPU pipeline creation | In progress; full-pass result pending |
 | Retail dry-run / initialization | Both exit 0; four DLL initializations succeed |
-| Retail execution | Runtime export, TLS-slot-zero and DirectStorage factory blockers cleared; now stops at a refused file interface before D3D12 |
+| Retail execution | Vulkan device creation succeeds on RTX 5080; next stop is a device-call ABI mismatch before rendering |
 | First rendered frame | Not verified |
 
 These counts are preparation results, not gameplay or rendering results. Historical measurements in the inherited `docs/` remain attributed to their original authors and hardware.

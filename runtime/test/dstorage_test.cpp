@@ -3,7 +3,7 @@
 //
 // Provenance: adapted from upstream PR #4348 by mariuslozo-boop (commit 45c39cf6f4148aebbc8a88d476bea755887d35bd,
 // GPL-3.0); see UPSTREAM.md. Palmwave additions: raw factory slot 8/10 calls with the retail factory id, the strict
-// interface-id checks (nothing learned, no PC id accepted) and the unsupported-request checks.
+// interface-id checks (nothing learned, no PC id accepted), named file/GetHandle ownership and unsupported requests.
 #include <windows.h>
 #include <d3d12.h>
 
@@ -47,11 +47,11 @@ void check_hr(HRESULT got, HRESULT want, const char* what) {
     }
 }
 
-// The factory id is the one the retail executable passes. No console queue, file or status-array id is measured, so
-// those objects are created with IUnknown, the only id the shim accepts for them.
+// Factory and file ids were confirmed locally. No console queue or status-array id is measured, so those objects
+// are created with IUnknown, the only id the shim accepts for them.
 const GUID kFactoryId = kRetailFactoryId;
 const GUID kQueueId = __uuidof(IUnknown);
-const GUID kFileId = __uuidof(IUnknown);
+const GUID kFileId = kRetailFileId;
 const GUID kStatusId = __uuidof(IUnknown);
 // Made-up ids a strict policy must refuse every time.
 constexpr GUID kUnknownId = {0x5eed0001, 0x2222, 0x4222, {0x82, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x01}};
@@ -263,7 +263,7 @@ void test_registry(Env& env) {
     if (again) static_cast<IUnknown*>(again)->Release();
 }
 
-// The retail caller reaches SetStagingBufferSize at slot 8 and CreateQueue1 at slot 10 (native review). Call both
+// Public-source review places SetStagingBufferSize at slot 8 and CreateQueue1 at slot 10. Call both
 // through the raw vtable of the object DStorageGetFactory returns for the retail id, independent of the C++
 // declarations, and check they behave as those methods: slot 8 validates sizes and is locked by a live queue; slot 10
 // reads a DSTORAGE_QUEUE_DESC1 and its queue really reads a file.
@@ -389,7 +389,7 @@ void test_factory_checks(Env& env) {
 // refusal clears the output. Each refused id is asked twice, so a policy that learns from the first call fails here.
 void test_strict_iids(Env& env) {
     auto get = get_factory_fn("xcrdapi.dll");
-    const GUID refused_factory[] = {kUnknownId, kUnknownId2, kIMarshal, kPcFactoryId, kPcStatusArrayId};
+    const GUID refused_factory[] = {kUnknownId, kUnknownId2, kIMarshal, kPcFactoryId, kPcStatusArrayId, kRetailFileId};
     for (const GUID& g : refused_factory)
         for (int round = 0; round < 2; ++round) {
             void* out = reinterpret_cast<void*>(1);
@@ -402,7 +402,7 @@ void test_strict_iids(Env& env) {
     const DSTORAGE_QUEUE_DESC1 d = queue_desc();
     DSTORAGE_QUEUE_DESC d0{};
     d0.Capacity = 0x80;
-    const GUID refused_queue[] = {kUnknownId, kPcQueueId, kRetailFactoryId, kIMarshal};
+    const GUID refused_queue[] = {kUnknownId, kPcQueueId, kRetailFactoryId, kRetailFileId, kIMarshal};
     for (const GUID& g : refused_queue)
         for (int round = 0; round < 2; ++round) {
             void* out = reinterpret_cast<void*>(1);
@@ -419,7 +419,7 @@ void test_strict_iids(Env& env) {
             check_hr(env.factory->OpenFile(L"GAME:\\data\\b.bin", g, &out), E_NOINTERFACE, "OpenFile refuses the id");
             check(out == nullptr, "a refused OpenFile clears ppv");
         }
-    const GUID refused_status[] = {kUnknownId, kPcStatusArrayId, kRetailFactoryId};
+    const GUID refused_status[] = {kUnknownId, kPcStatusArrayId, kRetailFactoryId, kRetailFileId};
     for (const GUID& g : refused_status)
         for (int round = 0; round < 2; ++round) {
             void* out = reinterpret_cast<void*>(1);
@@ -459,6 +459,71 @@ void test_strict_iids(Env& env) {
     s->Release();
     b->Release();
     q->Release();
+}
+
+// The Xbox file API returns a caller-owned HANDLE at slot 4, with no output structure. Exercise the named IID and
+// raw slots, including both explicit Close and final Release: neither may invalidate an already returned handle.
+void test_raw_file_slots(Env& env) {
+    using QueryFn = HRESULT(STDMETHODCALLTYPE*)(void*, REFIID, void**);
+    using ReleaseFn = ULONG(STDMETHODCALLTYPE*)(void*);
+    using CloseFn = void(STDMETHODCALLTYPE*)(void*);
+    using GetHandleFn = HANDLE(STDMETHODCALLTYPE*)(void*);
+    for (bool explicit_close : {false, true}) {
+        void* raw = nullptr;
+        check_hr(env.factory->OpenFile(L"GAME:\\data\\a.bin", kRetailFileId, &raw), S_OK,
+                 "OpenFile accepts the named Xbox file IID");
+        if (!raw) return;
+        void** vt = *static_cast<void***>(raw);
+        auto query = reinterpret_cast<QueryFn>(vt[0]);
+        auto release = reinterpret_cast<ReleaseFn>(vt[2]);
+        auto close = reinterpret_cast<CloseFn>(vt[3]);
+        auto get_handle = reinterpret_cast<GetHandleFn>(vt[4]);
+        for (const GUID& id : {kRetailFileId, __uuidof(IUnknown)}) {
+            void* out = nullptr;
+            check_hr(query(raw, id, &out), S_OK, "file QueryInterface accepts its IID and IUnknown");
+            check(out == raw, "file QueryInterface preserves COM identity");
+            if (out) check(release(out) == 1, "file QueryInterface adds a reference");
+        }
+        for (const GUID& id : {kUnknownId, kPcFileId, kRetailFactoryId}) {
+            void* out = reinterpret_cast<void*>(1);
+            check_hr(query(raw, id, &out), E_NOINTERFACE, "file QueryInterface rejects unknown, PC and factory IIDs");
+            check(out == nullptr, "file QueryInterface refusal clears the output");
+        }
+
+        HANDLE first = get_handle(raw);
+        HANDLE survivor = get_handle(raw);
+        const bool first_valid = first && first != INVALID_HANDLE_VALUE;
+        const bool survivor_valid = survivor && survivor != INVALID_HANDLE_VALUE;
+        check(first_valid && survivor_valid && first != survivor, "slot 4 returns separate caller-owned handles");
+        LARGE_INTEGER size{};
+        check(first_valid && GetFileSizeEx(first, &size) &&
+                  static_cast<uint64_t>(size.QuadPart) == env.a_overlay.size(),
+              "slot 4's readable handle names the overlay file");
+        uint8_t byte = 0;
+        DWORD got = 0;
+        check(first_valid && ReadFile(first, &byte, 1, &got, nullptr) && got == 1 && byte == env.a_overlay[0],
+              "first returned handle reads the expected byte");
+        check(survivor_valid && ReadFile(survivor, &byte, 1, &got, nullptr) && got == 1 && byte == env.a_overlay[0],
+              "returned handles have independent file positions");
+        if (first_valid) check(CloseHandle(first) != 0, "the caller closes its first handle");
+        HANDLE probe = get_handle(raw);
+        check(probe && probe != INVALID_HANDLE_VALUE, "closing a returned handle leaves the file object open");
+        if (probe && probe != INVALID_HANDLE_VALUE) CloseHandle(probe);
+
+        if (explicit_close) {
+            close(raw);
+            SetLastError(ERROR_SUCCESS);
+            const HANDLE closed = get_handle(raw);
+            const DWORD error = GetLastError();
+            check(closed == INVALID_HANDLE_VALUE && error == ERROR_INVALID_HANDLE,
+                  "slot 3 Close prevents subsequent GetHandle calls");
+            close(raw);  // idempotent, even while a separate caller-owned handle remains open
+        }
+        check(release(raw) == 0, "final Release destroys the named file object");
+        check(survivor_valid && ReadFile(survivor, &byte, 1, &got, nullptr) && got == 1 && byte == env.a_overlay[1],
+              "the caller's handle stays readable after Close and final Release");
+        if (survivor_valid) check(CloseHandle(survivor) != 0, "the surviving handle is closed by its caller");
+    }
 }
 
 void test_open_paths(Env& env) {
@@ -1166,6 +1231,7 @@ int main() {
     test_raw_factory_slots(env);
     test_factory_checks(env);
     test_strict_iids(env);
+    test_raw_file_slots(env);
     test_open_paths(env);
     test_reads_and_errors(env);
     test_unsupported_reads(env);

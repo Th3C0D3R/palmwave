@@ -217,7 +217,8 @@ Current limits, by design:
 
 - `xcrdapi.dll` (the retail import), with `dstorage_xs.dll` / `dstorage.dll` as aliases — `DStorageGetFactory`:
   the console DirectStorage factory (`shims/dstorage.cpp`, declarations in `shims/dstorage_xs_abi.h`, adapted from
-  upstream PR #4348). Only the measured retail factory id and `IUnknown` are accepted. Files open through the
+  upstream PR #4348). Only the measured factory/file ids and `IUnknown` are accepted for their respective objects.
+  The Xbox file interface returns a caller-owned handle through `GetHandle`. Files open through the
   `GAME:` mapping and the overlay; each queue reads file or memory ranges on its own CPU worker thread and reports
   through status arrays, `ID3D12Fence` signals and events. zlib, BCPack, swizzle and physical-page requests fail
   with `E_NOTIMPL`. See [docs/directstorage.md](../docs/directstorage.md).

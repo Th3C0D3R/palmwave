@@ -20,7 +20,7 @@ Source revision: original upstream `dde82f27e994337094afc476ded0b1426f6e87e2`, m
 | Driver pipeline creation | Running on RTX 5080; final full-corpus counts pending |
 | Retail dry-run | Exit 0; five modules mapped |
 | Retail initialization | Exit 0; four DLL initializations succeed |
-| Retail execution | Runtime export, TLS-slot-zero and DirectStorage factory blockers cleared; next stop is a refused file interface before D3D12 |
+| Retail execution | Vulkan device created on RTX 5080; next stop is the struct-return ABI of device slot 26 |
 | First rendered frame | Not verified |
 
 The scanner candidate is not counted as a shader translation failure. Generated data and full logs are private and stored outside the authoring repository. No game assets have been added to Git.
@@ -52,3 +52,6 @@ The build now explicitly selects the existing Python RDNA2 decoder for its FSPX 
 ## DirectStorage factory
 
 The offline run now passes factory creation and reaches `OpenFile`, which refuses an unrecognized file interface. The shim serves real CPU file/memory queues adapted from upstream PR #4348, with strict interface checks and no host-open fallback when the file-system shim is absent. Both focused CTests (`dstorage`, `unimplemented_policy`) passed in 0.53 seconds. These are synthetic CPU checks; the retail probe on the RTX 5080 still stops before any D3D12 trace or rendered frame. This is a first-chance debugger stop, not a successful guest exit.
+## Graphics device reached
+
+The named Xbox file interface now preserves the documented `GetHandle` contract. Its raw-vtable and lifetime regression brings DirectStorage coverage to 458 checks with zero failures; both focused CTests passed in 0.44 seconds on CPU. The next offline run reports `D3D12XboxCreateDevice ok` on the RTX 5080, with 19 startup events, four successful DLL initializations and no unimplemented-import event. Execution then stops on an access violation in device slot 26, before a draw or presentation. Debugging confirms a struct-return buffer is mistaken for the device pointer; this matches the `GetCustomHeapProperties` ABI issue already documented in the inherited boot chain. No frame is claimed.

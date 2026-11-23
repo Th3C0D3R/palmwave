@@ -3,13 +3,13 @@
 // Provenance: adapted from upstream PR #4348 by mariuslozo-boop (commit 45c39cf6f4148aebbc8a88d476bea755887d35bd,
 // GPL-3.0); see UPSTREAM.md. Palmwave's own declarations: names, member order and types follow the public GDK reference
 // (learn.microsoft.com/gaming/gdk/docs/reference/system/dstorage); no Microsoft header is copied. Palmwave changes:
-// the interface-id section (one measured retail id, no PC id accepted for a console object) and the slot constants.
+// the interface-id section (measured factory and file ids, no PC id accepted for a console object) and slot constants.
 //
 // VERIFY (docs/directstorage.md "What is not measured"):
 //   - Vtable order. The reference lists methods alphabetically; the order below is the PC dstorage.h order for the
-//     methods both APIs share, with the console-only ones where the GDK overview lists them. A public-source review of the
-//     sibling implementations places the factory's SetStagingBufferSize at slot 8 and CreateQueue1 at slot 10, which this
-//     order gives (kFactorySlot* below; dstorage_test calls both through the raw vtable).
+//     methods both APIs share, with the console-only ones where the GDK overview lists them. Public-source review
+//     agrees on the factory's SetStagingBufferSize at slot 8 and CreateQueue1 at slot 10, which this order gives
+//     (kFactorySlot* below; dstorage_test calls both through the raw vtable). These ordinals are not locally measured.
 //   - The capacity bounds, DSTORAGE_REQUEST_MAX_NAME and the E_DSTORAGE_* values are the PC header's.
 #pragma once
 #include <windows.h>
@@ -312,6 +312,7 @@ struct IDStorageStatusArrayX : IUnknown {
 
 struct IDStorageFileX : IUnknown {
     virtual void STDMETHODCALLTYPE Close() = 0;
+    // The public Xbox reference specifies HANDLE GetHandle(), not the PC GetFileInformation(out*) method.
     virtual HANDLE STDMETHODCALLTYPE GetHandle() = 0;
 };
 
@@ -352,8 +353,8 @@ struct IDStorageFactoryX2 : IDStorageFactoryX1 {
     virtual HRESULT STDMETHODCALLTYPE CreateQueue1(const DSTORAGE_QUEUE_DESC1* desc, REFIID riid, void** ppv) = 0;
 };
 
-// The factory's vtable slots in the order above (IUnknown is 0-2). The retail caller's slot 8 and slot 10 are the
-// two a native review matched; dstorage_test calls these through the raw vtable, not through the C++ declarations.
+// The factory's vtable slots in the order above (IUnknown is 0-2). Public-source review corroborates slots 8 and 10;
+// dstorage_test calls these through the raw vtable, not through the C++ declarations. See docs/directstorage.md.
 constexpr unsigned kFactorySlotCreateQueue = 3;
 constexpr unsigned kFactorySlotOpenFile = 4;
 constexpr unsigned kFactorySlotCreateStatusArray = 5;
@@ -367,14 +368,16 @@ using DStorageGetFactoryFn = HRESULT(WINAPI*)(REFIID riid, void** ppv);
 
 // ---- Interface ids -------------------------------------------------------------------------------------------------
 //
-// Strict: an object is handed out only for IUnknown or for an id listed here for its kind. The console interfaces'
-// ids are not public; an id is added here only when a retail call has been measured passing it. Nothing is learned at
+// Strict: an object is handed out only for IUnknown or for an id listed here for its kind. The public OpenScarlett
+// header names these console ids; local calls confirmed the two requests below. Nothing is learned at
 // run time, and no PC DirectStorage id is accepted for a console object, whatever its method shape.
 
 // The id the retail executable passes to DStorageGetFactory (confirmed by the local offline boot). Which interface
-// version it names is not measured; the factory served is the IDStorageFactoryX2 layout, whose first slots are those of
-// IDStorageFactoryX and IDStorageFactoryX1.
+// version it names comes from the public OpenScarlett header: IDStorageFactoryX2. Its method order remains sourced,
+// rather than locally measured.
 constexpr GUID kRetailFactoryId = {0x62959d11, 0xd45f, 0x4884, {0xa0, 0xa3, 0xf7, 0x86, 0x2e, 0xa2, 0x43, 0xae}};
+// IDStorageFileX: public IID corroborated by OpenFile; the Microsoft Xbox API specifies Close and GetHandle.
+constexpr GUID kRetailFileId = {0x43704f9f, 0x27c6, 0x4a9f, {0x88, 0x15, 0xd1, 0x65, 0x27, 0x89, 0x4d, 0xf4}};
 
 enum class ObjectKind { Factory, Queue, File, StatusArray };
 
@@ -386,7 +389,8 @@ struct KnownInterfaceId {
 
 constexpr KnownInterfaceId kKnownInterfaceIds[] = {
     {kRetailFactoryId, ObjectKind::Factory, "retail DStorageGetFactory id"},
-    // Queue, file and status-array ids: none measured yet. A creating call with one is E_NOINTERFACE and logs it.
+    {kRetailFileId, ObjectKind::File, "IDStorageFileX id"},
+    // Queue and status-array ids: none measured yet. A creating call with one is E_NOINTERFACE and logs it.
 };
 
 // The PC DirectStorage ids (dstorage.h 1.3.0). Refused with a log line that names them; their objects have the PC
