@@ -1,5 +1,4 @@
 """tools/user_sgpr_census.py on hand-written index.json data (no game files, no GPU)."""
-import contextlib
 import json
 import os
 from pathlib import Path
@@ -100,7 +99,7 @@ def test_the_two_packing_models_are_told_apart():
     assert b["below_base"] == {"s1:const32": 1}
 
 
-@pytest.mark.parametrize("output_kind", ["same-path", "relative-alias", "hard-link", "folding-volume-case"])
+@pytest.mark.parametrize("output_kind", ["same-path", "relative-alias", "hard-link"])
 def test_json_report_refuses_to_overwrite_index(tmp_path, capsys, output_kind):
     assert usc.same_report_path is report_paths.same_report_path
     index = tmp_path / "index.json"
@@ -117,23 +116,61 @@ def test_json_report_refuses_to_overwrite_index(tmp_path, capsys, output_kind):
             output.hardlink_to(index)
         except OSError as err:
             pytest.skip(f"hard links unavailable: {err}")
-    elif output_kind == "folding-volume-case":
-        output = tmp_path / "INDEX.JSON"
 
-    probe = mock.Mock(return_value=True)
-    ctx = (mock.patch.multiple(report_paths, path_key=mock.Mock(side_effect=str),
-                               same_name_on_folding_volume=probe)
-           if output_kind == "folding-volume-case" else contextlib.nullcontext())
-    with ctx, (mock.patch.object(os.path, "samefile", side_effect=OSError("not same"))
-               if output_kind == "folding-volume-case" else contextlib.nullcontext()):
-        with pytest.raises(SystemExit) as exc:
-            usc.main([str(index), "--json", str(output)])
-    if output_kind == "folding-volume-case":
-        probe.assert_called_once()
+    with pytest.raises(SystemExit) as exc:
+        usc.main([str(index), "--json", str(output)])
 
     assert exc.value.code == 2
     assert "--json must not overwrite the input index" in capsys.readouterr().err
     assert index.read_bytes() == original
+
+
+def test_json_report_case_only_difference_follows_the_volume(tmp_path, capsys):
+    index = tmp_path / "index.json"
+    output = tmp_path / "INDEX.JSON"
+    original = json.dumps(INDEX).encode("utf-8")
+    index.write_bytes(original)
+    # Ask this volume, not the OS name: Linux mounts can fold case too.
+    if output.exists():
+        with pytest.raises(SystemExit) as exc:
+            usc.main([str(index), "--json", str(output)])
+        assert exc.value.code == 2
+        assert "--json must not overwrite the input index" in capsys.readouterr().err
+    else:
+        assert usc.main([str(index), "--json", str(output)]) == 0
+        assert json.loads(output.read_text(encoding="utf-8"))["ps"]["lowest_pointer_sgpr"] == {"s8": 2, "s9": 1}
+        assert not os.path.samefile(index, output)
+    assert index.read_bytes() == original
+
+
+def test_json_report_refuses_case_alias_detected_by_volume(tmp_path, capsys):
+    """A folding volume must protect the input even when name rules and samefile cannot identify the alias."""
+    index = tmp_path / "index.json"
+    output = tmp_path / "INDEX.JSON"
+    original = json.dumps(INDEX).encode("utf-8")
+    index.write_bytes(original)
+
+    def samefile(first, second):
+        if first != second:
+            raise OSError("file identity unavailable")
+        return os.path.samefile(first, second)
+
+    def exists(path):
+        return os.path.exists(os.path.join(os.path.dirname(path), os.path.basename(path).lower()))
+
+    # Simulate the filesystem primitives, leaving the actual collision guard and scratch probe in use.
+    path_api = mock.Mock(wraps=os.path, realpath=os.path.abspath, normcase=str,
+                         samefile=mock.Mock(side_effect=samefile), exists=mock.Mock(side_effect=exists))
+    with mock.patch.multiple(report_paths, os=mock.Mock(wraps=os, path=path_api),
+                             sys=mock.Mock(platform="linux")):
+        with pytest.raises(SystemExit) as exc:
+            usc.main([str(index), "--json", str(output)])
+
+    path_api.exists.assert_called()
+    assert exc.value.code == 2
+    assert "--json must not overwrite the input index" in capsys.readouterr().err
+    assert index.read_bytes() == original
+    assert list(tmp_path.iterdir()) == [index]
 
 
 def test_json_report_accepts_a_separate_output(tmp_path):
