@@ -14,8 +14,10 @@ Source revision: original upstream `dde82f27e994337094afc476ded0b1426f6e87e2`, m
 | Disassembly | 26,503 clean results |
 | Runtime compilation | 684 build steps completed |
 | Vulkan in the intended offline sandbox | Initialization and enumeration succeed; no rendering test implied |
-| Full-corpus translation/validation | Running; final counts pending |
-| Driver pipeline creation | Pending |
+| Main-corpus translation/validation | 26,503 / 26,503 translated and SPIR-V valid; 24 min 25 s translation |
+| Embedded BVH programs | 52 / 52 translated and SPIR-V valid |
+| Embedded FSPX programs | 18 / 29 translated and valid; 11 rejected: fall-through into undecodable words |
+| Driver pipeline creation | Running on RTX 5080; final full-corpus counts pending |
 | Retail execution and frame | Pending; no rendered frame claimed |
 
 The scanner candidate is not counted as a shader translation failure. Generated data and full logs are private and stored outside the authoring repository. No game assets have been added to Git.
@@ -29,3 +31,7 @@ The planned retail run uses a Windows AppContainer token with no Internet or pri
 Record the code revision, mode, exit code, event counts, first failure class and GPU/driver. Inspect the actual presented image before claiming a first rendered frame. Keep raw game traces, addresses paired with proprietary dumps, shader listings and screenshots containing game assets out of this repository.
 
 Project: [Palmwave / Moon AI](https://realmoon.ai). Source provenance: [UPSTREAM.md](UPSTREAM.md).
+
+## Synthetic regression baseline
+
+The first full semantic run executed 5,956 tests across 447 files in 245 seconds, with two files failing because of stale fixtures: CUBE d16 rejection and a constant-EXEC assumption in atomic guard checks. Focused corrections add positive coverage and negative controls without changing translator code. A complete rerun is pending. `compileall` passed. These are CPU/tool validations, not game rendering tests.

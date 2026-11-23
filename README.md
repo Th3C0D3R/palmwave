@@ -44,7 +44,10 @@ Measured on **Ryzen 9 9950X3D / NVIDIA RTX 5080 16 GB / driver 621.14 / Windows 
 | Native shader unpacking | 26,503 FSSM blobs; no unpacking problems |
 | LLVM disassembly | 26,503 / 26,503 clean |
 | Windows runtime build | 684 / 684 build steps completed |
-| Full-corpus SPIR-V validation and GPU pipelines | In progress; no success claimed yet |
+| Main-corpus SPIR-V validation | 26,503 / 26,503 passed |
+| Embedded BVH shaders | 52 / 52 translated and SPIR-V valid |
+| Embedded FSPX shaders | 18 / 29 translated and valid; 11 rejected as undecodable fall-through |
+| GPU pipeline creation | In progress; full-pass result pending |
 | Retail dry-run, initialization, execution | Not yet performed in this project |
 | First rendered frame | Not verified |
 
