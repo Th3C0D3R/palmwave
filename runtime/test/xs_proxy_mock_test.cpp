@@ -367,6 +367,16 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
                 out->VisibleNodeMask = kHeapMarker;
                 return a1;  // a struct-returning method hands the buffer's address back in RAX
             }
+            case 41:                                                        // CreateCommandSignature(desc, ...)
+                if (const auto* desc = reinterpret_cast<const D3D12_COMMAND_SIGNATURE_DESC*>(a1)) {
+                    m->array[41][0] = desc->ByteStride | std::uint64_t{desc->NumArgumentDescs} << 32;
+                    for (UINT i = 0; desc->pArgumentDescs && i < desc->NumArgumentDescs && i < 3; ++i) {
+                        std::uint32_t type = 0;  // read as its 32 bits: a console type is outside the enum's range
+                        std::memcpy(&type, &desc->pArgumentDescs[i].Type, sizeof(type));
+                        m->array[41][i + 1] = type;
+                    }
+                }
+                break;
             case 50: copy_array(m, slot, a3, a2); break;                    // (flags, count, objects, fence, value)
             default: break;
         }
@@ -1281,6 +1291,21 @@ int check_xbox_slots() {
         EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&list_iid), word(&list))) == E_NOTIMPL);
         EXPECT(!list && mock->calls[12] == 1);
     }
+
+    // Only the measured standalone dispatch is translated. The caller keeps its console descriptor.
+    D3D12_INDIRECT_ARGUMENT_DESC arg{};
+    constexpr std::uint32_t console_type = 105;
+    std::memcpy(&arg.Type, &console_type, sizeof(console_type));
+    D3D12_COMMAND_SIGNATURE_DESC sig{12, 1, &arg, 0};
+    const IID iid = __uuidof(ID3D12CommandSignature);
+    void* signature = nullptr;
+    raw(device, 41, word(&sig), 0, word(&iid), word(&signature));
+    EXPECT(mock->calls[41] == 1 && mock->array[41][1] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH);
+    EXPECT(sig.pArgumentDescs == &arg && std::memcmp(&arg.Type, &console_type, sizeof(console_type)) == 0);
+    sig.ByteStride = 16;
+    raw(device, 41, word(&sig), 0, word(&iid), word(&signature));
+    EXPECT(mock->calls[41] == 2 && mock->array[41][1] == console_type);
+    EXPECT(xs::device_slot_overridden(41));
 
     EXPECT(xs::device_slot_overridden(48) && xs::device_slot_overridden(73) && xs::device_slot_overridden(78) &&
            xs::device_slot_overridden(79) && xs::device_slot_overridden(80));

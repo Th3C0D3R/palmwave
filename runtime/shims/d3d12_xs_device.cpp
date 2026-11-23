@@ -179,6 +179,7 @@ const char* slot_name(unsigned slot) {
         case 32: return "OpenSharedHandle (a fence comes back wrapped)";
         case 34: return "MakeResident (proxies unwrapped)";
         case 35: return "Evict (proxies unwrapped)";
+        case 41: return "CreateCommandSignature (Xbox)";
         case 36: return "CreateFence -> fence proxy";
         case 43: return "GetAdapterLuid";
         case 45: return "SetEventOnMultipleFenceCompletion (fence proxies unwrapped)";
@@ -2913,6 +2914,31 @@ void proxy_copy_descriptors_simple(DeviceProxy* self, std::uint64_t num, std::ui
 // The Xbox slot 62 takes two more words between the description and the IID: (desc, w2, w3, riid, out). Measured
 // on the package's XboxBvhBuilder.dll (its constructor passes w2 = w3 = 0 and IID_ID3D12PipelineState in the fourth
 // argument), as the prior art had recorded. Their meaning is unknown; non-zero values are logged once.
+// Adapted from mrp1no's ProjectLeonida PR #7163 (GPL-3.0). The single 12-byte Xbox argument
+// is consumed with compute state. Its console queue scheduling remains unknown.
+HRESULT proxy_create_command_signature(DeviceProxy* self, const D3D12_COMMAND_SIGNATURE_DESC* desc,
+                                       ID3D12RootSignature* root, const IID* riid, void** out) {
+    note_slot(41);
+    if (!riid) {
+        if (out) *out = nullptr;
+        return E_POINTER;
+    }
+    if (desc && !root && desc->NumArgumentDescs == 1 && desc->pArgumentDescs &&
+        desc->ByteStride == sizeof(D3D12_DISPATCH_ARGUMENTS) && desc->NodeMask == 0) {
+        std::uint32_t type = 0;
+        static_assert(sizeof(type) == sizeof(desc->pArgumentDescs->Type));
+        std::memcpy(&type, &desc->pArgumentDescs->Type, sizeof(type));
+        if (type == 105) {
+            D3D12_INDIRECT_ARGUMENT_DESC dispatch{};
+            dispatch.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+            auto pc = *desc;
+            pc.pArgumentDescs = &dispatch;
+            return self->real->CreateCommandSignature(&pc, root, *riid, out);
+        }
+    }
+    return self->real->CreateCommandSignature(desc, root, *riid, out);
+}
+
 HRESULT proxy_create_compute_pipeline_state(DeviceProxy* self, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
                                             std::uint64_t w2, std::uint64_t w3, const IID* riid, void** out) {
     note_slot(62);
@@ -3946,6 +3972,10 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
     } else if constexpr (Slot == 24) {
         proxy_copy_descriptors_simple(self, a1, a2, a3, a4);
         return 0;
+    } else if constexpr (Slot == 41) {
+        return hr_to_u64(proxy_create_command_signature(self,
+            reinterpret_cast<const D3D12_COMMAND_SIGNATURE_DESC*>(a1), reinterpret_cast<ID3D12RootSignature*>(a2),
+            reinterpret_cast<const IID*>(a3), reinterpret_cast<void**>(a4)));
     } else if constexpr (Slot == 62) {
         return hr_to_u64(proxy_create_compute_pipeline_state(
             self, reinterpret_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(a1), a2, a3,
@@ -4328,7 +4358,7 @@ std::uint64_t hook_backed_texture_refused_calls() { return g_hook_backed_refused
 bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || (slot >= 17 && slot <= 24) || slot == 25 || slot == 26 ||
         slot == 31 || slot == 32 || slot == 34 ||
-        slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
+        slot == 35 || slot == 36 || slot == 41 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
         slot == 70 || slot == 75 || slot == 76 || slot == kCreateCommittedResource3X || slot == 133 ||
         (slot >= 92 && slot <= 95) || (slot >= 108 && slot <= 110) || slot == 112)
         return true;

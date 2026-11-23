@@ -335,3 +335,9 @@ validation report remain outside the repositories. No new executable startup or 
 The combined runtime build passed. Its focused CTest run completed in 1.98 seconds with six passes and one explicit
 skip for D3D12 negative placement. It included the ABI marker, JSON loader, address arithmetic, host-read barrier,
 positive D3D12 import and native negative-address shader checks.
+
+## Xbox indirect signature type 105
+
+Palmwave adapts the slot 41 dispatch interpretation and mock recorder from mrp1no's [ProjectLeonida PR #7163](https://github.com/ProjectLeonida/Leonida/pull/7163), [revision 084c8c6](https://github.com/ProjectLeonida/Leonida/pull/7163/commits/084c8c60e7e839d0caefaaeccf41a6348b062cf1), under GPL-3.0. This PR was closed without merging. Its call-site evidence identifies compute state and a 12-byte indirect argument. Palmwave translates the observed single argument on node zero with no root signature, using a stack copy. Other shapes reach the ordinary backend validation. The console scheduling semantics are open. Five-star-recomp corroborates the type value independently. No code from five-star-recomp was used here.
+
+The CPU proxy regression checks the value passed to the backend, the unchanged input and refusal to translate an unmeasured stride. The offline RTX 5080 diagnostic reached four successful command signatures after the fix. The fifth requested a mesh dispatch and returned unsupported. There was no indirect execution or game frame.
