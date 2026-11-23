@@ -9,8 +9,7 @@
   <a href="https://realmoon.ai">Moon AI</a> ·
   <a href="STATUS.md">Measured status</a> ·
   <a href="docs/boot.md">Boot runbook</a> ·
-  <a href="docs/testing.md">Testing</a> ·
-  <a href="UPSTREAM.md">Source credits</a>
+  <a href="docs/testing.md">Testing</a>
 </p>
 <p align="center">
   <img src="https://img.shields.io/badge/boot-graphics_device_reached-08bdb5" alt="Retail startup reaches a graphics device">
@@ -23,9 +22,7 @@ Palmwave is an experimental open-source Xbox Series compatibility layer and shad
 
 **The tested Xbox Series executable starts on PC and reaches Vulkan graphics initialization on NVIDIA RTX 5080. It then stops during startup. No menu or rendered game frame has been observed.**
 
-**Local compatibility milestone: graphics device reached.** The default run creates five queues, five fences, an allocator and the first Xbox command list, then stops at unimplemented list methods 132 and 131. With the explicitly opt-in synchronization and host-memory experiments, the run reaches **581 command lists created and closed, a real 174 MiB buffer import and the first descriptor heap**. It then stops at the title's assertion on the heap's CPU descriptor address. This experimental result does not establish a stable launch or a first frame. Measurements and limitations are recorded in [STATUS.md](STATUS.md); a successful presentation call alone would not establish a rendered image.
-
-Palmwave starts from the GPL-3.0 [Leonida](https://github.com/ItsNotRexed/Leonida) source at `dde82f27e`, with a new Git history. The loader, translator, runtime, tests and technical documentation originate there. Original copyrights, licenses and third-party notices are retained; see [UPSTREAM.md](UPSTREAM.md).
+**Local compatibility milestone: graphics device reached.** The default run creates five queues, five fences, an allocator and the first Xbox command list, then stops at unimplemented list methods 132 and 131. With the explicitly opt-in synchronization and host-memory experiments, the run reaches **581 command lists created and closed, a real 174 MiB buffer import and the first descriptor heap**. It now passes that heap-address assertion and reaches SRV/UAV/CBV calls, then stops at Xbox device slot 70. This experimental result does not establish a stable launch or a first frame. Measurements and limitations are recorded in [STATUS.md](STATUS.md); a successful presentation call alone would not establish a rendered image.
 
 ## What it does
 
@@ -50,10 +47,10 @@ Measured on **Ryzen 9 9950X3D / NVIDIA RTX 5080 16 GB / driver 621.14 / Windows 
 | Main-corpus SPIR-V validation | 26,503 / 26,503 passed |
 | Embedded BVH shaders | 52 / 52 translated and SPIR-V valid |
 | Embedded FSPX shaders | 29 / 29 translated and SPIR-V valid with the native decoder; GPU semantics not yet verified |
-| GPU pipeline creation | In progress; full-pass result pending |
+| GPU pipeline creation | 18,500 completed with zero failures/skips; bulk build stopped to release memory; full-pass result pending |
 | Retail dry-run / initialization | Both exit 0; four DLL initializations succeed |
 | Retail execution | Vulkan device, five queues, five fences, an allocator and the first Xbox command list created on RTX 5080; recording stops at methods 132 and 131 |
-| Opt-in startup diagnostics | 581 lists created and closed; real 174 MiB buffer imported; first descriptor heap created; stops at the CPU descriptor-address assertion; experimental ABI hypotheses |
+| Opt-in startup diagnostics | 581 lists created and closed; real 174 MiB buffer imported; heap-address assertion passed; SRV/UAV/CBV calls reached; stops at device slot 70; experimental ABI hypotheses |
 | First rendered frame | Not verified |
 
 These counts are preparation results, not gameplay or rendering results. Historical measurements in the inherited `docs/` remain attributed to their original authors and hardware.
@@ -71,7 +68,7 @@ $env:VULKAN_SDK = 'C:\VulkanSDK\YOUR_VERSION'
 $env:PATH = "$env:VULKAN_SDK\Bin;$env:PATH"
 $env:LLVM_MC = 'C:\tools\llvm-mc\llvm-mc.exe'
 
-python -I make_game.py --game 'D:\Games\YOUR_READABLE_PACKAGE' --out C:\palmwave-run --work C:\palmwave-work --stages check,shaders,runtime,pipelines --wave64-emulate on
+python -I make_game.py --game 'D:\Games\YOUR_READABLE_PACKAGE' --out C:\palmwave-run --work C:\palmwave-work --stages check,shaders,runtime,pipelines --wave64-emulate on --jobs 2
 ```
 
 This omits the large `assets` stage. Re-run the same command to resume. Wave64 emulation is required for the RTX 5080; cross-half wave operations in vertex, pixel and geometry shaders still have known approximations.
@@ -88,10 +85,8 @@ Read [AGENTS.md](AGENTS.md), [CONTRIBUTING.md](CONTRIBUTING.md), [docs/design.md
 
 Project discussions and issues: [fablinoo/palmwave](https://github.com/fablinoo/palmwave/issues). Upstream contributions remain coordinated with the original project. New work uses small, reviewable commits.
 
-## Credits and license
+## License
 
 **Project:** [Moon AI](https://realmoon.ai), created by **Stellarr Studio**. **Maintainer:** [fablinoo](https://github.com/fablinoo).
 
-**Foundation:** ItsNotRexed and the upstream contributors; the vendored projects retain their own notices. **AI assistance for the initial setup:** OpenAI Codex and image generation; Claude Code was assigned a source review.
-
-Source is distributed under [GPL-3.0](LICENSE), with third-party components under their stated licenses. Palmwave is an independent community project and is not affiliated with Rockstar Games, Take-Two Interactive or Microsoft.
+Source is distributed under [GPL-3.0](LICENSE), with third-party components under their stated licenses. Palmwave is an independent community project and is not affiliated with Microsoft or game publishers.

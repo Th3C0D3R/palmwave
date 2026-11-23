@@ -17,7 +17,7 @@ Source revision: original upstream `dde82f27e994337094afc476ded0b1426f6e87e2`, m
 | Main-corpus translation/validation | 26,503 / 26,503 translated and SPIR-V valid; 24 min 25 s translation |
 | Embedded BVH programs | 52 / 52 translated and SPIR-V valid |
 | Embedded FSPX programs | 29 / 29 translated and SPIR-V valid with the native decoder; previously 18 / 29 with LLVM |
-| Driver pipeline creation | Running on RTX 5080; final full-corpus counts pending |
+| Driver pipeline creation | 18,500 completed with zero failures/skips; bulk build stopped for memory pressure; full-pass counts pending |
 | Retail dry-run | Exit 0; five modules mapped |
 | Retail initialization | Exit 0; four DLL initializations succeed |
 | Retail execution (strict default) | Vulkan device, five queues, five fences, an allocator and the first Xbox command list created; recording stops at methods 132 and 131 |
@@ -141,3 +141,28 @@ startup events, four successful DLL initializations and no unimplemented import.
 1763 `ok`, 11 `called`, 10 `experimental-hypothesis` and one `experimental`. A real 182,452,224-byte buffer import
 succeeds, followed by CreateDescriptorHeap and GetCPUDescriptorHandleForHeapStart, then a guest assertion.
 No Draw, Submit or Present is observed. A first rendered frame is still not verified.
+
+## Descriptor handles and active runtime name
+
+The title allocation hooks now provide the CPU base of each console descriptor heap, and descriptor calls translate
+that base to the real backend heap. A mixed native/custom heap case preserves native PC handles. The typed depth-clear
+adapter preserves the float argument in its register. Four CPU/WARP CTests pass; the independent Vulkan regression on
+RTX 5080 / driver 621.14 passes with validation and synchronization checks: all 192 color bytes and all 16 depth values
+match, with no validation error through device destruction.
+
+The next offline retail run passes the heap-address assertion and reaches SRV/UAV/CBV calls. It records 23 startup
+events, four successful DLL initializations, no unimplemented import, and 1,800 D3D12 events: 1,767 successful, 22 call
+records and 11 experimental records. The next access violation is in the PC method reached through Xbox device slot
+70. That console call's argument layout requires its own adapter. No Draw, ExecuteCommandLists or Present is observed.
+
+The active runtime is now palmwave.exe with palmwave_tls_host.dll and PALMWAVE_ options. The requested console and
+presentation-window title is Palmwave Game Launcher. The renamed runtime reproduces the same measured stop above.
+Targeted Python checks pass: 186 tests and 47 subtests, three skips; compileall passes. Source notices and licenses
+retain their original attribution. Public descriptions and commit naming use generic Xbox Series terminology.
+
+## Bulk compiler memory pressure
+
+The bulk pipeline worker was running 16 compiler threads and occupied about 23 GiB of resident memory. The controller
+and that worker were stopped; available RAM rose from about 6 GiB to 37.5 GiB, with no checker left running. Completed
+cache checkpoints remain outside the repository. The build example now uses two jobs. Future bulk runs must use bounded
+parallelism; this interruption is a resource-management decision, not evidence of a shader translation failure.
