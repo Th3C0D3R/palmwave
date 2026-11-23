@@ -15,16 +15,18 @@
 //     first origin after ScheduleFrameEventX is the next vblank. The origin event of vblank n is signalled
 //     offset microseconds after it (ScheduleFrameEventX's offset).
 //   * A frame is "in flight" from PresentX until the vblank that shows it. Frames show one per vblank, in order.
-//     WaitFrameEventX does not return while `latency` frames are in flight. A frame presented while the origin event
+//     An origin wait does not return while `latency` frames are in flight. A frame presented while the origin event
 //     is not armed is not paced (PresentX does not hold it for a vblank): it shows at once and is never in flight.
 //   * A wait that comes late (after the next origin already passed) returns at once with the newest passed origin;
 //     the missed origins are skipped, not queued.
-//   * Tokens are 1, 2, 3, ... (0 is the null token), one per successful wait, never reused, across suspend/resume.
+//   * Tokens are 1, 2, 3, ... (0 is the null token), one per successful origin wait, never reused, across suspend/resume.
+//     Indexed event 2 waits on an existing token at its frame-grid origin plus an independent offset; it issues no token.
 //   * A frame is due at the vblank after the origin that handed out its token; a PresentX after that vblank is late by
 //     the time since it (present_timing), and ImmediateThresholdPercent decides whether that lateness is shown at once
 //     (decide_present_sync).
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -97,8 +99,15 @@ private:
     std::function<void()> wake_;
 };
 
-// Provisional definitions of ours: the real constants and layouts of the console API are unmeasured.
+// Origin 0 is corroborated by public bindings; the wider console event enum remains unestablished here.
 inline constexpr std::uint32_t frame_event_origin = 0;
+// Public compatible implementation evidence: FiveStar 18e225d2cbd526ba710beb69b7884d6c758d9291,
+// Present/FramePacer.cs:26-27,62-69,95-120 (GPL-3.0-or-later), schedules index 2 at an offset on the same frame grid
+// and waits on an existing token. Its console enum name is not established; indices 1 and 3 remain unsupported.
+inline constexpr std::uint32_t frame_event_index2 = 2;
+inline constexpr bool supported_frame_event(std::uint32_t event) {
+    return event == frame_event_origin || event == frame_event_index2;
+}
 // Statistics types (bit mask). Interval and render entries are never produced here.
 inline constexpr std::uint32_t stat_frame_interval = 0x01;
 inline constexpr std::uint32_t stat_frame_event = 0x02;
@@ -172,38 +181,41 @@ public:
         latency_ = std::max(latency, 1u);
         epoch_us_ = clock_.now_us();
         interval_set_ = true;
-        offset_us_ = std::min(offset_us_, period_us - 1);
+        events_[frame_event_origin].offset_us = std::min(events_[frame_event_origin].offset_us, period_us - 1);
         last_origin_ = 0;  // origin 0 is the epoch itself, which has passed
         cv_.notify_all();
         return pacer_hr::ok;
     }
 
-    // ScheduleFrameEventX(event, offset, ..., flags). Only the origin event exists here.
+    // ScheduleFrameEventX(event, offset, ..., flags). Origin emits tokens; index 2 is independently scheduled on
+    // the same frame grid and only observes an already-issued token. Changing index 2 never resets origin progress.
     std::int32_t schedule_frame_event(std::uint32_t event, std::uint32_t offset_us, std::uint32_t flags) {
         (void)flags;
-        if (event != frame_event_origin) return pacer_hr::invalid_arg;
+        if (!supported_frame_event(event)) return pacer_hr::invalid_arg;
         std::lock_guard guard(mutex_);
         if (suspended_ || !interval_set_) return pacer_hr::invalid_state;
-        if (offset_us >= period_us_) return pacer_hr::invalid_arg;
-        offset_us_ = offset_us;
-        armed_ = true;
-        // The first origin is the next one that has not come yet: origin n is due at epoch + n * period + offset.
-        const std::uint64_t now = clock_.now_us();
-        last_origin_ = now >= epoch_us_ + offset_us_ ? std::int64_t((now - epoch_us_ - offset_us_) / period_us_) : 0;
+        if (event == frame_event_origin && offset_us >= period_us_) return pacer_hr::invalid_arg;
+        events_[event] = {offset_us, true};
+        if (event == frame_event_origin) {
+            // The next origin not yet passed, with the existing origin-offset behavior.
+            const std::uint64_t now = clock_.now_us();
+            last_origin_ = now >= epoch_us_ + offset_us ? std::int64_t((now - epoch_us_ - offset_us) / period_us_) : 0;
+        }
         cv_.notify_all();
         return pacer_hr::ok;
     }
 
-    // WaitFrameEventX(event, timeout, ..., flags, &token). Blocks until the next origin, and while `latency` frames
-    // are in flight. pacer_hr::timeout when `timeout_ms` passes first (infinite_timeout_ms: never); the token is left
-    // alone then. invalid_state when nothing is registered, the pacer is suspended, or one of those happens while waiting.
+    // Origin waits create the next token and honor frame latency. Index 2 waits on the caller's existing token:
+    // its frame-grid origin + that event's offset. It neither creates a token nor consumes an origin/latency slot.
+    // Timeouts/refusals leave the token untouched; a null, unknown or aged-out index-2 token is refused.
     std::int32_t wait_frame_event(std::uint32_t event, std::uint32_t timeout_ms, std::uint32_t flags,
                                   std::uint64_t* token) {
         (void)flags;
-        if (event != frame_event_origin || !token) return pacer_hr::invalid_arg;
+        if (!supported_frame_event(event) || !token) return pacer_hr::invalid_arg;
         std::unique_lock lock(mutex_);
         ++waiters_;
-        const std::int32_t result = wait_locked(lock, timeout_ms, token);
+        const std::int32_t result = event == frame_event_origin ? wait_locked(lock, timeout_ms, token)
+                                                              : wait_indexed_locked(lock, event, timeout_ms, *token);
         if (--waiters_ == 0) cv_.notify_all();
         return result;
     }
@@ -297,7 +309,7 @@ public:
         const std::uint64_t now = clock_.now_us();
         retire_locked(now);
         last_presented_ = std::max(last_presented_, token);
-        if (!interval_set_ || !armed_) {  // not paced (PresentX holds no vblank until the event is armed): shows at once
+        if (!interval_set_ || !events_[frame_event_origin].armed) {  // not paced (PresentX holds no vblank until the event is armed): shows at once
             for (Record& r : records_)
                 if (r.token == token) { r.presented = r.displayed = true; r.present_us = r.display_us = now; }
             return;
@@ -325,7 +337,7 @@ public:
     // the origin event not armed it is not paced: it shows at once and is not counted.
     void note_untokened_present() {
         std::lock_guard guard(mutex_);
-        if (!interval_set_ || !armed_) return;
+        if (!interval_set_ || !events_[frame_event_origin].armed) return;
         const std::uint64_t now = clock_.now_us();
         retire_locked(now);
         const std::uint64_t since = now > epoch_us_ ? now - epoch_us_ : 0;
@@ -339,15 +351,17 @@ public:
     void suspend() {
         std::lock_guard guard(mutex_);
         suspended_ = true;
-        interval_set_ = armed_ = false;
+        interval_set_ = false;
+        for (auto& event : events_) event.armed = false;
         pending_.clear();
         cv_.notify_all();
     }
-    // ResumeX: presents work again, but the interval and the origin event must be set up again.
+    // ResumeX: presents work again, but the interval and each requested event must be set up again.
     void resume() {
         std::lock_guard guard(mutex_);
         suspended_ = false;
-        interval_set_ = armed_ = false;
+        interval_set_ = false;
+        for (auto& event : events_) event.armed = false;
         cv_.notify_all();
     }
 
@@ -361,7 +375,7 @@ public:
     // Frames that were flipped mid-scan because of ImmediateThresholdPercent.
     std::uint64_t immediate_presents() const { std::lock_guard guard(mutex_); return immediate_presents_; }
     std::uint32_t period_us() const { std::lock_guard guard(mutex_); return period_us_; }
-    bool registered() const { std::lock_guard guard(mutex_); return interval_set_ && armed_; }
+    bool registered() const { std::lock_guard guard(mutex_); return interval_set_ && events_[frame_event_origin].armed; }
 
 private:
     struct Pending {
@@ -371,6 +385,7 @@ private:
     };
     struct Record {
         std::uint64_t token = 0, origin_us = 0, present_us = 0, display_us = 0;
+        std::uint64_t grid_origin_us = 0;  // fixed before the origin event offset, when this token was issued
         std::uint64_t due_us = 0;  // vblank after this token's origin, fixed when issued
         float percent_scanned = 0.0f;
         bool presented = false, displayed = false;
@@ -389,15 +404,38 @@ private:
         }
     }
 
+    std::int32_t wait_indexed_locked(std::unique_lock<std::mutex>& lock, std::uint32_t event,
+                                     std::uint32_t timeout_ms, std::uint64_t token) {
+        if (!token) return pacer_hr::invalid_arg;
+        const std::uint64_t start = clock_.now_us();
+        const std::uint64_t duration = std::uint64_t(timeout_ms) * 1000;
+        const std::uint64_t give_up = timeout_ms == infinite_timeout_ms || duration > no_deadline - start
+                                         ? no_deadline : start + duration;
+        for (;;) {
+            if (shutdown_ || suspended_ || !interval_set_ || !events_[event].armed)
+                return pacer_hr::invalid_state;
+            const Record* record = nullptr;
+            for (const Record& candidate : records_)
+                if (candidate.token == token) { record = &candidate; break; }
+            if (!record || events_[event].offset_us > no_deadline - record->grid_origin_us)
+                return pacer_hr::invalid_arg;
+            const std::uint64_t due = record->grid_origin_us + events_[event].offset_us;
+            const std::uint64_t now = clock_.now_us();
+            if (now >= due && due <= give_up) return pacer_hr::ok;
+            if (give_up != no_deadline && now >= give_up) return pacer_hr::timeout;
+            clock_.wait(lock, cv_, std::min(due, give_up));
+        }
+    }
+
     std::int32_t wait_locked(std::unique_lock<std::mutex>& lock, std::uint32_t timeout_ms, std::uint64_t* token) {
         const std::uint64_t start = clock_.now_us();
         const std::uint64_t give_up = timeout_ms == infinite_timeout_ms ? no_deadline
                                                                          : start + std::uint64_t(timeout_ms) * 1000;
         for (;;) {
-            if (shutdown_ || suspended_ || !interval_set_ || !armed_) return pacer_hr::invalid_state;
+            if (shutdown_ || suspended_ || !interval_set_ || !events_[frame_event_origin].armed) return pacer_hr::invalid_state;
             const std::uint64_t now = clock_.now_us();
             retire_locked(now);
-            const std::uint64_t first = epoch_us_ + offset_us_;  // origin 0
+            const std::uint64_t first = epoch_us_ + events_[frame_event_origin].offset_us;  // origin 0
             const std::int64_t next = last_origin_ + 1;
             const std::uint64_t next_us = first + std::uint64_t(next) * period_us_;
             std::uint64_t wake = next_us;
@@ -410,7 +448,8 @@ private:
                     Record record;
                     record.token = *token;
                     record.origin_us = first + std::uint64_t(origin) * period_us_;
-                    record.due_us = record.origin_us - offset_us_ + period_us_;
+                    record.grid_origin_us = record.origin_us - events_[frame_event_origin].offset_us;
+                    record.due_us = record.grid_origin_us + period_us_;
                     records_.push_back(record);
                     if (records_.size() > 64) records_.pop_front();
                     return pacer_hr::ok;
@@ -430,10 +469,13 @@ private:
 
     bool suspended_ = false;
     bool interval_set_ = false;
-    bool armed_ = false;
+    struct EventSchedule {
+        std::uint32_t offset_us = 0;
+        bool armed = false;
+    };
+    std::array<EventSchedule, frame_event_index2 + 1> events_{};
     std::uint32_t period_us_ = 0;
     std::uint32_t latency_ = 1;
-    std::uint32_t offset_us_ = 0;
     std::uint64_t epoch_us_ = 0;
     std::int64_t last_origin_ = 0;  // origin 0 is the epoch itself, which has passed
     std::uint64_t issued_ = 0;

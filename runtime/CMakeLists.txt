@@ -208,6 +208,11 @@ if(WIN32 AND PALMWAVE_BUILD_WINDOWS_RUNTIME)
     )
     target_compile_definitions(xs_queue_version_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(xs_queue_version_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    # The strict PresentX plane/parameter wire check (shims/xbox_present_wire.h), header-only: CPU, no GPU, no Vulkan.
+    add_executable(xbox_present_wire_test test/xbox_present_wire_test.cpp)
+    target_compile_definitions(xbox_present_wire_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(xbox_present_wire_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    add_test(NAME xbox_present_wire COMMAND xbox_present_wire_test)
   else()
     message(STATUS "d3d12.lib not found: root_sig_test and device_proxy_test are not built")
   endif()
@@ -1621,7 +1626,7 @@ if(TARGET Vulkan::Headers)
       COMMENT "Generating D3D12 COM stubs"
       VERBATIM)
     add_library(palmwave_d3d12_com STATIC shims/d3d12_com.cpp shims/d3d12_vulkan_device.cpp shims/d3d12_xs_device.cpp shims/xbox_present.cpp
-                shims/dxgi_com.cpp shims/host_pins.h ${PALMWAVE_STUBS})   # d3d12_vulkan_device.cpp reads the PC device behind the proxy (#224)
+                shims/xbox_present_bridge.cpp shims/dxgi_com.cpp shims/host_pins.h ${PALMWAVE_STUBS})   # d3d12_vulkan_device.cpp reads the PC device behind the proxy (#224)
     target_include_directories(palmwave_d3d12_com PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
     target_link_libraries(palmwave_d3d12_com PUBLIC Vulkan::Headers palmwave_root_signature)
     target_compile_definitions(palmwave_d3d12_com PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -2256,6 +2261,16 @@ if(TARGET Vulkan::Headers)
     # Needs a Vulkan GPU and a window; exits 77 (skipped) without a Vulkan device.
     add_test(NAME xbox_present COMMAND xbox_present_test)
     set_tests_properties(xbox_present PROPERTIES SKIP_RETURN_CODE 77)
+
+    # The PresentX bridge (shims/xbox_present_bridge.h) through the device proxy's frame-event slots and
+    # actual modern queue slots 35 (submission) and 32 (PresentX): a real "Palmwave Game Launcher" window, swapchain read-back, refusals and
+    # lifetime. Synthetic cleared textures only. Exits 77 without a Vulkan device with presentation.
+    add_executable(xbox_present_bridge_test test/xbox_present_bridge_test.cpp)
+    target_link_libraries(xbox_present_bridge_test PRIVATE palmwave_d3d12_com user32)
+    target_compile_definitions(xbox_present_bridge_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(xbox_present_bridge_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    add_test(NAME xbox_present_bridge COMMAND xbox_present_bridge_test)
+    set_tests_properties(xbox_present_bridge PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
 
     # TEST-528: a real boot-movie frame (the package's Bink2Scarlett.dll) uploaded through the Xbox-ABI proxy and
     # presented with PresentX, checked against the decoded BGRA. Package-gated like bink_decode_test: skips (77)

@@ -213,6 +213,10 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out,
 // IDXGIDevice1 pointer (what create_device_proxy returns for that IID); the proxy itself becomes the outer. For a
 // proxy it also makes the proxy's IDXGIDevice1::GetAdapter return this layer's adapter (d3d12_xs_device.h).
 void set_device_outer(ID3D12Device* device, IUnknown* outer);
+// True when set_device_outer has given `device` (from create_vulkan_device*) an outer identity. Objects created from
+// then on (a WindowPresenter included) hold that outer, not the device: the presentation bridge checks this to keep
+// its presenter on the real device and out of a reference cycle with the proxy.
+bool device_has_outer(ID3D12Device* device);
 
 // The VkImage behind a texture created by such a device, or VK_NULL_HANDLE. For tests and the swapchain.
 VkImage vulkan_image(ID3D12Resource* resource);
@@ -376,6 +380,8 @@ public:
     bool enable_capture();
     // See VulkanPresenter::set_abort: polled while a present waits for a swapchain image.
     void set_abort(std::function<bool()> abort);
+    // Bounded completion of the last submitted blit, without capture or a device-wide idle. E_PENDING before a submit.
+    HRESULT wait_for_present(DWORD timeout_ms);
     // See VulkanPresenter::read_back: false after a present skipped while the window is minimised, too.
     bool read_back(std::vector<std::uint8_t>& pixels, VkExtent2D* extent, VkFormat* format);
     VkExtent2D extent() const;

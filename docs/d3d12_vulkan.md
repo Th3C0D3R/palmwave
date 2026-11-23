@@ -3194,6 +3194,57 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   image is not done. 2 planes must share one token (see "Plane composition" for what happens to plane 1). More than 2
   planes, null planes, or an empty/outside rectangle give `E_INVALIDARG`. A missing `ALLOW_DISPLAY` heap flag is logged
   once and presented anyway.
+- *Console PresentX bridge* (`runtime/shims/xbox_present_bridge.h`, `xbox_present_wire.h`). Connects the console calls
+  to the core above for a strict subset; it is a component, not a claim that the local title presents a frame.
+  - *Wire contract (public sources, not a local measurement).* Plane: 0x48 bytes, `Token` u64 +0x00, `ResourceCount`
+    +0x08, `ppResources` +0x10, `pSrcViewRects` (`D3D12_RECT*`) +0x18, `pDestPlacementBase` +0x20, `ColorSpace` +0x28,
+    `ScaleFilter` +0x2C, `ExtendedDescCount` +0x30, `pExtendedDescs` +0x38, `Flags` +0x40. Parameters: 0x20 bytes,
+    `ImmediateThresholdPercent` f32 +0x00, `ViewCount` +0x04, `ExtendedDescCount` +0x08, `pExtendedDescs` +0x10, `Flags`
+    +0x18. Field order and types: Ebiten `d3d12_windows.go` at `d438df689b19544c82543ad522b36be86a5a60b7` (Apache-2.0),
+    lines 846-878 (token type line 461) with natural x64 alignment; FiveStar `PresentPlane.cs` at
+    `18e225d2cbd526ba710beb69b7884d6c758d9291` (GPL-3.0-or-later) describes the same 72-byte plane through +0x28; Microsoft
+    `DeviceResourcesGXDK.cpp` (directxtk12modelviewer `37e6552a`, MIT, lines 420-440) shows the zeroed-struct use.
+    OpenScarlett's plane with inline rectangles disagrees with all three and is not used. No code was copied from any
+    of them. No plane of the local retail title has been read yet.
+  - *Accepted.* `PresentX(0, …)`: a real black frame (the samples' shutdown); the plane pointer is not read. `PresentX(1,
+    plane, params)` with `Token` non-zero, `ResourceCount` 1, a non-null resource, `pSrcViewRects` null or a non-empty
+    rectangle inside the texture, `pDestPlacementBase` null, `ColorSpace` 0, `ScaleFilter` 0, no extended descriptors,
+    `Flags` 0; `params` null or all fields zero. The resource must be a texture of this layer on the same device:
+    single-sample, one mip, one layer, R8G8B8A8/B8G8R8A8 UNORM(_SRGB) or R10G10B10A2_UNORM. Everything else is refused
+    before the presenter is called (`E_NOTIMPL` for an unsupported value, `E_INVALIDARG` for a malformed one), logged and
+    counted; two planes (the HDR/GameDVR pair) are refused. The core's token rule still applies: a token its pacer never
+    issued is `E_INVALIDARG`.
+  - *Frame events.* While the bridge is installed, device slots 78/79/80 go to the same `XboxPresentation`, so tokens come
+    from one pacer. Origin 0 and indexed event 2 are accepted, with a null ancillary list and flags 0;
+    `SetFrameIntervalX` flags must be 0. Only origin waits issue tokens and enforce presentation latency. Event 2
+    waits on an existing token's fixed frame-grid origin plus its independently scheduled microsecond offset;
+    repeated waits preserve that token and consume no origin or latency slot. A finite timeout before the event
+    deadline returns `HRESULT_FROM_WIN32(WAIT_TIMEOUT)` even if the thread wakes after both deadlines. Unregistered
+    events return `HRESULT_FROM_WIN32(ERROR_INVALID_STATE)`; null, unknown or aged-out tokens return `E_INVALIDARG`.
+    The 64-record history bounds accepted old tokens. Suspend/resume clears both registrations. Index 2's enum name
+    remains unknown, and indices 1/3, ancillary lists and nonzero flags remain refused. This bounded interpretation
+    follows FiveStar `FramePacer.cs` lines 26-27, 62-69, 95-120 at the pinned GPL-3.0-or-later revision above;
+    it is compatible implementation evidence, not console hardware or SDK proof. The third
+    `SetFrameIntervalX` word is `periodInIntervals` in the Ebiten binding but is still read as the latency (open).
+  - *Synchronisation and ownership.* Before a blit the bridge signals a temporary fence on the calling queue and waits
+    for it (bounded, 5 s by default; a timeout fails the present). It then waits for the presenter's submitted-blit fence
+    before returning success, so the source can be overwritten on another queue without a capture or global idle.
+    The device proxy owns the bridge and destroys it on its last `Release`, before the real device. The bridge holds the real device through its presenter, never the proxy or a
+    queue, so it must be installed before `set_device_outer` (refused afterwards). Its window is created and pumped on
+    its own thread. Closing hides it and cancels further presents; the native window is destroyed after the surface on
+    final release. Minimized presents return `DXGI_STATUS_OCCLUDED` without advancing the actual presentation count.
+  - *Wiring.* `D3D12XboxCreateDevice` installs it on the Vulkan path for version `0x20004`. Modern queue slot 32 calls
+    `rt::d3d12_xs::queue_proxy_present_x(queue_proxy, a1, a2, a3)`. Without a bridge that call is `E_NOTIMPL`.
+  - *Validation.* `xbox_present_wire` checks the layout, immutable input and refusal rules without a GPU.
+    `xbox_present_bridge` passed on RTX 5080 with Vulkan and synchronization validation, zero errors, in 0.59 s after rebasing onto the current runtime:
+    actual slots 35 and 32, 6 presentations, 5 distinct readback-verified colour/rectangle/blank frames, 17 refusals,
+    same-source reuse without intervening readback, minimized/closed-window handling and final-release destruction.
+    The indexed-event extension passed 23 focused CPU CTests (1.85 s) and this GPU regression (0.73 s, same RTX 5080,
+    validation and synchronization validation, zero errors) after a clean build. It registers events 0 then 2 and
+    verifies that Wait(2) preserves the token and token count. These are synthetic frames only; the local title's
+    plane has not been observed.
+  - *Not handled yet.* SuspendX/ResumeX, statistics, HDR/extra planes and nonzero slot-35 frame/flags are not routed.
+    The existing core's deferred-present path is not established as a console contract.
 - *Plane composition* (M7). *Fact* (public MIT sample, Xbox-GDK-Samples `Samples/Graphics/HDR10/DeviceResources.cpp` and
   its readme): the two-plane form there is **not** an overlay. Plane 0 is the HDR10 back buffer
   (`RGB_FULL_G2084_NONE_P2020`), plane 1 is a second back-buffer set holding the SDR rendering of the same frame
@@ -3387,10 +3438,10 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   `PercentScanned` of frames shown at a vblank (a scan position is never measured), and the vtable wiring. Slots to measure (all unknown): the device's `SetFrameIntervalX`,
   `ScheduleFrameEventX`, `WaitFrameEventX`, `GetFrameStatisticsX` and the queue's `PresentX`, `SuspendX`, `ResumeX`
   (the list is in the header). Queue slots now follow public implementation sources by device version (OpenScarlett and
-  FiveStar; for `0x20004`, PresentX 32, SuspendX 23, ResumeX 24). The proxy recognises them but returns `E_NOTIMPL`:
-  the queue is not yet connected to `XboxPresentation`. The plane bytes, a token source shared with the device's frame
-  slots, presenter ownership and per-queue ordering come first (docs/BLOCKERS.md, "Versioned console queue layout and
-  the PresentX bridge"). "One `VkQueue` behind all of them" above is stale: see 4.4, `pick_queue_slot`.
+  FiveStar; for `0x20004`, PresentX 32, SuspendX 23, ResumeX 24). The strict single-plane PresentX bridge above now
+  connects slot 32 and device frame slots 78/79/80 through one pacer and real presenter. SuspendX/ResumeX and the
+  wider plane contracts still return `E_NOTIMPL` (docs/BLOCKERS.md, "Versioned console queue layout and the PresentX
+  bridge"). "One `VkQueue` behind all of them" above is stale: see 4.4, `pick_queue_slot`.
 - *Tests*: `frame_pacer_test` (fake clock: interval, offset, late waits, timeouts, latency blocking, tokens,
   statistics, suspend/resume, a real 10 ms timer; no GPU) and `xbox_present_test` (the Vulkan device, reading the
   swapchain image back: blank, solid, two colours, source rectangles, RGBA/BGRA/sRGB sources, 2 planes, plane composition

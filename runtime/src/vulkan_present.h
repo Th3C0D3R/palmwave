@@ -316,6 +316,15 @@ public:
         return true;
     }
 
+    // Wait for the most recent submitted blit to finish reading its source. No capture is needed, and no unrelated
+    // queue is idled. The caller serializes present + wait when it needs this as a resource-reuse boundary.
+    VkResult wait_last_present(std::uint64_t timeout_ns) {
+        std::lock_guard lock(present_mutex_);
+        if (!frame_index_) return VK_NOT_READY;
+        const Frame& frame = frames_[(frame_index_ + frames_.size() - 1) % frames_.size()];
+        return vkWaitForFences_(context_.device(), 1, &frame.done, VK_TRUE, timeout_ns);
+    }
+
     // The last presented frame as the swapchain stores it (4 bytes a texel, rows tightly packed, format() order).
     // Waits for the frame to finish. False when nothing was presented since enable_capture(), after a present
     // that was skipped because the window is minimised (it returned VK_SUCCESS but showed nothing), until the next

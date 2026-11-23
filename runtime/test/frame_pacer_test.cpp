@@ -66,6 +66,64 @@ int main() {
         EXPECT(pacer.registered());
     }
 
+    // Indexed event 2: its own offset on an existing token's frame grid, no new token or origin consumption.
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        EXPECT(setup(pacer, 1, 5000));
+        clock.advance_us(period + 5000);
+        std::uint64_t token = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token) == pacer_hr::ok && token == 1);
+        EXPECT(pacer.wait_frame_event(frame_event_index2, 0, 0, &token) == pacer_hr::invalid_state && token == 1);
+        EXPECT(pacer.schedule_frame_event(frame_event_index2, 7000, 0) == pacer_hr::ok);
+        pacer.commit_present_token(token, 1);  // fills latency 1; an indexed wait must not wait for presentation
+        const auto indexed_wait = [&](std::uint32_t timeout) {
+            return std::async(std::launch::async, [&pacer, token, timeout] {
+                Result r{0, token};
+                r.hr = pacer.wait_frame_event(frame_event_index2, timeout, 0, &r.token);
+                return r;
+            });
+        };
+        auto indexed = indexed_wait(infinite_timeout_ms);
+        EXPECT(blocked(indexed));
+        clock.advance_us(1999);
+        EXPECT(blocked(indexed));
+        clock.advance_us(1);  // grid origin + 7000, not origin-event time + 7000
+        Result result = indexed.get();
+        EXPECT(result.hr == pacer_hr::ok && result.token == token);
+        EXPECT(pacer.tokens_issued() == 1 && pacer.frames_in_flight() == 1);
+        EXPECT(pacer.wait_frame_event(frame_event_index2, 0, 0, &token) == pacer_hr::ok && token == 1);
+        EXPECT(pacer.wait_frame_event(frame_event_index2, 0, 0, &token) == pacer_hr::ok && token == 1);
+        EXPECT(pacer.tokens_issued() == 1);
+        EXPECT(pacer.schedule_frame_event(frame_event_index2, 10000, 0) == pacer_hr::ok);
+        EXPECT(pacer.wait_frame_event(frame_event_index2, 0, 0, &token) == pacer_hr::timeout && token == 1);
+        auto limited = indexed_wait(2);
+        EXPECT(blocked(limited));
+        clock.advance_us(3000);  // after both the 2 ms timeout and the 3 ms event deadline: timeout wins
+        result = limited.get();
+        EXPECT(result.hr == pacer_hr::timeout && result.token == 1);
+        EXPECT(pacer.wait_frame_event(frame_event_index2, 0, 0, &token) == pacer_hr::ok && token == 1);
+        std::uint64_t unknown = 999, null_token = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_index2, 0, 0, &unknown) == pacer_hr::invalid_arg && unknown == 999);
+        EXPECT(pacer.wait_frame_event(frame_event_index2, 0, 0, &null_token) == pacer_hr::invalid_arg && null_token == 0);
+        EXPECT(pacer.wait_frame_event(frame_event_index2, 0, 0, nullptr) == pacer_hr::invalid_arg);
+        EXPECT(pacer.tokens_issued() == 1);
+        clock.advance_us(period - 5000);  // next origin event; index-2 waits did not consume it
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token) == pacer_hr::ok && token == 2);
+        EXPECT(pacer.schedule_frame_event(frame_event_index2, 2 * period, 0) == pacer_hr::ok);
+        auto cancelled = indexed_wait(infinite_timeout_ms);
+        EXPECT(blocked(cancelled));
+        pacer.suspend();
+        result = cancelled.get();
+        EXPECT(result.hr == pacer_hr::invalid_state && result.token == 2);
+        pacer.resume();
+        EXPECT(setup(pacer, 1));
+        EXPECT(pacer.wait_frame_event(frame_event_index2, 0, 0, &token) == pacer_hr::invalid_state && token == 2);
+        EXPECT(pacer.schedule_frame_event(frame_event_index2, 0, 0) == pacer_hr::ok);
+        EXPECT(pacer.wait_frame_event(frame_event_index2, 0, 0, &token) == pacer_hr::ok && token == 2);
+        EXPECT(pacer.tokens_issued() == 2);
+    }
+
     // The origin event: each wait returns at the next vblank, with the next token.
     {
         ManualFrameClock clock;

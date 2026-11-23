@@ -63,6 +63,12 @@ static_assert(sizeof(D3D12_CPU_DESCRIPTOR_HANDLE) == 8,
               "the Xbox handle ABI is an 8-byte value in RAX; the heap thunk converts the PC hidden-pointer form");
 static_assert(sizeof(D3D12_RESOURCE_DESC) == 56, "the measured Xbox description prefix is 56 bytes");
 
+// An installed presentation table and its state (set_device_presentation); published once by compare-exchange.
+struct PresentationSlot {
+    const PresentationHooks* hooks;
+    void* state;
+};
+
 struct DeviceProxy {
     void** vtable;          // offset 0: the caller's ID3D12Device* points here
     ID3D12Device* real;     // offset 8: the PC device every thunk forwards to
@@ -87,10 +93,9 @@ struct DeviceProxy {
     // UploadArena is defined with the list proxy. Lists record on several threads, so the first call installs it by
     // compare-exchange.
     std::atomic<void*> upload_state{nullptr};
-    // The first 32-bit word of the D3D12XboxCreateDevice parameter block (create_device_proxy's xbox_version), or 0
-    // for a proxy made without one (PC-shaped tests and callers). Constant after creation. It selects the queue
-    // proxies' console method layout (see "Versioned console queue layout"); nothing else reads it.
-    std::uint32_t xbox_version = 0;
+    std::uint32_t xbox_version = 0;  // immutable queue-layout version from the device parameter block
+    // The presentation table (set_device_presentation): frame events 78/79/80 and queue PresentX go to it when set.
+    std::atomic<PresentationSlot*> presentation{nullptr};
 };
 
 // Frees the upload arena in proxy_release; defined with the list proxy, where UploadArena is complete.
@@ -325,6 +330,12 @@ unsigned long proxy_release(DeviceProxy* self) {
     if (refs == 0) {
         // Every list holds a device reference, so no list can still translate into the arena here.
         destroy_upload_state(self->upload_state.load(std::memory_order_acquire));
+        // The presentation state goes before the real device: it may hold its own reference to that device (never to
+        // this proxy), and its window and presenter must be gone before the device's last reference is.
+        if (PresentationSlot* presentation = self->presentation.exchange(nullptr, std::memory_order_acq_rel)) {
+            presentation->hooks->destroy(presentation->state);
+            delete presentation;
+        }
         ID3D12Device* real = self->real;
         delete self;
         if (real) real->Release();
@@ -1553,9 +1564,8 @@ bool route_console_queue_slot(void* rcx, unsigned slot, std::uint64_t a1, std::u
             return true;
         }
         case kModernPresentX:
-            result = refuse_console_queue_slot(slot, version,
-                                               "PresentX (modern slot 32): plane/parameter layout not established",
-                                               a1, a2, a3, a4, kPresentXLayoutUnestablished);
+            note_console_queue_slot(slot, console_queue_trace_name(slot));
+            result = hr_to_u64(queue_proxy_present_x(self, a1, a2, a3));
             return true;
         case kModernSuspendX:
         case kModernResumeX:
@@ -2499,8 +2509,17 @@ HRESULT proxy_create_command_queue_x(DeviceProxy* self, const D3D12_COMMAND_QUEU
 // Xbox device slot 78 (public HLE): SetFrameIntervalX(output, interval_us, latency, flags). The output and flags are
 // not used before a presenter exists. The period is a vblank period in microseconds in the public samples (16667 for
 // 60 Hz), and latency is the allowed frames in flight. S_OK even for 0: a boot must not abort here, and nothing paces.
+// With a presentation table installed (set_device_presentation) slots 78/79/80 go to it instead: one pacer serves
+// these events and queue PresentX.
+const PresentationSlot* installed_presentation(const DeviceProxy* self) {
+    return self->presentation.load(std::memory_order_acquire);
+}
+
 HRESULT proxy_set_frame_interval_x(DeviceProxy* self, std::uint64_t output, std::uint64_t interval_us,
                                    std::uint64_t latency, std::uint64_t flags) {
+    if (const PresentationSlot* p = installed_presentation(self))
+        return p->hooks->set_frame_interval(p->state, output, static_cast<std::uint32_t>(interval_us),
+                                            static_cast<std::uint32_t>(latency), static_cast<std::uint32_t>(flags));
     (void)output;
     (void)flags;
     self->frame_interval_us.store(static_cast<std::uint32_t>(interval_us), std::memory_order_relaxed);
@@ -2510,7 +2529,12 @@ HRESULT proxy_set_frame_interval_x(DeviceProxy* self, std::uint64_t output, std:
 
 // Xbox device slot 79 (public HLE): ScheduleFrameEventX(event, offset_us, pEvent, flags); our pacer has only the origin.
 HRESULT proxy_schedule_frame_event_x(DeviceProxy* self, std::uint64_t event, std::uint64_t offset_us,
-                                     std::uint64_t flags) {
+                                     std::uint64_t ancillary, std::uint64_t flags) {
+    if (const PresentationSlot* p = installed_presentation(self))
+        return p->hooks->schedule_frame_event(p->state, static_cast<std::uint32_t>(event),
+                                              static_cast<std::uint32_t>(offset_us), ancillary,
+                                              static_cast<std::uint32_t>(flags));
+    (void)ancillary;
     (void)event;
     (void)offset_us;
     (void)flags;
@@ -2522,7 +2546,13 @@ HRESULT proxy_schedule_frame_event_x(DeviceProxy* self, std::uint64_t event, std
 // a fresh non-zero token (the first-frame choice): there is no vblank source behind the device before a presenter, and
 // a zero wait cannot stall the title. A null token pointer is E_POINTER, as a _Out_ parameter.
 HRESULT proxy_wait_frame_event_x(DeviceProxy* self, std::uint64_t event, std::uint64_t timeout_ms,
-                                 std::uint64_t flags, std::uint64_t token_word) {
+                                 std::uint64_t ancillary, std::uint64_t flags, std::uint64_t token_word) {
+    if (const PresentationSlot* p = installed_presentation(self))
+        return p->hooks->wait_frame_event(p->state, static_cast<std::uint32_t>(event),
+                                          static_cast<std::uint32_t>(timeout_ms), ancillary,
+                                          static_cast<std::uint32_t>(flags),
+                                          reinterpret_cast<std::uint64_t*>(token_word));
+    (void)ancillary;
     (void)event;
     (void)timeout_ms;
     (void)flags;
@@ -3768,10 +3798,10 @@ bool route_xbox_device_slot(DeviceProxy* self, unsigned slot, std::uint64_t a1, 
         result = hr_to_u64(proxy_set_frame_interval_x(self, a1, a2, a3, a4));
     } else if (slot == routes.schedule_event) {
         log_xbox_route_once(slot, "ScheduleFrameEventX", a1, a2, a3, a4, a5);
-        result = hr_to_u64(proxy_schedule_frame_event_x(self, a1, a2, a4));
+        result = hr_to_u64(proxy_schedule_frame_event_x(self, a1, a2, a3, a4));
     } else if (slot == routes.wait_event) {
         log_xbox_route_once(slot, "WaitFrameEventX", a1, a2, a3, a4, a5);
-        result = hr_to_u64(proxy_wait_frame_event_x(self, a1, a2, a4, a5));
+        result = hr_to_u64(proxy_wait_frame_event_x(self, a1, a2, a3, a4, a5));
     } else if (slot == routes.queue_x) {
         log_xbox_route_once(slot, "CreateCommandQueueX", a1, a2, a3, a4, a5);
         result = hr_to_u64(proxy_create_command_queue_x(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
@@ -4115,6 +4145,33 @@ bool set_device_buffer_at_va_resolver(void* device, BufferAtVaResolver resolver)
     return true;
 }
 
+bool set_device_presentation(void* device, const PresentationHooks* hooks, void* state) {
+    auto* proxy = static_cast<DeviceProxy*>(device_proxy_primary(device));
+    if (!proxy || !hooks || !state || !hooks->destroy || !hooks->set_frame_interval || !hooks->schedule_frame_event ||
+        !hooks->wait_frame_event || !hooks->present) {
+        std::fprintf(stderr, "[rt] d3d12_xs: set_device_presentation: %p is not a device proxy or the table is "
+                             "incomplete; nothing installed\n", device);
+        return false;
+    }
+    auto* slot = new (std::nothrow) PresentationSlot{hooks, state};
+    if (!slot) return false;
+    PresentationSlot* expected = nullptr;
+    if (!proxy->presentation.compare_exchange_strong(expected, slot, std::memory_order_acq_rel)) {
+        delete slot;
+        std::fprintf(stderr, "[rt] d3d12_xs: set_device_presentation: a presentation table is already installed on "
+                             "%p; nothing changed\n", device);
+        return false;
+    }
+    return true;
+}
+
+void* device_presentation_state(const void* device, const PresentationHooks* hooks) {
+    const auto* proxy = static_cast<const DeviceProxy*>(device_proxy_primary(const_cast<void*>(device)));
+    if (!proxy || !hooks) return nullptr;
+    const PresentationSlot* slot = proxy->presentation.load(std::memory_order_acquire);
+    return slot && slot->hooks == hooks ? slot->state : nullptr;
+}
+
 SrvAtVaOutcome last_srv_at_va_outcome() { return g_srv_at_va_last.load(std::memory_order_relaxed); }
 std::uint64_t srv_at_va_created_calls() { return g_srv_at_va_created.load(std::memory_order_relaxed); }
 std::uint64_t srv_at_va_refused_calls() { return g_srv_at_va_refused.load(std::memory_order_relaxed); }
@@ -4225,6 +4282,24 @@ ID3D12CommandAllocator* allocator_proxy_real_allocator(const void* allocator) {
 ID3D12CommandQueue* queue_proxy_real_queue(const void* queue) {
     if (!is_queue_proxy(queue)) return nullptr;
     return reinterpret_cast<ID3D12CommandQueue*>(static_cast<const ChildProxy*>(queue)->real);
+}
+
+// The caller (the title, through the queue router) holds a reference to the queue proxy for the call, and the queue
+// proxy holds one to its device proxy, so the presentation state cannot be destroyed while this runs.
+HRESULT queue_proxy_present_x(void* queue, std::uint64_t plane_count, std::uint64_t planes, std::uint64_t params) {
+    constexpr auto method = "XboxID3D12CommandQueue::PresentX";
+    if (!is_queue_proxy(queue)) return d3d12_trace::result(method, E_INVALIDARG);
+    const auto* self = static_cast<const ChildProxy*>(queue);
+    const PresentationSlot* p = self->device ? installed_presentation(self->device) : nullptr;
+    if (!p) {
+        static std::atomic<bool> logged{false};
+        if (first_call(logged))
+            std::fprintf(stderr, "[rt] d3d12_xs: queue PresentX refused: no presentation bridge on this device "
+                                 "(E_NOTIMPL, nothing presented)\n");
+        return d3d12_trace::result(method, E_NOTIMPL);
+    }
+    return d3d12_trace::result(method, p->hooks->present(p->state, reinterpret_cast<ID3D12CommandQueue*>(self->real),
+                                                         plane_count, planes, params));
 }
 
 ID3D12Fence* fence_proxy_real_fence(const void* fence) {

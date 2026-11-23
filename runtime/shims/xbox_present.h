@@ -3,23 +3,18 @@
 // The Xbox presentation core (docs/d3d12_vulkan.md section 4.5): the frame events and PresentX of a GDKX title, which
 // presents without a DXGI swapchain. FramePacer (src/frame_pacer.h) does the timing and the token bookkeeping;
 // WindowPresenter (d3d12_com.h, over palmwave::VulkanPresenter) puts the pixels in a window. This class is the
-// glue, and the surface the Xbox device and queue proxy will forward to once the vtable slots are known.
+// glue used by the strict console bridge in xbox_present_bridge.h.
 //
-// WHAT IS KNOWN: the public GDKX samples give the call order, the argument counts and the field names (section 4.5).
-// WHAT IS OURS: every struct layout, constant value and HRESULT below is a provisional definition of this layer; the real
-// slots, layouts, enum values and the token width are unmeasured. They are named like the console's so the proxy
-// can swap them, but nothing here may be read as the console's ABI.
-//
-// TODO, the slots to measure before the proxy can forward (index in the vtable of the Xbox device / queue):
-//   ID3D12Device (Xbox):        SetFrameIntervalX   (output, interval, latency, flags)           slot ?
-//                               ScheduleFrameEventX (event, offset, reserved pointer, flags)     slot ?
-//                               WaitFrameEventX     (event, timeout ms, reserved pointer, flags, &token)  slot ?
-//                               GetFrameStatisticsX (token, type mask, &count, array)            slot ?
-//   ID3D12CommandQueue (Xbox):  PresentX (plane count, planes, params)                           slot ?
-//                               SuspendX (flags)                                                 slot ?
-//                               ResumeX ()                                                       slot ?
-// The queue-side calls do not look at the queue: the Vulkan device has one VkQueue behind every D3D12 queue, and
-// the present is submitted after the work already executed on it.
+// The core supports a wider provisional surface than the console bridge. Public field layouts and the versioned
+// queue slots accepted by the bridge are documented in xbox_present_wire.h and docs/d3d12_vulkan.md. The bridge
+// routes device frame slots 78/79/80 and modern queue PresentX 32 through this one pacer; it refuses unsupported
+// fields instead of relying on the core's permissive defaults. Statistics and queue SuspendX/ResumeX are not routed.
+// Local retail compatibility beyond that public-source subset remains unmeasured.
+// The queue-side calls do not look at the queue. The Vulkan device may have several VkQueues behind its D3D12 queues,
+// and the presenter submits on the device's own presentation VkQueue, so a caller must first make sure the work on
+// the calling queue has executed: the PresentX bridge (xbox_present_bridge.h) waits on a fence for it. The bridge also
+// validates the strict console wire subset (xbox_present_wire.h) before anything here sees it; this class's own
+// permissive handling of extra fields is for direct callers and tests.
 
 #include "d3d12_com.h"
 #include "../src/frame_pacer.h"
@@ -101,7 +96,7 @@ public:
     // window. `interval_period_us` is the period of a frame interval, e.g. xbox_frame_interval_60hz_us; `latency`
     // is the frames allowed in flight (the samples pass the buffer count minus 1, or 1).
     HRESULT SetFrameIntervalX(IUnknown* output, UINT interval_period_us, UINT latency, UINT flags);
-    // Only the origin event (xbox_frame_event_origin) exists. `offset_us` delays it inside the frame. The pointer
+    // Origin emits tokens; event index 2 waits on an existing token at its independently scheduled offset. `offset_us` delays it inside the frame. The pointer
     // argument the samples pass as null is not modelled.
     HRESULT ScheduleFrameEventX(UINT event, UINT offset_us, UINT flags);
     // Blocks for the next origin and while the latency is used up. HRESULT_FROM_WIN32(WAIT_TIMEOUT) after `timeout_ms`
@@ -136,7 +131,7 @@ public:
     // `params` may be null (threshold 0). ImmediateThresholdPercent: see XboxPresentParameters; a frame that was shown
     // at once has its display statistic's percent_scanned set and is counted in immediate_presents().
     HRESULT PresentX(UINT plane_count, const XboxPresentPlaneParameters* planes, const XboxPresentParameters* params);
-    // SuspendX drops the interval, the origin event and the frames in flight, and refuses presents. ResumeX allows
+    // SuspendX drops the interval, every scheduled event and the frames in flight, and refuses presents. ResumeX allows
     // presents again; SetFrameIntervalX and ScheduleFrameEventX must be called again before the next wait.
     HRESULT SuspendX(UINT flags);
     HRESULT ResumeX();

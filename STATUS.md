@@ -286,9 +286,32 @@ validation reported zero errors. The same committed image produced 11,520 exact 
 This test uses synthetic GLSL and validates neither translated game shaders nor the imported-buffer path.
 
 The offline executable then created two matching 4K images and called their SRV/RTV/UAV creation.
-It stopped at a separate allocation-accounting assertion: the scoped reserved budget remains 64 MiB
-while accounted use remains zero after the two creations. The trace contains 2,249 D3D12 events:
+It stopped at a separate allocation-accounting assertion: the scoped allocator reserves a 64 MiB pool,
+but its allocation cursor has not advanced after the two creations. The trace contains 2,249 D3D12 events:
 2,205 ok, 29 called, 12 experimental-hypothesis, one experimental and two refused imported RAW views.
 A repeat with the integrated runtime confirmed the same stop. No Draw, ExecuteCommandLists, Present or
 game image was observed. The signed imported-address correction and true resource-allocation accounting
 are separate remaining requirements.
+
+
+## Window presentation and indexed frame synchronization
+
+The Vulkan device now installs a real Win32 presentation bridge for console version 0x20004.
+The window is named Palmwave Game Launcher. Queue slot 32 reaches the Vulkan presenter through a
+validated single-plane SDR subset; device frame-event methods share the same pacer. Origin event 0
+issues tokens; event index 2 observes an existing token at its own scheduled offset without consuming
+another token or latency slot. Unsupported planes, ancillary data and flags remain explicit refusals.
+Public source evidence and remaining timing assumptions are recorded in docs/d3d12_vulkan.md and UPSTREAM.md.
+
+The final integrated build passed 25 targeted CTests in 2.74 seconds. The GPU bridge test passed in
+0.80 seconds on NVIDIA GeForce RTX 5080 / 621.14 with Vulkan synchronization validation and zero errors:
+six synthetic presentations, five distinct readback-verified images, 17 refusal cases and no failed
+presentation. These are handcrafted test images, not output from the local Xbox executable.
+
+An offline executable run with the synchronization, host-import and committed-texture experiments
+confirmed that event 2 no longer stops startup. The window opens and the run again reaches the
+allocation-accounting assertion after the two 4K image creations: 23 startup events, four successful
+DLL initializations, no unimplemented import, and 2,249 D3D12 events (2,205 ok, 29 called,
+12 experimental-hypothesis, one experimental, two refused imported RAW views). No Draw,
+ExecuteCommandLists, Present or rendered game frame was observed. The debugger's exit code zero
+records diagnostic completion, not successful completion of the executable.

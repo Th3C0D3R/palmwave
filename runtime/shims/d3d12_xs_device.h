@@ -41,8 +41,10 @@
 //             call (public HLE; the PC six-argument form differs). A type other than direct, bundle or compute
 //             (copy, the derived DMA type 6, anything unknown) is refused with E_NOTIMPL rather than coerced to
 //             DIRECT: the console DMA-list vtable is not modelled.
-//   slots 78/79/80  SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX. A per-device token state machine answers
-//             them before the PC vtable is indexed; WaitFrameEventX returns at once with a fresh non-zero token.
+//   slots 78/79/80  SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX. With a presentation table installed
+//             (set_device_presentation, below) they go to it, so they share the PresentX frame pacer. Without one, a
+//             per-device token state machine answers them before the PC vtable is indexed; WaitFrameEventX returns at
+//             once with a fresh non-zero token.
 //             Slot 80 is outside a PC ID3D12Device11 table, so it is checked before the beyond-table refusal.
 //   slots 92-95, 108-110, 112  Xbox Series positions of ID3D12Device4/ID3D12Device8 resource methods. The mapping
 //             comes from public reference code (OpenScarlett, MIT, 87cdba6a). Leonida PR #7490's offset rule gives the
@@ -387,6 +389,47 @@ std::uint64_t list_slot_hits(unsigned slot);
 
 // Number of live references on a device proxy. Test helper for the heap's GetDevice/lifetime checks.
 unsigned long device_proxy_ref_count(const void* device);
+
+// ---- Presentation hooks (the PresentX bridge, runtime/shims/xbox_present_bridge.h) ----
+//
+// The proxy stays free of Vulkan: a presentation provider installs a table of plain function pointers and an opaque
+// state on one device proxy. While a table is installed, device slots 78/79/80 (at their configured indices) call it
+// instead of the proxy's own first-frame token counter, so WaitFrameEventX and PresentX share ONE frame pacer and a
+// PresentX token is always one the same pacer handed out. Without a table the previous behaviour is unchanged.
+//
+// Arguments are the console words, truncated to the 32-bit widths of the public prototypes (Ebiten d438df68
+// d3d12_windows.go lines 1550-1590: SetFrameIntervalX(output, lengthInMicroseconds, periodInIntervals, flags),
+// ScheduleFrameEventX(type, offset, pAncillarySignalList, flags), WaitFrameEventX(type, timeout, pAncillaryWaitList,
+// flags, pToken)). `ancillary` is the list pointer the proxy used to drop; the provider decides what it accepts.
+//
+// Lifetime: the table must stay valid for the process. `state` belongs to the proxy from a successful install on:
+// destroy(state) runs once, on the proxy's last Release, BEFORE the device behind the proxy is released. Queue
+// proxies hold a device-proxy reference, so a queue that outlives the title's device reference keeps the state alive.
+// The provider must not hold a reference to the proxy itself (or to a backend child object that holds one).
+struct PresentationHooks {
+    void (*destroy)(void* state);
+    HRESULT (*set_frame_interval)(void* state, std::uint64_t output, std::uint32_t length_us,
+                                  std::uint32_t period_in_intervals, std::uint32_t flags);
+    HRESULT (*schedule_frame_event)(void* state, std::uint32_t event, std::uint32_t offset_us, std::uint64_t ancillary,
+                                    std::uint32_t flags);
+    HRESULT (*wait_frame_event)(void* state, std::uint32_t event, std::uint32_t timeout_ms, std::uint64_t ancillary,
+                                std::uint32_t flags, std::uint64_t* token);
+    // `real_queue` is the object behind the calling queue proxy (no reference added; the caller holds one for the
+    // call). `plane_count` arrives as the full register word; the provider truncates it to UINT.
+    HRESULT (*present)(void* state, ID3D12CommandQueue* real_queue, std::uint64_t plane_count, std::uint64_t planes,
+                       std::uint64_t params);
+};
+// Installs `hooks`/`state` on `device` (the proxy or its DXGI pointer) once. False, with a line on stderr, when
+// `device` is not a proxy, an argument is null, or a table is already installed: the caller keeps `state` then.
+bool set_device_presentation(void* device, const PresentationHooks* hooks, void* state);
+// The installed state when `device` is a proxy whose table is exactly `hooks`; null otherwise. No reference is added.
+void* device_presentation_state(const void* device, const PresentationHooks* hooks);
+
+// The console PresentX entry for the queue router (modern queue slot 32): `queue` is the queue proxy (RCX), a1..a3 the
+// console words (plane count, plane array, parameters). Calls the installed presentation table of the queue's
+// device with the real queue behind the proxy. E_NOTIMPL (traced "unsupported") without a table; E_INVALIDARG when
+// `queue` is not a queue proxy. The result is traced as XboxID3D12CommandQueue::PresentX.
+HRESULT queue_proxy_present_x(void* queue, std::uint64_t plane_count, std::uint64_t planes, std::uint64_t params);
 
 // Per-slot call counters and first-call flags for the device and heap proxies. Slot 0 also counts the
 // QueryInterface call made while a proxy is created, so tests reset the counters after creation.

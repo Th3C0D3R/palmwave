@@ -17,6 +17,7 @@
 
 #ifdef PALMWAVE_VULKAN_DEVICE
 #include "d3d12_com.h"
+#include "xbox_present_bridge.h"
 #endif
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
@@ -218,6 +219,14 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
             std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice: proxy over the Vulkan device failed "
                                  "(hr=0x%08lx)\n", static_cast<unsigned long>(vhr));
             return result(method, vhr);
+        }
+        // The PresentX bridge (window "Palmwave Game Launcher", presenter, shared frame pacer) goes in BEFORE the outer
+        // is set, so its presenter holds the real device and not the proxy. Without it the device still works, the
+        // frame events keep the proxy's first-frame counter, and queue PresentX is refused (E_NOTIMPL).
+        if (xbox_version == 0x00020004u) {
+            if (const HRESULT bridge = rt::d3d12::install_present_bridge(*out); FAILED(bridge))
+                std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice: no PresentX bridge (hr=0x%08lx); nothing "
+                                     "can be presented on this device\n", static_cast<unsigned long>(bridge));
         }
         rt::d3d12::set_device_outer(vulkan, static_cast<IUnknown*>(*out));
         if (!tracing)

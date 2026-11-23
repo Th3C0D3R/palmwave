@@ -8863,6 +8863,13 @@ bool is_sparse_image(ID3D12Resource* resource) {
     return object && object->sparse_image();
 }
 
+bool device_has_outer(ID3D12Device* device) {
+    Device* d = Device::from<Device>(device);
+    if (!d) return false;
+    IUnknown* self = static_cast<ID3D12Device*>(d);
+    return d->holder() != self;
+}
+
 void set_device_outer(ID3D12Device* device, IUnknown* outer) {
     Device* d = Device::from<Device>(device);
     if (!d) return;
@@ -9237,6 +9244,13 @@ float WindowPresenter::display_sdr_white_nits() const {
 bool WindowPresenter::enable_capture() { return presenter_->enable_capture(); }
 
 void WindowPresenter::set_abort(std::function<bool()> abort) { presenter_->set_abort(std::move(abort)); }
+
+HRESULT WindowPresenter::wait_for_present(DWORD timeout_ms) {
+    const VkResult result = presenter_->wait_last_present(std::uint64_t(timeout_ms) * 1000000);
+    if (result == VK_TIMEOUT) return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    if (result == VK_NOT_READY) return E_PENDING;
+    return present_result(result);
+}
 
 bool WindowPresenter::read_back(std::vector<std::uint8_t>& pixels, VkExtent2D* extent, VkFormat* format) {
     return presenter_->read_back(pixels, extent, format);
