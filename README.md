@@ -43,7 +43,7 @@ The direct run records **25 startup events** and **2,341 D3D12 trace events**: 2
 
 ## Current stop and run configurations
 
-The direct run stopped on a guest breakpoint after pipeline creation. Follow-up tracing identified the third indirect command signature as the first call returning an error. The slot 41 adapter now accepts its measured 12-byte compute argument (type 105). On the RTX 5080 the next probe created four signatures and stopped after the fifth, a mesh-dispatch signature, returned unsupported. A separate local build created that fifth signature and reached an 18th root signature. It stopped at Xbox device slot 61 while creating a sampler. See the [diagnostic results](STATUS.md#sampler-creation-after-the-fifth-indirect-signature) and [parent fixes under review](docs/peer_compatibility.md).
+A local diagnostic build created five indirect command signatures, reached an 18th root signature and wrote its first sampler through Xbox device slot 61. The next call, device slot 74, reached desktop ShaderCacheControl and failed. The executable stopped before submitting a command list. The sampler decoder is in the public runtime. Reaching this point also used a local mesh-signature implementation and a cache warmed with the builder. See the [latest executable measurements](STATUS.md#first-sampler-and-the-next-device-call) and [peer implementation notes](docs/peer_compatibility.md).
 
 | Configuration | Observed reach |
 |---|---|

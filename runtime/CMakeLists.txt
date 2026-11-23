@@ -970,6 +970,11 @@ if(BUILD_TESTING)
     add_test(NAME xs_proxy_mock_resource_routes COMMAND xs_proxy_mock_test --resource-routes)
     add_test(NAME xs_proxy_mock_env_resource_95 COMMAND xs_proxy_mock_test --env-resource-struct-slot 95)
     add_test(NAME xs_proxy_mock_env_resource_108 COMMAND xs_proxy_mock_test --env-resource-struct-slot 108)
+    # Device slot 61 (CreateSamplerX for the title, the PC CreateMetaCommand for a host) with the D3D12 trace on.
+    add_test(NAME xs_proxy_mock_slot61_trace COMMAND xs_proxy_mock_test --slot61)
+    set_tests_properties(xs_proxy_mock_slot61_trace PROPERTIES
+                         PASS_REGULAR_EXPRESSION "device slot 61; a host caller gets the PC CreateMetaCommand[)] unsupported"
+                         FAIL_REGULAR_EXPRESSION "xs_proxy_mock line [0-9]+:")
     add_test(NAME xs_proxy_mock_slot70_trace COMMAND xs_proxy_mock_test --slot70)
     set_tests_properties(xs_proxy_mock_slot70_trace PROPERTIES
                          PASS_REGULAR_EXPRESSION "[(]device slot 70[)] unsupported"

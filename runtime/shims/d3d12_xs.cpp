@@ -174,6 +174,12 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
     rt::d3d12_xs::set_default_descriptor_heap_allocator(&kXmemDescriptorHeapAllocator);
     // Consulted only by slot 127's double opt-in hook-backed texture experiment (an explicit test provider still wins).
     rt::d3d12_xs::set_default_texture_page_provider(&kXmemTexturePageProvider);
+    // Device slot 61 is CreateSamplerX only for a caller in an image this loader mapped (the title); any other caller
+    // keeps the PC CreateMetaCommand. Caller split from upstream PR #7115 (mrp1no, 8f756ebe, GPL-3.0).
+    rt::d3d12_xs::set_console_caller([](std::uint64_t address) {
+        std::uint64_t base = 0;
+        return rt::shims::mapped_image_base(address, base);
+    });
     if (!out) return result(method, E_POINTER);
     *out = nullptr;
     if (!riid) return result(method, E_POINTER);

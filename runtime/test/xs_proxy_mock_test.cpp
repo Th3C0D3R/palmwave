@@ -18,6 +18,9 @@
 //     a raw view of the live buffer through PC slot 18 with the translated handle, never PC slot 70; every refusal
 //     (shape, range, destination, VA, resolver, unreadable bytes) writes nothing and leaves no reference. --slot70 runs
 //     it with the D3D12 trace on; --env-slots-70 moves a configured route onto 70, which must win;
+//   - device slot 61: CreateSamplerX for a console caller (a synthetic 0x6c-byte console sampler decoded into PC
+//     CreateSampler, slot 22, with the translated SAMPLER handle) and the PC CreateMetaCommand for a host caller; every
+//     unknown, unsupported, invalid, destination and unreadable refusal calls nothing. --slot61 runs it traced;
 //   - --resource-routes: device slots 92-95, 108-110 and 112 to ID3D12Device4/ID3D12Device8 through separate
 //     queried interface objects (95/108 in the console and the PC struct-return form), and their explicit refusals;
 //   - --host-import-experiment on|off: device slot 133's opt-in experiment (PALMWAVE_EXPERIMENTAL_XBOX_HOST_IMPORT, set
@@ -47,6 +50,7 @@
 #include <cstring>
 #include <initializer_list>
 #include <iterator>
+#include <limits>
 #include <new>
 #include <utility>
 
@@ -171,6 +175,8 @@ struct Mock {
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
     // device slot 18 (CreateShaderResourceView): the description as it arrived (the caller's copy is temporary).
     D3D12_SHADER_RESOURCE_VIEW_DESC srv;
+    // device slot 22 (CreateSampler): the same, for the description device slot 61 builds on its own stack.
+    D3D12_SAMPLER_DESC sampler;
     // device: the separate objects QueryInterface returns for ID3D12Device4 / ID3D12Device8 (null: the device itself).
     RouteAlias* device4_alias;
     RouteAlias* device8_alias;
@@ -328,6 +334,11 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         if (slot == 18) {
             std::memset(&m->srv, 0, sizeof(m->srv));
             if (a2 > 0xFFFF) std::memcpy(&m->srv, reinterpret_cast<const void*>(a2), sizeof(m->srv));
+        }
+        // CreateSampler(desc, handle): the same marker rule for a1.
+        if (slot == 22) {
+            std::memset(&m->sampler, 0, sizeof(m->sampler));
+            if (a1 > 0xFFFF) std::memcpy(&m->sampler, reinterpret_cast<const void*>(a1), sizeof(m->sampler));
         }
         switch (slot) {
             case 8: {  // CreateCommandQueue: capture values, never retain a temporary description.
@@ -3159,6 +3170,411 @@ int check_srv_at_va() {
     return 0;
 }
 
+// ---- Device slot 61: CreateSamplerX for the title, the PC CreateMetaCommand for a host caller ----
+//
+// The console call void(this, 0x6c-byte console sampler desc*, CPU handle) through the proxy's vtable. The descriptions
+// are synthetic byte arrays laid out as d3d12_xs_device.h ("Device slot 61") records FiveStar's measured offsets; no
+// bytes come from the title. The mock device's slot 22 (CreateSampler) records the D3D12_SAMPLER_DESC and handle it
+// receives; its slot 61 (the PC CreateMetaCommand) must be reached only by a host caller. The console-caller check is
+// a test classifier here (the real one asks the loader whether the return address is in a mapped image).
+
+// The fields the decoder reads, in console numbering.
+struct ConsoleSampler {
+    std::uint32_t mag = 2, min = 2, mip = 2, unknown10 = 1, reduction = 0;
+    std::uint32_t address[3] = {1, 1, 1};
+    float min_lod = 0.0f, max_lod = D3D12_FLOAT32_MAX, bias = 0.0f;
+    std::uint32_t anisotropy = 0, comparison = 1;
+    float border[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+};
+
+struct SamplerXBytes {
+    alignas(8) std::uint8_t b[0x6c];
+};
+
+void putf(std::uint8_t* at, std::size_t offset, float value) { std::memcpy(at + offset, &value, 4); }
+
+SamplerXBytes sampler_x_bytes(const ConsoleSampler& s) {
+    SamplerXBytes out{};  // zeroed first, as the measured caller does
+    put32(out.b, 0x04, s.mag);
+    put32(out.b, 0x08, s.min);
+    put32(out.b, 0x0C, s.mip);
+    put32(out.b, 0x10, s.unknown10);
+    put32(out.b, 0x14, s.reduction);
+    for (int i = 0; i < 3; ++i) put32(out.b, 0x18 + 4 * static_cast<std::size_t>(i), s.address[i]);
+    putf(out.b, 0x24, s.min_lod);
+    putf(out.b, 0x28, s.max_lod);
+    putf(out.b, 0x30, s.bias);
+    put32(out.b, 0x34, s.anisotropy);
+    put32(out.b, 0x40, s.comparison);
+    for (int i = 0; i < 4; ++i) putf(out.b, 0x44 + 4 * static_cast<std::size_t>(i), s.border[i]);
+    return out;
+}
+
+bool g_console_caller_answer = false;
+bool test_console_caller(std::uint64_t) { return g_console_caller_answer; }
+
+bool same_sampler(const D3D12_SAMPLER_DESC& a, const D3D12_SAMPLER_DESC& b) {
+    return a.Filter == b.Filter && a.AddressU == b.AddressU && a.AddressV == b.AddressV && a.AddressW == b.AddressW &&
+           std::memcmp(&a.MipLODBias, &b.MipLODBias, 4) == 0 && a.MaxAnisotropy == b.MaxAnisotropy &&
+           a.ComparisonFunc == b.ComparisonFunc && std::memcmp(a.BorderColor, b.BorderColor, 16) == 0 &&
+           std::memcmp(&a.MinLOD, &b.MinLOD, 4) == 0 && std::memcmp(&a.MaxLOD, &b.MaxLOD, 4) == 0;
+}
+
+int check_sampler_x() {
+    using O = xs::SamplerXOutcome;
+    constexpr auto kSampler = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+    constexpr std::uint64_t kInc = 32;                        // the mock's SAMPLER increment
+    constexpr std::uint64_t kCustom = 0x0000650000000000ull;  // the title backing of the sampler heap below
+    const GUID meta_command{0x12345678, 0x1234, 0x1234, {1, 2, 3, 4, 5, 6, 7, 8}};
+    g_backing = {};
+    xs::set_default_descriptor_heap_allocator(nullptr);
+    xs::set_descriptor_heap_allocator(nullptr);
+    xs::set_console_caller(nullptr);
+    g_console_caller_answer = false;
+
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true);  // level 9: the PC slot 61 (CreateMetaCommand) exists
+    EXPECT(device && xs::device_slot_overridden(61));
+    Mock* other_mock = nullptr;
+    void* other = make_device(other_mock, 9, true);
+    EXPECT(other);
+
+    // Heaps: a plain sampler heap, a title-backed one, a CBV_SRV_UAV heap, another device's sampler heap, a released one.
+    void* plain = nullptr;
+    EXPECT(make_heap(device, kSampler, 4, &plain) == S_OK);
+    void* cbv = nullptr;
+    EXPECT(make_heap(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, &cbv) == S_OK);
+    void* foreign_heap = nullptr;
+    EXPECT(make_heap(other, kSampler, 4, &foreign_heap) == S_OK);
+    void* gone = nullptr;
+    EXPECT(make_heap(device, kSampler, 4, &gone) == S_OK);
+    const std::uint64_t gone_cpu = real_heap_of(gone)->heap_cpu;
+    EXPECT(release(gone) == 0);
+    xs::set_descriptor_heap_allocator(&kMockBackingAllocator);
+    g_backing.next = kCustom;
+    void* heap = nullptr;
+    EXPECT(make_heap(device, kSampler, 8, &heap) == S_OK && raw(heap, 9) == kCustom);
+    xs::set_descriptor_heap_allocator(nullptr);
+    const std::uint64_t real0 = real_heap_of(heap)->heap_cpu;
+    const std::uint64_t plain0 = real_heap_of(plain)->heap_cpu;
+    xs::reset_device_proxy_stats();
+    xs::reset_sampler_x_stats();
+
+    // No classifier installed: every caller is a host one, and slot 61 is the PC CreateMetaCommand, word for word.
+    const auto meta = [&](void* on) {
+        return raw(on, 61, word(&meta_command), 0, 0, 0, word(&kUnknownIid), 0x77);
+    };
+    EXPECT(hr_of(meta(device)) == S_OK);
+    EXPECT(mock->calls[61] == 1 && mock->calls[22] == 0 && mock->args[61][0] == word(&meta_command) &&
+           mock->args[61][4] == word(&kUnknownIid) && xs::device_slot_hits(61) == 1);
+    EXPECT(xs::last_sampler_x_outcome() == O::none && xs::sampler_x_created_calls() == 0 &&
+           xs::sampler_x_refused_calls() == 0);
+    // A classifier that says "not the title" is the same.
+    xs::set_console_caller(&test_console_caller);
+    meta(device);
+    EXPECT(mock->calls[61] == 2 && mock->calls[22] == 0 && xs::last_sampler_x_outcome() == O::none);
+
+    // The title from here on.
+    g_console_caller_answer = true;
+    const auto call61 = [&](const SamplerXBytes& bytes, std::uint64_t destination) {
+        return raw(device, 61, word(bytes.b), destination);
+    };
+
+    // 1. The common shape: trilinear, WRAP, the full LOD range, into a title-backed slot. The handle is translated to
+    //    the real heap; the description reaches PC CreateSampler (slot 22) field for field; the caller's bytes are not
+    //    written; PC slot 61 is not reached.
+    {
+        const SamplerXBytes args = sampler_x_bytes({});
+        SamplerXBytes call = args;
+        EXPECT(call61(call, kCustom + 2 * kInc) == 0);
+        EXPECT(std::memcmp(&call, &args, sizeof(args)) == 0);
+        EXPECT(mock->calls[61] == 2 && mock->calls[22] == 1 && mock->args[22][1] == real0 + 2 * kInc);
+        D3D12_SAMPLER_DESC want{};
+        want.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        want.AddressU = want.AddressV = want.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        want.MaxAnisotropy = 0;
+        want.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+        want.MaxLOD = D3D12_FLOAT32_MAX;
+        EXPECT(same_sampler(mock->sampler, want));
+        EXPECT(xs::last_sampler_x_outcome() == O::created && xs::sampler_x_created_calls() == 1 &&
+               xs::sampler_x_refused_calls() == 0 && xs::device_slot_hits(61) == 3);
+    }
+    // 2. Every non-default field at once: point mag, linear min, point mip, the maximum reduction, three different
+    //    address modes, a LOD window, a negative bias, a table border colour; into a plain heap's real slot (unchanged).
+    {
+        ConsoleSampler s;
+        s.mag = 1;
+        s.min = 2;
+        s.mip = 1;
+        s.unknown10 = 2;
+        s.reduction = 2;
+        s.address[0] = 3;
+        s.address[1] = 4;
+        s.address[2] = 5;
+        s.min_lod = 1.5f;
+        s.max_lod = 8.0f;
+        s.bias = -0.5f;
+        s.anisotropy = 4;  // not anisotropic: passed as it is, unused by the filter
+        s.border[0] = 0.25f;
+        s.border[1] = 0.5f;
+        s.border[2] = 0.75f;
+        s.border[3] = 1.0f;
+        call61(sampler_x_bytes(s), plain0 + kInc);
+        EXPECT(mock->calls[22] == 2 && mock->args[22][1] == plain0 + kInc);
+        D3D12_SAMPLER_DESC want{D3D12_FILTER_MAXIMUM_MIN_LINEAR_MAG_MIP_POINT,
+                                D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                                D3D12_TEXTURE_ADDRESS_MODE_BORDER,
+                                D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE,
+                                -0.5f,
+                                4,
+                                D3D12_COMPARISON_FUNC_NEVER,
+                                {0.25f, 0.5f, 0.75f, 1.0f},
+                                1.5f,
+                                8.0f};
+        EXPECT(same_sampler(mock->sampler, want));
+    }
+    // 3. Anisotropic comparison sampler (both filters 3, linear mip, LESS_EQUAL, 16x).
+    {
+        ConsoleSampler s;
+        s.mag = s.min = 3;
+        s.anisotropy = 16;
+        s.comparison = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+        s.address[0] = s.address[1] = s.address[2] = 3;
+        call61(sampler_x_bytes(s), kCustom);
+        EXPECT(mock->calls[22] == 3 && mock->args[22][1] == real0);
+        EXPECT(mock->sampler.Filter == D3D12_FILTER_COMPARISON_ANISOTROPIC && mock->sampler.MaxAnisotropy == 16 &&
+               mock->sampler.ComparisonFunc == D3D12_COMPARISON_FUNC_LESS_EQUAL &&
+               mock->sampler.AddressU == D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+    }
+    // 4. The minimum reduction, a point comparison sampler, and the last slot of the title range.
+    {
+        ConsoleSampler s;
+        s.reduction = 1;
+        call61(sampler_x_bytes(s), kCustom + 7 * kInc);
+        EXPECT(mock->calls[22] == 4 && mock->args[22][1] == real0 + 7 * kInc &&
+               mock->sampler.Filter == D3D12_FILTER_MINIMUM_MIN_MAG_MIP_LINEAR);
+        ConsoleSampler c;
+        c.mag = c.min = c.mip = 1;
+        c.comparison = D3D12_COMPARISON_FUNC_GREATER;
+        call61(sampler_x_bytes(c), kCustom + 7 * kInc);
+        EXPECT(mock->calls[22] == 5 && mock->sampler.Filter == D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT &&
+               mock->sampler.ComparisonFunc == D3D12_COMPARISON_FUNC_GREATER);
+    }
+    // The PC slot 22 itself is unchanged: the caller's own description and the translated handle.
+    {
+        D3D12_SAMPLER_DESC pc{};
+        pc.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+        pc.AddressU = pc.AddressV = pc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_MIRROR;
+        raw(device, 22, word(&pc), kCustom + kInc);
+        EXPECT(mock->calls[22] == 6 && mock->args[22][0] == word(&pc) && mock->args[22][1] == real0 + kInc &&
+               same_sampler(mock->sampler, pc) && xs::sampler_x_created_calls() == 5);
+    }
+
+    // Every refusal: PC CreateSampler and CreateMetaCommand not called, the caller's bytes unchanged, the refusal
+    // counted with its own outcome.
+    const std::uint64_t good_dest = kCustom + kInc;
+    const auto refused = [&](const SamplerXBytes& args, std::uint64_t destination, O want) {
+        SamplerXBytes call = args;
+        const unsigned samplers = mock->calls[22] + other_mock->calls[22];
+        const unsigned metas = mock->calls[61] + other_mock->calls[61];
+        const std::uint64_t before = xs::sampler_x_refused_calls();
+        const std::uint64_t created = xs::sampler_x_created_calls();
+        call61(call, destination);
+        const bool ok = mock->calls[22] + other_mock->calls[22] == samplers &&
+                        mock->calls[61] + other_mock->calls[61] == metas &&
+                        std::memcmp(&call, &args, sizeof(args)) == 0 && xs::last_sampler_x_outcome() == want &&
+                        xs::sampler_x_refused_calls() == before + 1 && xs::sampler_x_created_calls() == created;
+        if (!ok)
+            std::fprintf(stderr, "%s: slot 61 refusal: outcome %d (want %d), slot 22 calls %u -> %u\n", g_label,
+                         static_cast<int>(xs::last_sampler_x_outcome()), static_cast<int>(want), samplers,
+                         mock->calls[22] + other_mock->calls[22]);
+        return ok;
+    };
+    const SamplerXBytes good = sampler_x_bytes({});
+    const auto with_byte = [&](std::size_t offset, std::uint8_t value) {
+        SamplerXBytes a = good;
+        a.b[offset] = value;
+        return a;
+    };
+    const auto with = [](ConsoleSampler s) { return sampler_x_bytes(s); };
+
+    // Reserved bytes: the first and last of each range.
+    for (const std::size_t offset : {0x00, 0x03, 0x2C, 0x2F, 0x38, 0x3F, 0x54, 0x6B})
+        EXPECT(refused(with_byte(offset, 0x01), good_dest, O::unknown_field));
+
+    // Known fields with values outside their encoding: never mapped to a neighbour or a default.
+    {
+        ConsoleSampler s;
+        s.mag = 0;
+        EXPECT(refused(with(s), good_dest, O::unknown_value));
+        s = {};
+        s.mag = 4;
+        EXPECT(refused(with(s), good_dest, O::unknown_value));
+        s = {};
+        s.min = 0;
+        EXPECT(refused(with(s), good_dest, O::unknown_value));
+        s = {};
+        s.mip = 0;
+        EXPECT(refused(with(s), good_dest, O::unknown_value));
+        s = {};
+        s.mip = 3;
+        EXPECT(refused(with(s), good_dest, O::unknown_value));
+        s = {};
+        s.unknown10 = 0;
+        EXPECT(refused(with(s), good_dest, O::unknown_value));
+        s = {};
+        s.unknown10 = 3;
+        EXPECT(refused(with(s), good_dest, O::unknown_value));
+        s = {};
+        s.reduction = 3;
+        EXPECT(refused(with(s), good_dest, O::unknown_value));
+        s = {};
+        s.address[0] = 0;  // FiveStar would substitute WRAP
+        EXPECT(refused(with(s), good_dest, O::unknown_value));
+        s = {};
+        s.address[2] = 6;
+        EXPECT(refused(with(s), good_dest, O::unknown_value));
+        s = {};
+        s.comparison = 0;  // FiveStar would substitute NEVER
+        EXPECT(refused(with(s), good_dest, O::unknown_value));
+        s = {};
+        s.comparison = 9;
+        EXPECT(refused(with(s), good_dest, O::unknown_value));
+    }
+    // Known values this layer does not combine.
+    {
+        ConsoleSampler s;
+        s.mag = 3;
+        s.anisotropy = 8;
+        EXPECT(refused(with(s), good_dest, O::unsupported));
+        s = {};
+        s.min = 3;
+        s.anisotropy = 8;
+        EXPECT(refused(with(s), good_dest, O::unsupported));
+        s = {};
+        s.mag = s.min = 3;
+        s.mip = 1;
+        s.anisotropy = 8;
+        EXPECT(refused(with(s), good_dest, O::unsupported));
+        s = {};
+        s.comparison = D3D12_COMPARISON_FUNC_LESS;
+        s.reduction = 1;  // FiveStar would drop the minimum reduction
+        EXPECT(refused(with(s), good_dest, O::unsupported));
+    }
+    // Invalid numbers: nothing is clamped.
+    {
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        const float inf = std::numeric_limits<float>::infinity();
+        ConsoleSampler s;
+        s.min_lod = nan;
+        EXPECT(refused(with(s), good_dest, O::invalid_value));
+        s = {};
+        s.max_lod = nan;
+        EXPECT(refused(with(s), good_dest, O::invalid_value));
+        s = {};
+        s.min_lod = 2.0f;
+        s.max_lod = 1.0f;
+        EXPECT(refused(with(s), good_dest, O::invalid_value));
+        s = {};
+        s.bias = 16.0f;
+        EXPECT(refused(with(s), good_dest, O::invalid_value));
+        s = {};
+        s.bias = nan;
+        EXPECT(refused(with(s), good_dest, O::invalid_value));
+        s = {};
+        s.anisotropy = 17;  // the caller masks with 0x1f, so 17..31 can arrive; FiveStar would clamp to 16
+        EXPECT(refused(with(s), good_dest, O::invalid_value));
+        s = {};
+        s.mag = s.min = 3;
+        s.anisotropy = 0;  // FiveStar would clamp to 1
+        EXPECT(refused(with(s), good_dest, O::invalid_value));
+        s.anisotropy = 31;
+        EXPECT(refused(with(s), good_dest, O::invalid_value));
+        s = {};
+        s.border[1] = inf;
+        EXPECT(refused(with(s), good_dest, O::invalid_value));
+        s = {};
+        s.border[3] = nan;
+        EXPECT(refused(with(s), good_dest, O::invalid_value));
+    }
+    // Destinations: null, off a descriptor boundary, past the title range, a CBV_SRV_UAV slot, another device's
+    // sampler heap, a handle the proxy never saw, a released heap's slot.
+    EXPECT(refused(good, 0, O::invalid_destination));
+    EXPECT(refused(good, kCustom + kInc / 2, O::invalid_destination));
+    EXPECT(refused(good, kCustom + 8 * kInc, O::invalid_destination));
+    EXPECT(refused(good, real_heap_of(cbv)->heap_cpu, O::invalid_destination));
+    EXPECT(refused(good, real_heap_of(foreign_heap)->heap_cpu, O::invalid_destination));
+    EXPECT(refused(good, 0x4242000, O::invalid_destination));
+    EXPECT(refused(good, gone_cpu, O::invalid_destination));
+    // A malformed description wins over a bad destination: the description is decoded first.
+    EXPECT(refused(with_byte(0x00, 0x01), 0, O::unknown_field));
+
+    // Descriptions that cannot be read: null, running off a committed page into a reserved one, a guard page, a
+    // no-access page. Nothing is copied from them, and the guard page stays armed.
+    {
+        const auto unreadable = [&](std::uint64_t desc_word) {
+            const unsigned samplers = mock->calls[22];
+            const std::uint64_t before = xs::sampler_x_refused_calls();
+            raw(device, 61, desc_word, good_dest);
+            return mock->calls[22] == samplers && mock->calls[61] == 2 &&
+                   xs::last_sampler_x_outcome() == O::unreadable && xs::sampler_x_refused_calls() == before + 1;
+        };
+        EXPECT(unreadable(0));
+        auto* const pages = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 0x3000, MEM_RESERVE, PAGE_NOACCESS));
+        EXPECT(pages != nullptr);
+        EXPECT(VirtualAlloc(pages, 0x1000, MEM_COMMIT, PAGE_READWRITE) == pages);
+        EXPECT(VirtualAlloc(pages + 0x2000, 0x1000, MEM_COMMIT, PAGE_READWRITE | PAGE_GUARD) == pages + 0x2000);
+        std::uint8_t* const straddle = pages + 0x1000 - 0x40;  // 0x40 of the 0x6c bytes are committed
+        std::memcpy(straddle, good.b, 0x40);
+        EXPECT(unreadable(word(straddle)));
+        EXPECT(unreadable(word(pages + 0x1000)));  // reserved, not committed
+        EXPECT(unreadable(word(pages + 0x2000)));  // guard page: not touched
+        // The same bytes wholly inside the committed page are accepted.
+        std::uint8_t* const inside = pages + 0x1000 - sizeof(good.b);
+        std::memcpy(inside, good.b, sizeof(good.b));
+        raw(device, 61, word(inside), good_dest);
+        EXPECT(xs::last_sampler_x_outcome() == O::created && mock->args[22][1] == real0 + kInc);
+        DWORD old = 0;
+        EXPECT(VirtualProtect(pages, 0x1000, PAGE_NOACCESS, &old) != FALSE);
+        EXPECT(unreadable(word(inside)));
+        MEMORY_BASIC_INFORMATION info{};
+        EXPECT(VirtualQuery(pages + 0x2000, &info, sizeof(info)) == sizeof(info) && (info.Protect & PAGE_GUARD));
+        EXPECT(VirtualFree(pages, 0, MEM_RELEASE) != FALSE);
+    }
+
+    // A base PC device (44 slots, no PC slot 61): the title still gets CreateSamplerX (refused here: it has no heap);
+    // a host caller gets the beyond-table E_NOTIMPL, never a stray call.
+    {
+        Mock* base = nullptr;
+        void* base_device = make_device(base, 0, false);
+        EXPECT(base_device);
+        raw(base_device, 61, word(good.b), good_dest);
+        EXPECT(base->calls[61] == 0 && base->calls[22] == 0 &&
+               xs::last_sampler_x_outcome() == O::invalid_destination);
+        g_console_caller_answer = false;
+        EXPECT(hr_of(meta(base_device)) == E_NOTIMPL && base->calls[61] == 0);
+        g_console_caller_answer = true;
+        EXPECT(release(base_device) == 0 && base->refs == 0);
+    }
+
+    // Back to a host caller: the PC CreateMetaCommand again.
+    g_console_caller_answer = false;
+    meta(device);
+    EXPECT(mock->calls[61] == 3 && mock->calls[22] == 7);
+    xs::set_console_caller(nullptr);
+
+    EXPECT(xs::sampler_x_created_calls() == 6);
+    EXPECT(release(heap) == 0 && release(plain) == 0 && release(cbv) == 0 && release(foreign_heap) == 0);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    EXPECT(release(other) == 0 && other_mock->refs == 0);
+    std::printf("%s: device slot 61 decodes the 0x6c-byte console sampler into PC CreateSampler (slot 22) with the "
+                "translated sampler handle for the title, keeps the PC CreateMetaCommand for host callers, and refuses "
+                "unknown fields, unknown values, unsupported combinations, invalid numbers, invalid destinations and "
+                "unreadable descriptions without writing anything\n",
+                g_label);
+    return 0;
+}
+
 // ---- 11. Device4/Device8 resource routes: console slots 92-95, 108-110 and 112 (--resource-routes) ----
 //
 // The slot-to-method mapping is public reference only (OpenScarlett and two upstream PRs), not a measured retail call.
@@ -4555,6 +4971,11 @@ int main(int argc, char** argv) {
         rt::d3d12_trace::set_enabled(true);
         return check_srv_at_va();
     }
+    if (argc == 2 && std::strcmp(argv[1], "--slot61") == 0) {
+        // The same checks with the D3D12 trace on (as palmwave --trace-d3d12): every refusal is a traced line.
+        rt::d3d12_trace::set_enabled(true);
+        return check_sampler_x();
+    }
     if (argc == 2 && std::strcmp(argv[1], "--slot127") == 0) {
         rt::d3d12_trace::set_enabled(true);  // every outcome is a traced line, as under palmwave --trace-d3d12
         return check_committed_resource3();
@@ -4583,7 +5004,7 @@ int main(int argc, char** argv) {
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_xbox_queue_descriptions() ||
         check_lists() || check_shared_base_list() || check_experimental_flush() ||
         check_custom_heap_properties() || check_resource_allocation_info() || check_descriptor_heaps() || check_list_descriptor_handles() ||
-        check_srv_at_va() || check_committed_resource3() || check_committed_texture_experiment())
+        check_srv_at_va() || check_sampler_x() || check_committed_resource3() || check_committed_texture_experiment())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;

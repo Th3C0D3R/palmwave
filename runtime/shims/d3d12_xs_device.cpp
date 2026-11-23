@@ -6,7 +6,8 @@
 // arguments only, so the x64 registers and stack words line up exactly; methods that return a struct keep their
 // hidden return pointer in RDX, which is passed through as the first argument unchanged. The measured exceptions
 // are IUnknown (0-2), slot 14 (which wraps the heap), 25/26 (the title passes the return buffer in RCX and the device in
-// RDX), 62, 70 (a raw buffer SRV named by GPU VA, never the PC CreatePlacedResource1), 76, 127 (the PC
+// RDX), 61 (CreateSamplerX for the title, the PC CreateMetaCommand for a host caller), 62, 70 (a raw buffer SRV named by
+// GPU VA, never the PC CreatePlacedResource1), 76, 127 (the PC
 // ID3D12Device10::CreateCommittedResource3 through its own interface pointer) and 133
 // (CreatePlacedResourceX, handed to the registered handler), plus Device4/Device8 routes 92-95 and 108-110/112
 // (95/108 in both struct-return forms), and heap proxy 9/10 conversion from the PC hidden-pointer form to Xbox RAX. Slots
@@ -34,9 +35,11 @@
 
 #include <windows.h>
 #include <dxgi1_4.h>
+#include <intrin.h>  // _ReturnAddress: slot 61 serves a console caller differently from a host one
 
 #include <atomic>
 #include <cerrno>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -186,6 +189,7 @@ const char* slot_name(unsigned slot) {
         case 46: return "SetResidencyPriority (proxies unwrapped)";
         case 48: return "Xbox CreateCommandQueueX -> queue proxy";
         case 50: return "EnqueueMakeResident (proxies unwrapped)";
+        case 61: return "Xbox CreateSamplerX (device slot 61; a host caller gets the PC CreateMetaCommand)";
         case 62: return "Xbox CreateComputePipelineState";
         case 67: return "Xbox DeserializeComputePipelineStateX";
         case 70: return "Xbox CreateShaderResourceView at a GPU VA (device slot 70)";
@@ -3886,6 +3890,222 @@ void proxy_create_srv_at_va_x(DeviceProxy* self, std::uint64_t resource_desc, st
     d3d12_trace::record(slot_name(70), "ok");
 }
 
+// ---- Device slot 61: CreateSamplerX(console sampler desc, CPU destination) (contract in d3d12_xs_device.h) ----
+//
+// Method and caller split from upstream PR #7115 (mrp1no, 8f756ebe048af042638ce51a61490f35f4f44ee3, GPL-3.0). The field
+// offsets and value encodings are facts from FiveStar (five-star-recomp b1ac4037d29a17f150f0cd03c9ba4aee69e6098e,
+// ConsoleSamplerDescription.cs and ConsoleSamplers.cs, GPL-3.0-or-later). No FiveStar code is translated here. Palmwave
+// departs from both: #7115's desktop-prefix cast is not used, and FiveStar's anisotropy clamp, WRAP replacement of
+// unknown address modes, 0 -> NEVER comparison and dropped min/max reduction under comparison are refusals here.
+constexpr unsigned kCreateSamplerX = 61;
+
+namespace console_sampler {
+constexpr std::size_t kBytes = 0x6c;
+constexpr std::size_t kMagFilter = 0x04;
+constexpr std::size_t kMinFilter = 0x08;
+constexpr std::size_t kMipFilter = 0x0C;
+constexpr std::size_t kUnknown10 = 0x10;
+constexpr std::size_t kReduction = 0x14;
+constexpr std::size_t kAddress[3] = {0x18, 0x1C, 0x20};
+constexpr std::size_t kMinLod = 0x24;
+constexpr std::size_t kMaxLod = 0x28;
+constexpr std::size_t kMipLodBias = 0x30;
+constexpr std::size_t kMaxAnisotropy = 0x34;
+constexpr std::size_t kComparison = 0x40;
+constexpr std::size_t kBorder = 0x44;  // four floats (ASSUMPTION, see the header)
+struct Range {
+    std::size_t offset;
+    std::size_t bytes;
+};
+// Bytes with no known meaning. The measured caller zeroes the whole description before it fills the fields above.
+constexpr Range kReserved[] = {{0x00, 4}, {0x2C, 4}, {0x38, 8}, {0x54, 0x18}};
+// Every byte is either a decoded field or reserved: 13 decoded words (the ten at 0x04..0x28 and 0x30/0x34/0x40), the
+// border, the reserved ranges.
+static_assert(13 * 4 + 16 + 4 + 4 + 8 + 0x18 == kBytes, "every byte of the description is accounted for");
+static_assert(kBorder + 16 == 0x54, "the border is followed by the last reserved range");
+
+constexpr std::uint32_t kPoint = 1;
+constexpr std::uint32_t kLinear = 2;
+constexpr std::uint32_t kAnisotropic = 3;
+}  // namespace console_sampler
+
+std::atomic<SamplerXOutcome> g_sampler_x_last{SamplerXOutcome::none};
+std::atomic<std::uint64_t> g_sampler_x_created{0};
+std::atomic<std::uint64_t> g_sampler_x_refused{0};
+std::atomic<ConsoleCaller> g_console_caller{nullptr};
+
+bool is_console_caller(const void* return_address) {
+    const ConsoleCaller classify = g_console_caller.load(std::memory_order_acquire);
+    return classify && classify(reinterpret_cast<std::uint64_t>(return_address));
+}
+
+// Why a description was not decoded: the outcome, a fixed reason, and the offset and 32-bit value it is about.
+struct SamplerXRefusal {
+    SamplerXOutcome outcome = SamplerXOutcome::created;  // created: decoded
+    const char* detail = nullptr;
+    std::size_t offset = 0;
+    std::uint32_t value = 0;
+};
+
+// Decodes the copied 0x6c bytes into `out`, or says why not. `out` is written only on success.
+SamplerXRefusal decode_console_sampler(const std::uint8_t* bytes, D3D12_SAMPLER_DESC& out) {
+    namespace cs = console_sampler;
+    const auto word = [&](std::size_t offset) { return field_at<std::uint32_t>(bytes, offset); };
+    const auto refusal = [&](SamplerXOutcome outcome, std::size_t offset, const char* detail) {
+        return SamplerXRefusal{outcome, detail, offset, word(offset)};
+    };
+    for (const cs::Range& r : cs::kReserved)
+        for (std::size_t i = 0; i < r.bytes; ++i)
+            if (bytes[r.offset + i] != 0)
+                return SamplerXRefusal{SamplerXOutcome::unknown_field, "a reserved byte is not 0", r.offset + i,
+                                       bytes[r.offset + i]};
+
+    // (Not named min/mag: windows.h may define min() as a macro.)
+    const std::uint32_t mag_filter = word(cs::kMagFilter);
+    const std::uint32_t min_filter = word(cs::kMinFilter);
+    const std::uint32_t mip_filter = word(cs::kMipFilter);
+    const std::uint32_t reduction = word(cs::kReduction);
+    const std::uint32_t comparison = word(cs::kComparison);
+    if (mag_filter < cs::kPoint || mag_filter > cs::kAnisotropic)
+        return refusal(SamplerXOutcome::unknown_value, cs::kMagFilter, "MagFilter is not 1, 2 or 3");
+    if (min_filter < cs::kPoint || min_filter > cs::kAnisotropic)
+        return refusal(SamplerXOutcome::unknown_value, cs::kMinFilter, "MinFilter is not 1, 2 or 3");
+    if (mip_filter != cs::kPoint && mip_filter != cs::kLinear)
+        return refusal(SamplerXOutcome::unknown_value, cs::kMipFilter, "MipFilter is not 1 or 2");
+    const std::uint32_t unknown10 = word(cs::kUnknown10);
+    if (unknown10 != 1 && unknown10 != 2)
+        return refusal(SamplerXOutcome::unknown_value, cs::kUnknown10, "the word at +0x10 is not 1 or 2");
+    if (reduction > 2)
+        return refusal(SamplerXOutcome::unknown_value, cs::kReduction, "Reduction is not 0, 1 or 2");
+    D3D12_TEXTURE_ADDRESS_MODE address[3]{};
+    for (int i = 0; i < 3; ++i) {
+        const std::uint32_t mode = word(cs::kAddress[i]);
+        if (mode < std::uint32_t{D3D12_TEXTURE_ADDRESS_MODE_WRAP} ||
+            mode > std::uint32_t{D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE})
+            return refusal(SamplerXOutcome::unknown_value, cs::kAddress[i],
+                           "an address mode is not a D3D12_TEXTURE_ADDRESS_MODE (1..5)");
+        address[i] = static_cast<D3D12_TEXTURE_ADDRESS_MODE>(mode);
+    }
+    if (comparison < std::uint32_t{D3D12_COMPARISON_FUNC_NEVER} || comparison > std::uint32_t{D3D12_COMPARISON_FUNC_ALWAYS})
+        return refusal(SamplerXOutcome::unknown_value, cs::kComparison,
+                       "ComparisonFunc is not a D3D12_COMPARISON_FUNC (1..8)");
+
+    const bool anisotropic = mag_filter == cs::kAnisotropic || min_filter == cs::kAnisotropic;
+    if (anisotropic && (mag_filter != cs::kAnisotropic || min_filter != cs::kAnisotropic))
+        return refusal(SamplerXOutcome::unsupported, cs::kMagFilter, "only one of MagFilter/MinFilter is anisotropic");
+    if (anisotropic && mip_filter != cs::kLinear)
+        return refusal(SamplerXOutcome::unsupported, cs::kMipFilter, "anisotropic with a point mip filter");
+    const bool compares = comparison != std::uint32_t{D3D12_COMPARISON_FUNC_NEVER};
+    if (compares && reduction != 0)
+        return refusal(SamplerXOutcome::unsupported, cs::kReduction,
+                       "a comparison function with a minimum/maximum reduction");
+
+    const auto min_lod = field_at<float>(bytes, cs::kMinLod);
+    const auto max_lod = field_at<float>(bytes, cs::kMaxLod);
+    const auto bias = field_at<float>(bytes, cs::kMipLodBias);
+    const std::uint32_t max_anisotropy = word(cs::kMaxAnisotropy);
+    if (std::isnan(min_lod)) return refusal(SamplerXOutcome::invalid_value, cs::kMinLod, "MinLOD is NaN");
+    if (std::isnan(max_lod)) return refusal(SamplerXOutcome::invalid_value, cs::kMaxLod, "MaxLOD is NaN");
+    if (min_lod > max_lod) return refusal(SamplerXOutcome::invalid_value, cs::kMinLod, "MinLOD is above MaxLOD");
+    if (!(bias >= D3D12_MIP_LOD_BIAS_MIN && bias <= D3D12_MIP_LOD_BIAS_MAX))
+        return refusal(SamplerXOutcome::invalid_value, cs::kMipLodBias, "MipLODBias is NaN or outside [-16, 15.99]");
+    if (max_anisotropy > std::uint32_t{D3D12_MAX_MAXANISOTROPY} || (anisotropic && max_anisotropy < 1))
+        return refusal(SamplerXOutcome::invalid_value, cs::kMaxAnisotropy,
+                       anisotropic ? "MaxAnisotropy is not 1..16" : "MaxAnisotropy is above 16");
+    float border[4];
+    for (int i = 0; i < 4; ++i) {
+        border[i] = field_at<float>(bytes, cs::kBorder + 4 * static_cast<std::size_t>(i));
+        if (!std::isfinite(border[i]))
+            return refusal(SamplerXOutcome::invalid_value, cs::kBorder + 4 * static_cast<std::size_t>(i),
+                           "a border colour component is not finite");
+    }
+
+    const D3D12_FILTER_REDUCTION_TYPE type = compares          ? D3D12_FILTER_REDUCTION_TYPE_COMPARISON
+                                             : reduction == 1  ? D3D12_FILTER_REDUCTION_TYPE_MINIMUM
+                                             : reduction == 2  ? D3D12_FILTER_REDUCTION_TYPE_MAXIMUM
+                                                               : D3D12_FILTER_REDUCTION_TYPE_STANDARD;
+    const auto pc_type = [](std::uint32_t console) {  // 1 point / 2 linear (anisotropic is handled above)
+        return console == cs::kLinear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT;
+    };
+    D3D12_SAMPLER_DESC desc{};
+    desc.Filter = anisotropic ? D3D12_ENCODE_ANISOTROPIC_FILTER(type)
+                              : D3D12_ENCODE_BASIC_FILTER(pc_type(min_filter), pc_type(mag_filter),
+                                                          pc_type(mip_filter), type);
+    desc.AddressU = address[0];
+    desc.AddressV = address[1];
+    desc.AddressW = address[2];
+    desc.MipLODBias = bias;
+    desc.MaxAnisotropy = max_anisotropy;
+    desc.ComparisonFunc = static_cast<D3D12_COMPARISON_FUNC>(comparison);
+    std::memcpy(desc.BorderColor, border, sizeof(border));
+    desc.MinLOD = min_lod;
+    desc.MaxLOD = max_lod;
+    out = desc;
+    return {};
+}
+
+const char* sampler_x_reason(SamplerXOutcome outcome) {
+    switch (outcome) {
+        case SamplerXOutcome::unreadable: return "the description is null or not 0x6c committed readable bytes";
+        case SamplerXOutcome::unknown_field: return "unknown field";
+        case SamplerXOutcome::unknown_value: return "unknown value";
+        case SamplerXOutcome::unsupported: return "unsupported combination";
+        case SamplerXOutcome::invalid_value: return "invalid value";
+        case SamplerXOutcome::invalid_destination:
+            return "the destination is not a SAMPLER slot of a heap this device created";
+        default: return "unknown";
+    }
+}
+
+// Not forwarded: counted, logged (first time per outcome, every time with XS_TRACE) and traced.
+void refuse_sampler_x(const SamplerXRefusal& why, std::uint64_t desc, std::uint64_t destination) {
+    g_sampler_x_refused.fetch_add(1, std::memory_order_relaxed);
+    g_sampler_x_last.store(why.outcome, std::memory_order_relaxed);
+    static std::atomic<bool> warned[8];
+    const auto index = static_cast<unsigned>(why.outcome);
+    if ((index < std::size(warned) && first_call(warned[index])) || trace_enabled())
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: device slot 61 CreateSamplerX refused (%s%s%s, +0x%02llx = 0x%08x): desc 0x%llx, "
+                     "destination 0x%llx; nothing written, the destination is unchanged\n",
+                     sampler_x_reason(why.outcome), why.detail ? ": " : "", why.detail ? why.detail : "",
+                     static_cast<unsigned long long>(why.offset), static_cast<unsigned>(why.value),
+                     static_cast<unsigned long long>(desc), static_cast<unsigned long long>(destination));
+    const bool unsupported = why.outcome == SamplerXOutcome::unknown_field ||
+                             why.outcome == SamplerXOutcome::unknown_value ||
+                             why.outcome == SamplerXOutcome::unsupported;
+    d3d12_trace::record(slot_name(kCreateSamplerX), unsupported ? "unsupported" : "refused");
+}
+
+// Device slot 61 for a console caller. Both words keep their thunk positions (see the top of this file).
+void proxy_create_sampler_x(DeviceProxy* self, std::uint64_t desc, std::uint64_t destination) {
+    std::uint8_t bytes[console_sampler::kBytes];
+    if (!readable_range(desc, sizeof(bytes)) || !guarded_copy(bytes, reinterpret_cast<const void*>(desc), sizeof(bytes)))
+        return refuse_sampler_x({SamplerXOutcome::unreadable, nullptr, 0, 0}, desc, destination);
+    D3D12_SAMPLER_DESC pc{};
+    const SamplerXRefusal why = decode_console_sampler(bytes, pc);
+    if (why.outcome != SamplerXOutcome::created) return refuse_sampler_x(why, desc, destination);
+    SIZE_T real_destination = 0;
+    if (!registered_descriptor(self, static_cast<SIZE_T>(destination), D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                               real_destination))
+        return refuse_sampler_x({SamplerXOutcome::invalid_destination, nullptr, 0, 0}, desc, destination);
+
+    self->real->CreateSampler(&pc, D3D12_CPU_DESCRIPTOR_HANDLE{real_destination});
+    g_sampler_x_created.fetch_add(1, std::memory_order_relaxed);
+    g_sampler_x_last.store(SamplerXOutcome::created, std::memory_order_relaxed);
+    static std::atomic<bool> logged{false};
+    if (first_call(logged) || trace_enabled())
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: device slot 61 CreateSamplerX: filter 0x%x, address %u/%u/%u, LOD [%g, %g] bias %g, "
+                     "anisotropy %u, comparison %u, border (%g %g %g %g), +0x10 word %u; destination 0x%llx -> 0x%llx\n",
+                     static_cast<unsigned>(pc.Filter), static_cast<unsigned>(pc.AddressU),
+                     static_cast<unsigned>(pc.AddressV), static_cast<unsigned>(pc.AddressW), pc.MinLOD, pc.MaxLOD,
+                     pc.MipLODBias, pc.MaxAnisotropy, static_cast<unsigned>(pc.ComparisonFunc), pc.BorderColor[0],
+                     pc.BorderColor[1], pc.BorderColor[2], pc.BorderColor[3],
+                     static_cast<unsigned>(field_at<std::uint32_t>(bytes, console_sampler::kUnknown10)),
+                     static_cast<unsigned long long>(destination), static_cast<unsigned long long>(real_destination));
+    d3d12_trace::record(slot_name(kCreateSamplerX), "ok");
+}
+
 // The Xbox routes at their configured indices (PALMWAVE_XS_*_SLOT). False when `slot` is none of them. Slot 70 asks
 // first too, so a route moved onto 70 keeps the existing environment-override priority over the built-in handler.
 // The route dispatch is adapted from upstream PR #7066 (tedin7, 8e700080, GPL-3.0).
@@ -4090,6 +4310,18 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                         out, device, a2, a3, reinterpret_cast<const D3D12_RESOURCE_DESC1*>(a4), infos));
             }
         }
+        if constexpr (Slot == kCreateSamplerX) {
+            // The title's CreateSamplerX. A host caller (or every caller with no classifier installed) falls through
+            // to the PC slot 61, ID3D12Device5::CreateMetaCommand, forwarded like any other PC method below.
+            if (is_console_caller(_ReturnAddress())) {
+                note_slot(Slot);
+                // A configured Xbox route moved onto 61 keeps its priority, as on slot 70.
+                std::uint64_t routed = 0;
+                if (route_xbox_device_slot(self, Slot, a1, a2, a3, a4, a5, routed)) return routed;
+                proxy_create_sampler_x(self, a1, a2);
+                return 0;  // void method: the return register carries nothing
+            }
+        }
         note_slot(Slot);
         // Xbox device slots, before the PC vtable is indexed: the public HLE's 78/79/80 would otherwise reach
         // CreateReservedResource2/CreateSampler2 or fall past an 80-slot table, and 48/73 would reach unrelated PC
@@ -4284,6 +4516,17 @@ void reset_srv_at_va_stats() {
     g_srv_at_va_refused.store(0, std::memory_order_relaxed);
 }
 
+SamplerXOutcome last_sampler_x_outcome() { return g_sampler_x_last.load(std::memory_order_relaxed); }
+std::uint64_t sampler_x_created_calls() { return g_sampler_x_created.load(std::memory_order_relaxed); }
+std::uint64_t sampler_x_refused_calls() { return g_sampler_x_refused.load(std::memory_order_relaxed); }
+void reset_sampler_x_stats() {
+    g_sampler_x_last.store(SamplerXOutcome::none, std::memory_order_relaxed);
+    g_sampler_x_created.store(0, std::memory_order_relaxed);
+    g_sampler_x_refused.store(0, std::memory_order_relaxed);
+}
+
+void set_console_caller(ConsoleCaller classify) { g_console_caller.store(classify, std::memory_order_release); }
+
 bool is_heap_proxy(const void* heap) {
     return heap && *reinterpret_cast<void* const*>(heap) == reinterpret_cast<void*>(get_heap_vtable());
 }
@@ -4358,7 +4601,8 @@ std::uint64_t hook_backed_texture_refused_calls() { return g_hook_backed_refused
 bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || (slot >= 17 && slot <= 24) || slot == 25 || slot == 26 ||
         slot == 31 || slot == 32 || slot == 34 ||
-        slot == 35 || slot == 36 || slot == 41 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
+        slot == 35 || slot == 36 || slot == 41 || slot == 45 || slot == 46 || slot == 50 || slot == kCreateSamplerX ||
+        slot == 62 || slot == 67 ||
         slot == 70 || slot == 75 || slot == 76 || slot == kCreateCommittedResource3X || slot == 133 ||
         (slot >= 92 && slot <= 95) || (slot >= 108 && slot <= 110) || slot == 112)
         return true;

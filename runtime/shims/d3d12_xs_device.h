@@ -10,6 +10,10 @@
 //             stack. Same routing as 26; the descriptions reach the device unchanged and its answer (UINT64_MAX
 //             included) is returned as it is. Slot 43 (GetAdapterLuid) is still forwarded in the PC form: no call
 //             of it has been seen.
+//   slot 61   void CreateSamplerX(console sampler desc, CPU destination), for a caller in an image the guest loader
+//             mapped (set_console_caller): the 0x6c-byte console description is decoded field by field and the PC
+//             CreateSampler (slot 22) writes the sampler into a registered SAMPLER heap slot. Any other caller gets the
+//             PC slot 61, ID3D12Device5::CreateMetaCommand, unchanged. See "Device slot 61" further down.
 //   slot 62   CreateComputePipelineState(desc, w2, w3, iid, out): two words (0 from XboxBvhBuilder, meaning unknown)
 //             before the IID. The PC slot 62 is CreateStateObject.
 //   slot 67   CreateComputePipelineState from native code (desc, iid, out): converts the Xbox native-code desc
@@ -384,10 +388,77 @@ std::uint64_t srv_at_va_created_calls();
 std::uint64_t srv_at_va_refused_calls();
 void reset_srv_at_va_stats();
 
+// ---- Device slot 61: CreateSamplerX(console sampler desc, CPU destination) ----
+//
+// Measured locally on the Xbox Series executable: after its first five indirect signatures, the title's sampler
+// creation called device slot 61, which the proxy forwarded to the PC slot 61 (ID3D12Device5::CreateMetaCommand), and
+// it faulted there. Upstream PR #7115 (mrp1no, 8f756ebe048af042638ce51a61490f35f4f44ee3, GPL-3.0) identified the
+// method as (desc, dest) and the caller split below; Palmwave adopts the caller split. #7115 forwarded the description
+// pointer as a PC D3D12_SAMPLER_DESC (a desktop-prefix hypothesis). FiveStar's measured layout contradicts that
+// hypothesis, and Palmwave does not use it.
+//
+// The console description is 0x6c bytes. Field offsets are facts taken from FiveStar (five-star-recomp b1ac4037,
+// ConsoleSamplerDescription.cs / ConsoleSamplers.cs, GPL-3.0-or-later), which records them from the title's only caller
+// (the description is zeroed, then filled). Values are 32-bit little-endian unless noted:
+//   +0x00 reserved, must be 0     +0x04 MagFilter  +0x08 MinFilter   (1 point, 2 linear, 3 anisotropic)
+//   +0x0C MipFilter (1 point, 2 linear)            +0x10 unknown, must be 1 or 2; read, range-checked, not mapped
+//   +0x14 Reduction (0 standard, 1 minimum, 2 maximum)
+//   +0x18/+0x1C/+0x20 AddressU/V/W, D3D12_TEXTURE_ADDRESS_MODE numbering (1..5)
+//   +0x24 MinLOD (float)  +0x28 MaxLOD (float)  +0x2C reserved, must be 0  +0x30 MipLODBias (float)
+//   +0x34 MaxAnisotropy   +0x38..+0x3F reserved, must be 0
+//   +0x40 ComparisonFunc, D3D12_COMPARISON_FUNC numbering (1 NEVER .. 8 ALWAYS; the caller writes 1 for a
+//         non-comparison sampler, so a NEVER comparison sampler cannot be told apart and is decoded as non-comparison)
+//   +0x44..+0x53 border colour, four floats (ASSUMPTION: FiveStar copies this field straight into the desktop border
+//         colour, but the supplied files do not include its type; four floats is the desktop field's size)
+//   +0x54..+0x6B reserved, must be 0
+// The decoder is restricted on purpose. It maps only the encodings above. Unlike FiveStar it does not clamp
+// MaxAnisotropy, does not replace an unknown address mode with WRAP, and does not map ComparisonFunc 0 to NEVER or drop
+// a min/max reduction from a comparison sampler. Every value outside the table is refused. The refusals:
+//   unreadable          null pointer, or the 0x6c bytes are not all committed and readable (checked first, then copied
+//                       under an access-violation guard; the caller's bytes are never cast or written)
+//   unknown_field       a non-zero byte in a reserved range (no known meaning)
+//   unknown_value       a known field with a value outside its known encoding
+//   unsupported         known values in a combination this layer does not implement: only one of Mag/Min anisotropic,
+//                       anisotropic with a point mip filter, a comparison function with a minimum/maximum reduction
+//   invalid_value       NaN MinLOD/MaxLOD, MinLOD > MaxLOD, MipLODBias outside [D3D12_MIP_LOD_BIAS_MIN, _MAX],
+//                       MaxAnisotropy outside 1..16 (anisotropic) or 0..16 (otherwise), a non-finite border component
+//   invalid_destination not one SAMPLER descriptor of a heap this device proxy created (slot 14), on a descriptor
+//                       boundary (the slot-70 rule: no untracked handle is passed on)
+// On success the PC CreateSampler (slot 22) gets a D3D12_SAMPLER_DESC built from those fields alone and the real CPU
+// handle (translated out of a title-backed range when the slot is in one). Filter: D3D12_ENCODE_BASIC_FILTER(min - 1,
+// mag - 1, mip - 1, reduction) or D3D12_ENCODE_ANISOTROPIC_FILTER(reduction) when both are 3 and mip is linear;
+// reduction COMPARISON when ComparisonFunc is 2..8, else from +0x14. On every refusal nothing is forwarded and the
+// destination is untouched. The refusal is counted, logged (once per reason, every time with XS_TRACE) and traced:
+// "unsupported" for unknown_field/unknown_value/unsupported, "refused" for the rest. The method is void, so the title is
+// not told. The first live sampler used point min/mag, linear mip, wrap on all axes, and LOD 0..12. The reserved
+// ranges and the +0x10 word are what this decoder assumes.
+enum class SamplerXOutcome {
+    none,                 // no call yet (or reset)
+    created,              // the PC CreateSampler was called
+    unreadable,
+    unknown_field,
+    unknown_value,
+    unsupported,
+    invalid_value,
+    invalid_destination,
+};
+SamplerXOutcome last_sampler_x_outcome();
+std::uint64_t sampler_x_created_calls();
+std::uint64_t sampler_x_refused_calls();
+void reset_sampler_x_stats();
+
+// Whether a return address is in an image the guest loader mapped, i.e. the call comes from the title (from #7115).
+// Device slot 61 is CreateSamplerX for such a caller and the PC ID3D12Device5::CreateMetaCommand for any other; with no
+// check installed every caller is a host one (the runtime's own tests drive the Vulkan device through the proxy and call
+// CreateMetaCommand). D3D12XboxCreateDevice installs one built on rt::shims::mapped_image_base.
+using ConsoleCaller = bool (*)(std::uint64_t address);
+void set_console_caller(ConsoleCaller classify);
+
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14, 17-24 (CPU descriptor handles translated), 26 (the console's struct-return
 // form), 31/34/35/45/46/50 (proxies unwrapped),
-// 32 and 36 (fence proxies), 48/73 and 78/79/80 (the Xbox slots above, at their configured indices), 62, 67, 70, 76,
+// 32 and 36 (fence proxies), 48/73 and 78/79/80 (the Xbox slots above, at their configured indices), 61 (for a console
+// caller; a host caller is forwarded verbatim), 62, 67, 70, 76,
 // 92-95, 108-110, 112 (the Device4/Device8 resource routes), 127 and 133. A configured route moved onto
 // slot 70, 127 or a resource route takes precedence over the built-in handler.
 // Slot 10 is intentionally false: the measured 9/10 handle conversion is on the heap proxy, and device slot 9 is
