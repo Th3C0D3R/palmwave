@@ -866,11 +866,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     note_alias(va as usize, &x);
     // console-only state bits (Unicorn Overlord's 4K display target: 0x100000) are not the
     // PC's: the PC refused the resource (E_INVALIDARG) and the title threw
-    let mut state = state & real::PC_RESOURCE_STATES;
-    // (a depth buffer placed for unordered access – no longer one on the PC: written as depth)
-    if u32::from_le_bytes(x[0x30..0x34].try_into().unwrap()) & 2 != 0 && state & 0x8 != 0 {
-        state = (state & !0x8) | 0x10;
-    }
+    let state = placed_state(u32::from_le_bytes(x[0x30..0x34].try_into().unwrap()), state);
     // a depth buffer that shaders write too: the state its twin's copies start from (#970)
     let depth_uav = u32::from_le_bytes(x[0x30..0x34].try_into().unwrap()) & 6 == 6;
     let mut clear_buf = [0u8; 24];
@@ -969,7 +965,27 @@ pub(super) unsafe extern "system" fn create_placed_resource_layout_x(this: *mut 
 /// when `desc` is a texture so creation matches `enhanced_barrier::Barrier`.
 pub(super) unsafe fn layout_state_for_desc(layout: u32, desc: usize) -> u32 {
     let texture = desc != 0 && crate::gpu::shader::readable(desc, 4) && (desc as *const u32).read_unaligned() != D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
-    super::enhanced_barrier::layout_state(layout, texture).unwrap_or(0)
+    let state = super::enhanced_barrier::layout_state(layout, texture).unwrap_or(0);
+    // the state the resource is really made in (`create_placed_resource_x`): what is noted for
+    // the enhanced barriers of the title has to be the PC's state, not the console's
+    if texture && crate::gpu::shader::readable(desc, 0x38) {
+        placed_state(((desc + 0x30) as *const u32).read_unaligned(), state)
+    } else {
+        state
+    }
+}
+
+/// The PC state a placed resource of console flags `flags` is made in when the title asks for
+/// `state`: console-only state bits (Unicorn Overlord's 4K display target: 0x100000) are not the
+/// PC's – the PC refused the resource (E_INVALIDARG) and the title threw – and a depth buffer
+/// placed for unordered access is no longer a UAV texture on the PC: written as depth.
+pub(super) fn placed_state(flags: u32, state: u32) -> u32 {
+    let state = state & real::PC_RESOURCE_STATES;
+    if flags & 2 != 0 && state & 0x8 != 0 {
+        (state & !0x8) | 0x10
+    } else {
+        state
+    }
 }
 
 /// device #38 GetCopyableFootprints: a console resource desc the PC rejects (total stays
@@ -1093,6 +1109,30 @@ mod tests {
         assert_eq!(s(D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COPY_SOURCE), D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
         assert_eq!(s(D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COPY_DEST), D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
         assert_eq!(s(D3D12_BARRIER_LAYOUT_VIDEO_QUEUE_COMMON), 0);
+    }
+
+    /// A depth buffer made in the UNORDERED_ACCESS layout is in DEPTH_WRITE on the PC, and that
+    /// is the state its enhanced barriers start from (not UNORDERED_ACCESS, which it never has).
+    #[test]
+    fn a_depth_buffer_made_for_unordered_access_is_noted_in_depth_write() {
+        let desc = |flags: u32| {
+            let mut x = [0u8; 0x38];
+            x[0..4].copy_from_slice(&(D3D12_RESOURCE_DIMENSION_TEXTURE2D.0 as u32).to_le_bytes());
+            x[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
+            x
+        };
+        let (uav, depth_write) = (D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32, D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32);
+        let layout = D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS.0 as u32;
+        let (depth_uav, plain_uav) = (desc(0x6), desc(0x4));
+        unsafe {
+            assert_eq!(layout_state_for_desc(layout, depth_uav.as_ptr() as usize), depth_write);
+            assert_eq!(layout_state_for_desc(layout, plain_uav.as_ptr() as usize), uav, "a UAV texture stays one");
+            assert_eq!(layout_state_for_desc(D3D12_BARRIER_LAYOUT_SHADER_RESOURCE.0 as u32, depth_uav.as_ptr() as usize), 0xC0);
+        }
+        assert_eq!(placed_state(0x6, uav), depth_write);
+        assert_eq!(placed_state(0x2, uav | 0x10_0000), depth_write, "console-only bits go");
+        assert_eq!(placed_state(0x4, uav), uav);
+        assert_eq!(placed_state(0x2, 0x20), 0x20);
     }
 
     #[test]
