@@ -83,6 +83,11 @@ pub(super) fn marked(page: usize) -> bool {
     LAZY.read().unwrap_or_else(|e| e.into_inner()).contains(&page)
 }
 
+/// Whether the mapping has yet to fault in through the lazy handler.
+pub(super) fn uncommitted(page: usize) -> bool {
+    LAZY.read().unwrap_or_else(|e| e.into_inner()).contains(&page)
+}
+
 /// `page` is unmapped: true if it was never used (nothing to keep of it).
 pub(super) fn unmark(page: usize) -> bool {
     LAZY.write().unwrap_or_else(|e| e.into_inner()).remove(&page)
