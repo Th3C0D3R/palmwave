@@ -201,15 +201,16 @@ pub unsafe fn upload(dev: &ID3D12Device, queue: &ID3D12CommandQueue, res: &ID3D1
     r
 }
 
-/// What `upload_batch` keeps for a queue between batches: its allocator and list, a fence, and
-/// one persistently mapped upload buffer the batches' texels go through. Making them for every
-/// batch – an upload buffer per texture, an allocator, a list and a fence per batch – cost a
-/// retail game most of its frame once it streamed textures: each of those D3D12 calls waits for
-/// the video memory manager, 200 – 650 ms apiece then.
+/// What a batch of uploads uses on the GPU, kept for the next batches on its queue: an allocator
+/// and a list, a fence, and one persistently mapped upload buffer the batch's texels go through.
+/// Making them for every batch – an upload buffer per texture, an allocator, a list and a fence
+/// per batch – cost a retail game most of its frame once it streamed textures: each of those
+/// D3D12 calls waits for the video memory manager, 200 – 650 ms apiece then.
 struct Uploader {
     alloc: ID3D12CommandAllocator,
     list: ID3D12GraphicsCommandList,
     fence: ID3D12Fence,
+    /// the fence's value once the GPU has run the last batch
     value: u64,
     /// (buffer, its mapped bytes, capacity)
     staging: Option<(ID3D12Resource, *mut u8, u64)>,
@@ -218,12 +219,16 @@ struct Uploader {
 // D3D12 objects are free-threaded; the mapped pointer is only used by the holder of the uploader
 unsafe impl Send for Uploader {}
 
-/// queue (raw pointer) → its uploader, while no batch uses it
-static UPLOADERS: std::sync::Mutex<Option<std::collections::HashMap<usize, Uploader>>> = std::sync::Mutex::new(None);
+/// (device, queue) (raw pointers) → the uploaders of its batches no `InFlight` holds; one is
+/// taken again only once the GPU has run its last batch
+static UPLOADERS: std::sync::Mutex<Option<std::collections::HashMap<(usize, usize), Vec<Uploader>>>> = std::sync::Mutex::new(None);
 
 /// the smallest upload buffer made, and the placement alignment of texture data in it
 const STAGING_MIN: u64 = 4 << 20;
 const PLACEMENT: u64 = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64;
+/// upload buffer bytes a queue keeps in uploaders the GPU is done with (as much as
+/// `title_textures` lets a queue have in flight); past it the biggest buffers are released
+const KEEP_BYTES: u64 = 512 << 20;
 
 impl Uploader {
     unsafe fn new(dev: &ID3D12Device) -> Result<Uploader, String> {
@@ -248,22 +253,115 @@ impl Uploader {
         self.staging = Some((b.clone(), p as *mut u8, cap));
         Ok((b, p as *mut u8))
     }
+
+    /// Whether the GPU has run its last batch: its list and upload buffer are free again.
+    unsafe fn done(&self) -> bool {
+        self.fence.GetCompletedValue() >= self.value
+    }
+
+    fn capacity(&self) -> u64 {
+        self.staging.as_ref().map_or(0, |s| s.2)
+    }
+}
+
+/// An uploader of `key` the GPU is done with – the one whose upload buffer is the smallest that
+/// holds `bytes`, else the one with the biggest (it grows) – or a new one.
+unsafe fn take(dev: &ID3D12Device, key: (usize, usize), bytes: u64) -> Result<Uploader, String> {
+    let taken = UPLOADERS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&key)).and_then(|pool| {
+        let mut pick: Option<usize> = None;
+        for (i, u) in pool.iter().enumerate() {
+            if !u.done() {
+                continue;
+            }
+            let better = pick.is_none_or(|p| {
+                let (cap, best) = (u.capacity(), pool[p].capacity());
+                if best >= bytes { cap >= bytes && cap < best } else { cap > best }
+            });
+            if better {
+                pick = Some(i);
+            }
+        }
+        pick.map(|i| pool.swap_remove(i))
+    });
+    match taken {
+        Some(u) => Ok(u),
+        None => Uploader::new(dev),
+    }
+}
+
+/// `up` back with `key`'s uploaders. Of the upload buffers of those the GPU is done with, the
+/// biggest are released while they hold more than `KEEP_BYTES`.
+fn put_back(key: (usize, usize), up: Uploader) {
+    let mut released = Vec::new();
+    {
+        let mut g = UPLOADERS.lock().unwrap();
+        let pool = g.get_or_insert_with(Default::default).entry(key).or_default();
+        pool.push(up);
+        let mut idle: Vec<&mut Uploader> = pool.iter_mut().filter(|u| unsafe { u.done() }).collect();
+        idle.sort_unstable_by_key(|u| std::cmp::Reverse(u.capacity()));
+        let mut kept: u64 = idle.iter().map(|u| u.capacity()).sum();
+        for u in idle {
+            if kept <= KEEP_BYTES {
+                break;
+            }
+            kept -= u.capacity();
+            released.extend(u.staging.take());
+        }
+    }
+    // (released outside the lock)
+    drop(released);
+}
+
+/// A batch `submit_batch` put on a queue. Its uploader (allocator, list, upload buffer) is not
+/// used again before the GPU has run the batch: held here, then by its queue's uploaders, which
+/// take it again only once its fence has passed – never released under the GPU, which removed
+/// the device when a batch's wait timed out.
+pub struct InFlight {
+    key: (usize, usize),
+    up: Option<Uploader>,
+    /// bytes of the upload buffer it holds
+    pub bytes: u64,
+}
+
+impl InFlight {
+    /// Whether the GPU has run the batch.
+    pub unsafe fn done(&self) -> bool {
+        self.up.as_ref().is_none_or(|u| u.done())
+    }
+
+    /// Wait up to `timeout_ms` until the GPU has run the batch.
+    pub unsafe fn wait(&self, dev: &ID3D12Device, timeout_ms: u32) -> Result<(), String> {
+        let Some(u) = &self.up else { return Ok(()) };
+        fence::wait(&u.fence, u.value, dev, None, timeout_ms).map_err(|e| format!("texture copy: {e}"))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Some(up) = self.up.take() {
+            put_back(self.key, up);
+        }
+    }
 }
 
 /// Several uploads on one list, one wait: (resource, subresources, states) each – the states
 /// the texture is in and is left in: one for every subresource, or one per subresource (D3D12
 /// order). A failure of one is returned with its index; the others still run. The texels go
-/// through the queue's kept upload buffer (`Uploader`).
+/// through the queue's kept upload buffers (`Uploader`).
 pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> Result<Vec<(usize, String)>, String> {
     if items.is_empty() {
         return Ok(Vec::new());
     }
-    let key = windows::core::Interface::as_raw(queue) as usize;
-    let taken = UPLOADERS.lock().unwrap().as_mut().and_then(|m| m.remove(&key));
-    let mut up = match taken {
-        Some(u) => u,
-        None => Uploader::new(dev)?,
-    };
+    let (failed, in_flight) = submit_batch(dev, queue, items)?;
+    // (a batch still running after its wait keeps its uploader: `InFlight`)
+    in_flight.wait(dev, 10_000)?;
+    Ok(failed)
+}
+
+/// `upload_batch` without the wait: the batch is put on `queue`, and the `InFlight` returned
+/// holds what it uses until the GPU has run it.
+pub unsafe fn submit_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> Result<(Vec<(usize, String)>, InFlight), String> {
+    let key = (windows::core::Interface::as_raw(dev) as usize, windows::core::Interface::as_raw(queue) as usize);
     // where each texture's texels go in the upload buffer
     let mut failed = Vec::new();
     let mut planned = Vec::with_capacity(items.len());
@@ -279,9 +377,10 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
         }
     }
     if planned.is_empty() {
-        put_back(key, up);
-        return Ok(failed);
+        return Ok((failed, InFlight { key, up: None, bytes: 0 }));
     }
+    // (an error before the list runs releases an uploader the GPU is done with)
+    let mut up = take(dev, key, total)?;
     let (staging, mapped) = up.staging(dev, total)?;
     up.alloc.Reset().map_err(err)?;
     up.list.Reset(&up.alloc, None).map_err(err)?;
@@ -292,20 +391,13 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     up.list.Close().map_err(err)?;
     queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&up.list).map_err(err)?)]);
     up.value += 1;
+    let bytes = up.capacity();
+    let in_flight = InFlight { key, up: Some(up), bytes };
+    let up = in_flight.up.as_ref().unwrap();
+    // (a failed Signal leaves the fence short of the value: the uploader is not taken again)
     let copy_error = |e| format!("texture copy: {e}");
     queue.Signal(&up.fence, up.value).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
-    if let Err(e) = fence::wait(&up.fence, up.value, dev, None, 10_000) {
-        // the GPU may still read the upload buffer and run the list: they stay alive (a fresh
-        // uploader next time) – freeing them under the GPU removed the device
-        std::mem::forget(up);
-        return Err(copy_error(e));
-    }
-    put_back(key, up);
-    Ok(failed)
-}
-
-fn put_back(key: usize, up: Uploader) {
-    UPLOADERS.lock().unwrap().get_or_insert_with(Default::default).insert(key, up);
+    Ok((failed, in_flight))
 }
 
 /// Record the copy of `subs` into `res` on `list` (barriers from `before` and back to `after`);
@@ -779,8 +871,12 @@ mod tests {
                     .collect()
             };
             let textures = [make(64, 64, 7, DXGI_FORMAT_R8G8B8A8_UNORM), make(100, 30, 1, DXGI_FORMAT_R8G8B8A8_UNORM), make(256, 256, 9, DXGI_FORMAT_BC7_UNORM)];
-            let key = windows::core::Interface::as_raw(&queue) as usize;
-            let kept = || UPLOADERS.lock().unwrap().as_ref().and_then(|m| m.get(&key)).and_then(|u| u.staging.as_ref()).map(|s| (windows::core::Interface::as_raw(&s.0) as usize, s.2));
+            let key = (windows::core::Interface::as_raw(&dev) as usize, windows::core::Interface::as_raw(&queue) as usize);
+            let kept = || -> Vec<(usize, u64)> {
+                let g = UPLOADERS.lock().unwrap();
+                let pool = g.as_ref().and_then(|m| m.get(&key));
+                pool.into_iter().flatten().filter_map(|u| u.staging.as_ref()).map(|s| (windows::core::Interface::as_raw(&s.0) as usize, s.2)).collect()
+            };
             let mut buffers = Vec::new();
             for round in 0..2u8 {
                 let items: Vec<_> = textures.iter().enumerate().map(|(i, r)| (r.clone(), subs(r, round * 16 + i as u8), vec![SHADER_READ])).collect();
@@ -791,9 +887,70 @@ mod tests {
                         assert!(g == w, "round {round}, texture {i}, subresource {k} differs");
                     }
                 }
-                buffers.push(kept().expect("the queue's upload buffer is kept"));
+                buffers.push(kept());
             }
+            assert_eq!(buffers[0].len(), 1, "the queue keeps its upload buffer");
             assert_eq!(buffers[0], buffers[1], "the second batch made a new upload buffer");
+        }
+    }
+
+    /// A batch the GPU has not run (its queue waits for a fence the CPU signals later) keeps its
+    /// uploader, also once its `InFlight` is dropped: the next batch on the queue gets another
+    /// upload buffer. Once both have run, a batch takes one of their buffers again, and each
+    /// texture holds what its batch wrote.
+    #[test]
+    fn gpu_batches_in_flight_keep_their_upload_buffers() {
+        let Some((dev, queue)) = device() else {
+            println!("no D3D12 device – skipping");
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        };
+        unsafe {
+            let rd = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 64,
+                Height: 64,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            let textures: Vec<ID3D12Resource> = (0..3)
+                .map(|_| {
+                    let mut r: Option<ID3D12Resource> = None;
+                    dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &rd, SHADER_READ, None, &mut r).unwrap();
+                    r.unwrap()
+                })
+                .collect();
+            let subs = |v: u8| vec![Subresource { rows: 64, row_bytes: 256, depth: 1, data: vec![v; 64 * 256] }];
+            let submit = |k: usize, v: u8| submit_batch(&dev, &queue, &[(textures[k].clone(), subs(v), vec![SHADER_READ])]).unwrap().1;
+            let buffer = |f: &InFlight| f.up.as_ref().and_then(|u| u.staging.as_ref()).map(|s| windows::core::Interface::as_raw(&s.0) as usize).unwrap();
+            struct Open(ID3D12Fence);
+            impl Drop for Open {
+                fn drop(&mut self) {
+                    let _ = unsafe { self.0.Signal(1) };
+                }
+            }
+            let gate = Open(dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap());
+            queue.Wait(&gate.0, 1).unwrap();
+            let first = submit(0, 0x11);
+            assert!(!first.done(), "the queue waits for the CPU's signal");
+            let first_buffer = buffer(&first);
+            drop(first);
+            let second = submit(1, 0x22);
+            assert_ne!(buffer(&second), first_buffer, "a batch took the upload buffer of one the GPU has not run");
+            drop(gate);
+            second.wait(&dev, 10_000).unwrap();
+            let second_buffer = buffer(&second);
+            drop(second);
+            let third = submit(2, 0x33);
+            assert!([first_buffer, second_buffer].contains(&buffer(&third)), "a batch made a new upload buffer while two were free");
+            third.wait(&dev, 10_000).unwrap();
+            drop(third);
+            for (t, v) in textures.iter().zip([0x11, 0x22, 0x33]) {
+                assert_eq!(read_back(&dev, &queue, t, &subs(v)), subs(v));
+            }
         }
     }
 
