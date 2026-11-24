@@ -8,6 +8,9 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
+#[path = "log_console.rs"]
+mod console;
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 #[repr(u8)]
 pub enum Level {
@@ -53,6 +56,7 @@ pub fn init(path: Option<&Path>, level: Level, echo_stderr: bool) {
     START.get_or_init(Instant::now);
     LEVEL.store(level as u8, Ordering::Relaxed);
     ECHO.store(echo_stderr, Ordering::Relaxed);
+    console::init();
     if let Some(p) = path {
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -84,9 +88,19 @@ pub fn write(level: Level, args: std::fmt::Arguments<'_>) {
             }
         }
     }
-    if ECHO.load(Ordering::Relaxed) && level <= Level::Info {
+    if !console::write(level, line) && ECHO.load(Ordering::Relaxed) && level <= Level::Info {
         let _ = std::io::stderr().write_all(format!("xcl: {args}\n").as_bytes());
     }
+}
+
+/// Move the optional debug console beside the game window on its output thread.
+pub fn position_console(game_window: isize) {
+    console::position(game_window);
+}
+
+/// Lines the optional console could not enqueue; file logging is unaffected.
+pub fn console_dropped_lines() -> u64 {
+    console::dropped_lines()
 }
 
 pub fn flush() {

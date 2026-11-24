@@ -421,6 +421,7 @@ fn window_thread() {
         HWND_RAW.store(hwnd.0 as isize, Ordering::Release);
         crate::xlog_info!("XCL window created ({}x{})", cfg.window_width, cfg.window_height);
         crate::hle::kbm::attach(hwnd.0);
+        crate::log::position_console(hwnd.0 as isize);
         if super::overlay::enabled() { super::overlay_stats::start_sampling(); }
         SetTimer(Some(hwnd), COMPILE_TIMER, 500, None);
         let mut msg = MSG::default();
