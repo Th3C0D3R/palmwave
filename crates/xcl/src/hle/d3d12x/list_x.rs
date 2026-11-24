@@ -1185,7 +1185,12 @@ unsafe fn would_signal_close_cycle(graph: &mut SyncGraph, sig_q: usize, target_v
         if completed == u64::MAX || target.armed_waits.is_empty() {
             return false;
         }
-        target.armed_waits.iter().filter(|aw| aw.val <= sig_val).map(|aw| (aw.waiting_queue, aw.wait_seq)).collect()
+        // A wait for a value an earlier GPU signal of the cell gives ends with that signal, not
+        // with this one: no cycle closes through it. (A retail game moves its barrier cells over
+        // its queues frame by frame; with the last frame still on the GPU, a cell's new writer
+        // still waits for the last writer's value.)
+        let covered = target.submitted_signals.iter().map(|s| s.val).max().unwrap_or(0);
+        target.armed_waits.iter().filter(|aw| aw.val > covered && aw.val <= sig_val).map(|aw| (aw.waiting_queue, aw.wait_seq)).collect()
     };
     if target_waiters.is_empty() {
         return false;
@@ -6483,6 +6488,166 @@ mod tests {
                 gr.cells.remove(&va_b);
                 gr.cells.remove(&va_c);
             }
+        }
+    }
+
+    /// A retail game's frame barrier: each of five queues records in a console list its
+    /// Write64BitValueBottomOfPipeX of the frame's value, then Wait64BitValueX for the four cells
+    /// the other queues write, so the list splits at its first wait and the queue's signal goes
+    /// to the GPU before its waits. Which cell a queue writes rotates from frame to frame (the
+    /// game's jobs move over its compute queues), and a frame is recorded and submitted before
+    /// the GPU has run the one before (a gate holds the queues here): each queue then writes a
+    /// cell it still waits for from the last frame – a wait the last writer's pending GPU signal
+    /// ends, so not a cycle. Both frames must run on the GPU in their order, nothing signalled
+    /// on the CPU.
+    #[test]
+    fn five_queue_frame_barrier_with_rotating_cells_runs_on_the_gpu() {
+        use super::super::{bind, title_list};
+        use crate::gpu::{fence, recomp::runner::skip_test};
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        const QUEUES: usize = 5;
+        const FRAMES: u64 = 2;
+        type Exec = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
+                    skip_test("no GPU");
+                    return;
+                };
+                let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
+                    skip_test("no GPU");
+                    return;
+                };
+                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                    skip_test("no GPU");
+                    return;
+                }
+            }
+            let dev = dev.unwrap();
+            // q0 the direct queue, q1-q4 compute queues
+            let ty = |q: usize| if q == 0 { D3D12_COMMAND_LIST_TYPE_DIRECT } else { D3D12_COMMAND_LIST_TYPE_COMPUTE };
+            let queues: Vec<ID3D12CommandQueue> = (0..QUEUES).map(|q| dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: ty(q), ..Default::default() }).unwrap()).collect();
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let done: Vec<ID3D12Fence> = (0..QUEUES).map(|_| dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap()).collect();
+            // (kept: the values land from the thread that writes them after the GPU, `cpu_writes`)
+            let cells: &'static [AtomicU64; QUEUES] = Box::leak(Box::new([const { AtomicU64::new(0) }; QUEUES]));
+            let va = |c: usize| &cells[c] as *const AtomicU64 as u64;
+            // frame f: queue q writes cell (q + f) % 5 and waits for the four others
+            let own = |q: usize, f: u64| (q + f as usize) % QUEUES;
+            let ge = D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32;
+            for q in &queues {
+                q.Wait(&gate, 1).unwrap();
+            }
+
+            let mut allocators = Vec::new();
+            let mut lists: Vec<*mut c_void> = Vec::new();
+            let mut split = true;
+            let mut ordered = Vec::new();
+            for f in 1..=FRAMES {
+                // the frame's lists are all recorded before the first one goes to its queue
+                let mut frame = Vec::new();
+                for q in 0..QUEUES {
+                    let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty(q)).unwrap();
+                    let raw: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty(q), &alloc, None).unwrap();
+                    let pc = raw.into_raw();
+                    real::adopt(pc, real::Kind::CommandList);
+                    on_create(pc, alloc.as_raw() as usize, 0, ty(q));
+                    bind::reset(pc, alloc.as_raw() as usize, 0);
+                    let list = title_list::wrap(pc);
+                    // console code reaches the segment recording now; the slot guard sees Rust
+                    // callers as PC, so the console handlers are entered directly
+                    let recording = || {
+                        let mut segs = Vec::new();
+                        title_list::push_segments(list, &mut segs);
+                        *segs.last().unwrap()
+                    };
+                    write64_bottom_x(recording(), va(own(q, f)), f, 0, 0);
+                    for c in (0..QUEUES).filter(|&c| c != own(q, f)) {
+                        wait64_x(recording(), va(c), ge, f, 0, 0);
+                    }
+                    let close: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(*(*(list as *const *const usize)).add(9));
+                    split &= close(list) == 0;
+                    let mut segs = Vec::new();
+                    title_list::push_segments(list, &mut segs);
+                    split &= segs.len() == 2;
+                    allocators.push(alloc);
+                    frame.push(list);
+                }
+                for (q, &list) in frame.iter().enumerate() {
+                    let queue = queues[q].as_raw();
+                    let exec: Exec = std::mem::transmute(*(*(queue as *const *const usize)).add(PC_QUEUE_EXECUTE_COMMAND_LISTS));
+                    let mut segs = Vec::new();
+                    title_list::push_segments(list, &mut segs);
+                    execute_with_waits_on(queue, &segs, |chunk| {
+                        exec(queue, chunk.len() as u32, chunk.as_ptr());
+                        signal_write64_fences(queue, chunk);
+                        cpu_writes_after(queue, chunk);
+                    });
+                }
+                lists.extend(frame);
+                // the gate holds the GPU: the frame's signals and waits are all in the graph
+                let g = SYNC_GRAPH.lock().unwrap();
+                let cell = |c: usize| g.as_ref().and_then(|gr| gr.cells.get(&va(c)));
+                ordered.push((0..QUEUES).all(|q| {
+                    let qr = queues[q].as_raw() as usize;
+                    let signal = cell(own(q, f)).and_then(|c| c.submitted_signals.iter().find(|s| s.queue == qr && s.val == f)).map(|s| s.seq);
+                    let waits: Vec<u64> = (0..QUEUES)
+                        .filter(|&c| c != own(q, f))
+                        .filter_map(|c| cell(c)?.armed_waits.iter().find(|aw| aw.waiting_queue == qr && aw.val == f).map(|aw| aw.wait_seq))
+                        .collect();
+                    signal.is_some_and(|s| waits.len() == QUEUES - 1 && waits.iter().all(|&w| w > s))
+                }));
+            }
+            let released: Vec<u64> = {
+                let g = SYNC_GRAPH.lock().unwrap();
+                (0..QUEUES).map(|c| g.as_ref().and_then(|gr| gr.cells.get(&va(c))).map_or(u64::MAX, |cell| cell.cpu_signaled_max)).collect()
+            };
+            for (q, d) in queues.iter().zip(&done) {
+                q.Signal(d, 1).unwrap();
+            }
+            gate.Signal(1).unwrap();
+            let start = Instant::now();
+            while done.iter().any(|d| d.GetCompletedValue() < 1) && start.elapsed() < Duration::from_millis(3000) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let finished: Vec<bool> = done.iter().map(|d| d.GetCompletedValue() >= 1).collect();
+
+            // a failed run is rescued before it is reported: no queue or armed wait stays behind
+            let fences: Vec<ID3D12Fence> = {
+                let g = SYNC_GRAPH.lock().unwrap();
+                (0..QUEUES).filter_map(|c| g.as_ref()?.cells.get(&va(c))?.fence.clone()).collect()
+            };
+            for f in &fences {
+                let _ = f.Signal(FRAMES);
+            }
+            for d in &done {
+                let _ = fence::wait(d, 1, &dev, None, 2000);
+            }
+            if let Some(graph) = SYNC_GRAPH.lock().unwrap().as_mut() {
+                for c in 0..QUEUES {
+                    if let Some(cell) = graph.cells.remove(&va(c)) {
+                        ARMED_GPU_WAITS.fetch_sub(cell.armed_waits.len(), Ordering::AcqRel);
+                    }
+                }
+                for q in &queues {
+                    graph.queue_seq.remove(&(q.as_raw() as usize));
+                }
+            }
+            for &list in &lists {
+                let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(list as *const *const usize)).add(2));
+                release(list);
+            }
+            drop(allocators);
+
+            assert!(split, "each list splits at its first Wait64: the signal recorded before the waits is a segment of its own");
+            assert!(ordered[0], "frame 1: each queue's Write64 signal goes to the GPU before its waits");
+            assert_eq!(released, vec![0; QUEUES], "frame 2: a cell's new writer still waiting for the last writer's value is no cycle – nothing is signalled on the CPU");
+            assert!(ordered[1], "frame 2: each queue's Write64 signal goes to the GPU before its waits");
+            assert_eq!(finished, vec![true; QUEUES], "both frames run on the GPU without the watchdog");
         }
     }
 }
