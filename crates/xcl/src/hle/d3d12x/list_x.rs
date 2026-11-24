@@ -59,8 +59,20 @@ const MAX_FILL: u64 = 256 << 20;
 const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Watchdog timeout for GPU `queue.Wait` so a genuinely hung GPU cycle never triggers a 30 s
 /// hang, while giving heavy initial 3D frames (>1 s of dispatches) plenty of room to finish
-/// cleanly without prematurely breaking synchronization.
-const GPU_WAIT_WATCHDOG_TIMEOUT: Duration = Duration::from_millis(5000);
+/// cleanly without prematurely breaking synchronization. `XCL_GPU_WAIT_WATCHDOG_MS` sets it:
+/// when a retail title starts its world its producer queue was still busy after 5 s (a burst of
+/// ~7 300 dispatches kept an RTX 5080 at 100 % for ~12 s), so releasing the waits on the CPU let
+/// consumers run ahead of what they read; with the title's own 30 s hang check patched out
+/// (`XCL_PATCH`) a longer watchdog costs nothing.
+fn gpu_wait_watchdog() -> Duration {
+    static T: OnceLock<Duration> = OnceLock::new();
+    *T.get_or_init(|| watchdog_from(std::env::var("XCL_GPU_WAIT_WATCHDOG_MS").ok().as_deref()))
+}
+
+/// `XCL_GPU_WAIT_WATCHDOG_MS` as a duration (5000 ms when unset or not a positive number).
+fn watchdog_from(ms: Option<&str>) -> Duration {
+    Duration::from_millis(ms.and_then(|v| v.trim().parse::<u64>().ok()).filter(|&v| v > 0).unwrap_or(5000))
+}
 /// Cap on tracked per-list written UMA ranges (for same-list write-then-wait detection).
 const MAX_WRITTEN_RANGES: usize = 256;
 
@@ -1388,7 +1400,7 @@ fn wake_sync_watchdog() {
                         let mut waiter_ty = -1i32;
                         let before = cell.armed_waits.len();
                         cell.armed_waits.retain(|aw| {
-                            if aw.armed_at.elapsed() >= GPU_WAIT_WATCHDOG_TIMEOUT {
+                            if aw.armed_at.elapsed() >= gpu_wait_watchdog() {
                                 if aw.val >= max_exp {
                                     max_exp = aw.val;
                                     waiter_q = aw.waiting_queue;
@@ -1438,7 +1450,7 @@ fn wake_sync_watchdog() {
                 let pq = prod_q.map(queue_id);
                 crate::xlog_warn!(
                     "D3D12.X: GPU queue.Wait at {va:#x} >= {val:#x} did not complete within {} ms (waiter=q{wq}/ty{waiter_ty}, prod=q{pq:?}/ty{prod_ty:?}, recorded={rec:#x}, submitted={sub:#x}, completed={done:#x}) – released on CPU to prevent GPU hang",
-                    GPU_WAIT_WATCHDOG_TIMEOUT.as_millis()
+                    gpu_wait_watchdog().as_millis()
                 );
             }
             if had_expired {
@@ -3869,6 +3881,15 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_gpu_wait_watchdog_is_5_s_unless_xcl_gpu_wait_watchdog_ms_says_otherwise() {
+        assert_eq!(watchdog_from(None), Duration::from_millis(5000));
+        assert_eq!(watchdog_from(Some(" 60000 ")), Duration::from_secs(60));
+        for bad in ["0", "-1", "soon", ""] {
+            assert_eq!(watchdog_from(Some(bad)), Duration::from_millis(5000), "{bad}");
+        }
+    }
     use std::sync::Arc;
 
     static RESET_TEST_HR: AtomicU32 = AtomicU32::new(0);
