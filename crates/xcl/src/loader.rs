@@ -203,6 +203,11 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
         }
     }
 
+    // 5b. byte patches asked for with `XCL_PATCH`, while the image is still writable
+    if let Ok(spec) = std::env::var("XCL_PATCH") {
+        apply_patches(&spec, &name, unsafe { std::slice::from_raw_parts_mut(base as *mut u8, size) });
+    }
+
     // 6. page protections
     unsafe {
         let mut old = 0u32;
@@ -232,6 +237,71 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
         unsafe { crate::eh::hook_gs_failure(base + s.va as usize, len, &name) };
     }
     Ok(module)
+}
+
+/// One `XCL_PATCH` entry, `<module>+0x<rva>:<bytes there>=<bytes to write>` in hex, e.g.
+/// `title.exe+0x1234:732e=9090`.
+#[derive(Debug, PartialEq)]
+struct Patch {
+    module: String,
+    rva: usize,
+    old: Vec<u8>,
+    new: Vec<u8>,
+}
+
+fn parse_hex(s: &str) -> Option<Vec<u8>> {
+    let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    if s.is_empty() || s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()
+}
+
+fn parse_patch(e: &str) -> Option<Patch> {
+    let (target, bytes) = e.split_once(':')?;
+    let (module, rva) = target.trim().rsplit_once('+')?;
+    let rva = rva.trim();
+    let rva = usize::from_str_radix(rva.strip_prefix("0x").or_else(|| rva.strip_prefix("0X")).unwrap_or(rva), 16).ok()?;
+    let (old, new) = bytes.split_once('=')?;
+    let (old, new) = (parse_hex(old)?, parse_hex(new)?);
+    (old.len() == new.len() && !module.trim().is_empty()).then(|| Patch { module: crate::util::dll_key(module), rva, old, new })
+}
+
+/// The entries of an `XCL_PATCH` value, separated by `;`; one that does not parse is logged and
+/// left out.
+fn parse_patches(spec: &str) -> Vec<Patch> {
+    spec.split(';')
+        .filter(|e| !e.trim().is_empty())
+        .filter_map(|e| {
+            let p = parse_patch(e);
+            if p.is_none() {
+                crate::xlog_warn!("XCL_PATCH: '{}' is not <module>+0x<rva>:<hex bytes>=<as many hex bytes> – left out", e.trim());
+            }
+            p
+        })
+        .collect()
+}
+
+/// Writes the `XCL_PATCH` entries meant for `module` into its mapped `image`, each only where the
+/// image holds the bytes the entry expects, so that another version of the file is left alone.
+/// Returns how many were written.
+fn apply_patches(spec: &str, module: &str, image: &mut [u8]) -> usize {
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let mut applied = 0;
+    for p in parse_patches(spec).into_iter().filter(|p| p.module == module) {
+        let Some(at) = p.rva.checked_add(p.old.len()).and_then(|end| image.get_mut(p.rva..end)) else {
+            crate::xlog_warn!("XCL_PATCH: {module}+{:#x} is outside the image – not written", p.rva);
+            continue;
+        };
+        if *at != *p.old {
+            crate::xlog_warn!("XCL_PATCH: {module}+{:#x} holds {} instead of {} – not written (another version of the file?)", p.rva, hex(at), hex(&p.old));
+            continue;
+        }
+        at.copy_from_slice(&p.new);
+        applied += 1;
+        crate::xlog_info!("XCL_PATCH: {module}+{:#x}: {} -> {}", p.rva, hex(&p.old), hex(&p.new));
+    }
+    applied
 }
 
 unsafe fn tls_install(m: &MappedModule, template: usize, len: usize, total: u64, index_ptr: *mut u32) -> Result<(), String> {
@@ -422,6 +492,35 @@ pub fn on_tls_event(reason: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn patches_parse_and_bad_entries_are_left_out() {
+        let p = parse_patches(" Title.EXE+0x2215bdc:732e=9090 ; x.dll+10:aa bb=ccdd;");
+        assert_eq!(
+            p,
+            vec![
+                Patch { module: "title.exe".into(), rva: 0x2215bdc, old: vec![0x73, 0x2e], new: vec![0x90, 0x90] },
+                Patch { module: "x.dll".into(), rva: 0x10, old: vec![0xaa, 0xbb], new: vec![0xcc, 0xdd] },
+            ]
+        );
+        // lengths differ, odd digits, not hex, no rva, no bytes, no module
+        for bad in ["t.exe+0x10:73=9090", "t.exe+0x10:732=909", "t.exe+0x10:zz=90", "t.exe:73=90", "t.exe+0x10", "+0x10:73=90"] {
+            assert!(parse_patches(bad).is_empty(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_patch_is_written_only_into_its_module_where_the_expected_bytes_are() {
+        let mut image = vec![0u8; 0x40];
+        image[0x20..0x22].copy_from_slice(&[0x73, 0x2e]);
+        let spec = "t.exe+0x20:732e=9090;t.exe+0x30:732e=9090;other.exe+0x20:732e=eb2e;t.exe+0x3f:0000=1111";
+        assert_eq!(apply_patches(spec, "t.exe", &mut image), 1);
+        assert_eq!(image[0x20..0x22], [0x90, 0x90]);
+        // the bytes at 0x30 were not the expected ones, the last entry runs past the image
+        assert!(image[0x30..].iter().all(|&b| b == 0));
+        // written once: the same entry again finds 90 90 and leaves it
+        assert_eq!(apply_patches(spec, "t.exe", &mut image), 0);
+    }
 
     /// A PE32+ DLL of one section (.text at RVA 0x1000) holding `code`, its entry point at the
     /// start of it, preferred at `image_base` and relocatable (one empty block at RVA 0x1100);
