@@ -516,6 +516,7 @@ unsafe fn record_on_adopted(this: *mut c_void, n: u32, groups: usize) {
 
 /// command list #146 Barrier(NumBarrierGroups, pBarrierGroups)
 pub(super) unsafe extern "system" fn barrier_x(this: *mut c_void, n: u32, groups: *const c_void) {
+    super::list_x::note_depth_uav_barrier_groups(n, groups);
     record_on_adopted(this, n, groups as usize);
 }
 
