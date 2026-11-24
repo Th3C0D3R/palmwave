@@ -224,8 +224,10 @@ struct FrameBudget {
     waited_us: AtomicU64,
     /// `XCL_PSO_FRAME_BUDGET_MS` (default 8000; 0: None, no budget – every wait as before)
     limit: Option<Duration>,
-    /// `XCL_PSO_COMPUTE_BUDGET` (default on; 0: compute pipelines are waited for without limit
-    /// and built in the title's thread, as before)
+    /// `XCL_PSO_COMPUTE_BUDGET=1`: compute pipelines come under the budget too, and a dispatch past
+    /// it is skipped. Off by default: what a skipped dispatch would have written is missing, and a
+    /// retail title then read a corrupted heap object and crashed; off, compute pipelines are
+    /// waited for without limit and built in the title's thread, as before.
     compute: bool,
 }
 
@@ -288,7 +290,7 @@ fn budget_from(ms: Option<&str>, compute: Option<&str>) -> FrameBudget {
         Some(ms) => Some(Duration::from_millis(ms)),
         None => Some(Duration::from_secs(8)),
     };
-    FrameBudget::new(limit, compute.map_or(true, |v| v.trim() != "0"))
+    FrameBudget::new(limit, compute.is_some_and(|v| v.trim() == "1"))
 }
 
 /// PresentX: the pipeline waits of the next frame start from nothing.
@@ -489,7 +491,7 @@ mod draw_wait_tests {
     #[test]
     fn compute_pipelines_and_no_limit_wait_as_before() {
         let none = budget_from(Some("0"), None);
-        assert!(none.limit.is_none() && none.compute);
+        assert!(none.limit.is_none() && !none.compute);
         none.charge(Duration::from_secs(60));
         assert!(!none.spent());
         let (c, c_real) = (0x7410_0011usize, 0x7410_0012usize);
@@ -514,7 +516,7 @@ mod draw_wait_tests {
     #[test]
     fn the_frame_budget_is_8_s_with_compute_unless_the_variables_say_otherwise() {
         let b = budget_from(None, None);
-        assert_eq!((b.limit, b.compute), (Some(Duration::from_secs(8)), true));
+        assert_eq!((b.limit, b.compute), (Some(Duration::from_secs(8)), false));
         let b = budget_from(Some("1500"), Some("0"));
         assert_eq!((b.limit, b.compute), (Some(Duration::from_millis(1500)), false));
         assert!(budget_from(Some("0"), Some("1")).limit.is_none());
