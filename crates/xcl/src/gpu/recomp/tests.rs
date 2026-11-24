@@ -3238,6 +3238,71 @@ fn gpu_mesh_mode_two_passes() {
     assert!(px16 == px, "split pass-through draws the same pixels");
 }
 
+/// Mesh mode, every thread of the group: 128 threads (two console waves, four 32-lane halves
+/// in the split form) each export a vertex and a triangle that say which thread they are –
+/// the position is (thread, group, 0, 1), the triangle (thread, thread + 1, thread + 2) in
+/// the group. Each must be in its thread's slot of its group's record: a vertex of an upper
+/// half or of the second wave in another slot joins the triangles of its neighbours to the
+/// wrong positions.
+#[test]
+fn gpu_mesh_mode_every_thread_exports_its_vertex_and_triangle() {
+    if !gpu_ready() || !mesh_ready() {
+        return;
+    }
+    use super::{dxc, mesh_passthrough, MsInterface, MESH_HEADER};
+    let pos = crate::gpu::dxbc::SigElement { name: "SV_Position".into(), index: 0, system_value: 1, component_type: 3, register: 0, mask: 0xF, rw_mask: 0xF, stream: 0 };
+    let ms = MsInterface { outputs: vec![pos], threads: 128, max_vertices: 128, max_primitives: 128 };
+    let exp = |tgt: u64, en: u64, v: [u64; 4]| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
+        ("EXP", "ENC_EXP", vec![("TGT", tgt), ("EN", en), ("VSRC0", v[0]), ("VSRC1", v[1]), ("VSRC2", v[2]), ("VSRC3", v[3]), ("DONE", 1)], None)
+    };
+    let list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
+        ("S_BFE_U32", "ENC_SOP2", vec![("SDST", 0), ("SSRC0", 3), ("SSRC1", 255)], Some(0x40018)), // wave index
+        ("V_MBCNT_LO_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", 128)], None),
+        ("V_MBCNT_HI_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", V)], None),
+        ("V_LSHL_ADD_U32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 0), ("SRC1", 134), ("SRC2", V)], None), // thread in group
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", vec![("VDST", 1), ("SRC0", V + 5)], None),
+        ("S_LSHR_B32", "ENC_SOP2", vec![("SDST", 1), ("SSRC0", 1), ("SSRC1", 135)], None), // group = v5 >> 7
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 124), ("SSRC0", 255)], Some(128 << 12 | 128)),
+        ("S_SENDMSG", "ENC_SOPP", vec![("SIMM16", 9)], None),
+        ("S_BARRIER", "ENC_SOPP", vec![], None),
+        ("V_CVT_F32_U32", "ENC_VOP1", vec![("VDST", 10), ("SRC0", V)], None),
+        ("V_CVT_F32_U32", "ENC_VOP1", vec![("VDST", 11), ("SRC0", 1)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 12), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 13), ("SRC0", 242)], None),
+        exp(12, 0xF, [10, 11, 12, 13]),
+        // (thread + 1) & 127 at bit 10, (thread + 2) & 127 at bit 20
+        ("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 20), ("SRC0", 129), ("VSRC1", 0)], None),
+        ("V_AND_B32", "ENC_VOP2", vec![("VDST", 20), ("SRC0", 255), ("VSRC1", 20)], Some(127)),
+        ("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 20), ("SRC0", 138), ("VSRC1", 20)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", vec![("VDST", 21), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_AND_B32", "ENC_VOP2", vec![("VDST", 21), ("SRC0", 255), ("VSRC1", 21)], Some(127)),
+        ("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 21), ("SRC0", 148), ("VSRC1", 21)], None),
+        ("V_OR3_B32", "ENC_VOP3", vec![("VDST", 22), ("SRC0", V), ("SRC1", V + 20), ("SRC2", V + 21)], None),
+        exp(20, 1, [22, 0, 0, 0]),
+    ];
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    let code = prog(&refs);
+    let t = translate(&code, &on_gpu(Options { mode: Mode::Mesh(ms.clone()), wave64: true, ..Default::default() })).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let cs = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let msb = dxc::compile(&mesh_passthrough(&ms), "main", "ms_6_6", &[]).unwrap();
+    let ps = dxc::compile("float4 main() : SV_Target0 { return 1.0; }\n", "main", "ps_6_6", &[]).unwrap();
+    const GROUPS: usize = 5;
+    let (_, rec) = runner::mesh_draw(&cs, &msb, &ps, GROUPS as u32, ms.record_dwords(), &[0u32; 128], &[0u32; 64], 32, [0.0; 4]).unwrap();
+    let (rd, vd) = (ms.record_dwords(), ms.vert_dwords());
+    for g in 0..GROUPS {
+        let r = &rec[g * rd..(g + 1) * rd];
+        assert_eq!((r[0], r[1]), (128, 128), "group {g}: GS_ALLOC_REQ counts");
+        for t in 0..128usize {
+            let b = MESH_HEADER + t * vd;
+            let got: [f32; 4] = std::array::from_fn(|c| f32::from_bits(r[b + c]));
+            assert_eq!(got, [t as f32, g as f32, 0.0, 1.0], "group {g}: the vertex in slot {t} (wave {}, half {})", t / 64, t / 32 % 2);
+            let want = (t | ((t + 1) & 127) << 10 | ((t + 2) & 127) << 20) as u32;
+            assert_eq!(r[MESH_HEADER + 128 * vd + t], want, "group {g}: the triangle in slot {t}");
+        }
+    }
+}
+
 /// The mesh output budget with wide vertices: DXC accounts whole chunks of 32 vertices even
 /// when fewer are declared, so 78 vertices with 22 float4 rows are accounted as 96 (33792 B >
 /// 32768) and the record must go out in split groups. A retail title's NGG transform programs
@@ -7840,4 +7905,296 @@ fn fspx_containers_translate_and_compile() {
     let (n, ok) = (n.into_inner(), ok.into_inner());
     println!("FSPX: {ok} / {n} translated and compiled");
     assert_eq!(ok, n);
+}
+
+/// Vertices and triangles of the synthetic meshlets of `retail_meshlets`: three kinds, of
+/// 128 / 70 / 20 vertices and 128 / 100 / 10 triangles.
+const MESHLET_KINDS: [(u32, u32); 3] = [(128, 128), (70, 100), (20, 10)];
+
+/// Vertex index thread `t` of a meshlet of kind `k` fetches: a permutation (`mul` odd), so
+/// that no thread's vertex is its own index.
+fn meshlet_vertex(k: usize, t: u32, mul: u32) -> u32 {
+    (t * mul + 11 * k as u32) % 128 + 128 * k as u32
+}
+
+fn meshlet_triangle(nv: u32, t: u32) -> [u32; 3] {
+    [t % nv, (t + 1) % nv, (t + 2) % nv]
+}
+
+/// Quantised position of vertex `idx` (24 : 24 : 16 bits).
+fn meshlet_position(idx: u32) -> (u32, u32, u32) {
+    (1000 + idx, 5000 + 2 * idx, idx)
+}
+
+/// Memory and SGPRs for a retail NGG program (the meshlet wrapper of the title's `MS_VS_*`
+/// programs, layout read from their code): `n` meshlets, meshlet m of kind m % 3. `list`:
+/// None = the group is the meshlet (s20 bit 28 clear), Some(format) = the group indexes a
+/// typed list of meshlets (in reverse order here). `layout`: None = the cascade shadow
+/// draw's (meshlets in descriptor 0 of the table at s17, the mesh at s18, matrices that
+/// leave the position as it is); Some((descriptor, register)) = the meshlets in that
+/// descriptor, the mesh at that register, and every other descriptor a buffer of arbitrary
+/// floats – what another program's vertex shader reads as its constants.
+/// Returns (sgprs, memory, meshlet of group).
+fn retail_meshlets(n: usize, list: Option<u32>, mul: u32, layout: Option<(usize, usize)>) -> (Vec<u32>, Vec<u32>, Vec<usize>) {
+    let mut bytes = vec![0u8; 0x10000];
+    let put = |b: &mut Vec<u8>, at: usize, w: &[u32]| {
+        for (k, x) in w.iter().enumerate() {
+            b[at + 4 * k..at + 4 * k + 4].copy_from_slice(&x.to_le_bytes());
+        }
+    };
+    let desc = |base: u32| [base, 0x10000, 0xFFFF_FFFF, 0x1101_4FAC];
+    match layout {
+        None => {
+            put(&mut bytes, 0x100, &desc(0x1000)); // meshlets
+            put(&mut bytes, 0x120, &desc(0x400)); // world
+            put(&mut bytes, 0x140, &desc(0x500)); // view-projection (at +0x160)
+            // matrices that leave (x, y, z, 1)
+            for at in [0x420, 0x414, 0x408, 0x660, 0x660 + 20, 0x660 + 40, 0x660 + 60] {
+                put(&mut bytes, at, &[f(1.0)]);
+            }
+        }
+        Some((d, _)) => {
+            for k in 0..8 {
+                put(&mut bytes, 0x100 + 0x20 * k, &desc(if k == d { 0x1000 } else { 0x400 }));
+            }
+            for k in 0..0x300usize {
+                put(&mut bytes, 0x400 + 4 * k, &[f(0.25 + (k * 7 % 13) as f32 * 0.125)]);
+            }
+        }
+    }
+    // the mesh: header (vertex stride 8, vertices at +0x80), scale 1, bias 0
+    put(&mut bytes, 0x8000, &[0x4040]);
+    put(&mut bytes, 0x8070, &[f(1.0); 3]);
+    for idx in 0..384u32 {
+        let (x, y, z) = meshlet_position(idx);
+        put(&mut bytes, 0x8080 + 8 * idx as usize, &[x << 8 | (y & 0xFF), (y >> 8) | z << 16]);
+    }
+    // meshlet table: count, 0, then per meshlet two dwords at 16 m + 12; index data after it
+    put(&mut bytes, 0x1000, &[n as u32]);
+    let s23 = n * 16 + 12;
+    for m in 0..n {
+        let (nv, np) = MESHLET_KINDS[m % 3];
+        let block = (m % 3) as u32 * 768;
+        put(&mut bytes, 0x1000 + m * 16 + 12, &[(nv - 1) | (np - 1) << 7, (block / 2) | ((block + 256) / 4) << 16]);
+    }
+    for (k, &(nv, _)) in MESHLET_KINDS.iter().enumerate() {
+        for t in 0..128u32 {
+            let a = 0x1000 + s23 + k * 768 + 2 * t as usize;
+            bytes[a..a + 2].copy_from_slice(&(meshlet_vertex(k, t, mul) as u16).to_le_bytes());
+            let [i0, i1, i2] = meshlet_triangle(nv, t);
+            put(&mut bytes, 0x1000 + s23 + k * 768 + 256 + 4 * t as usize, &[i0 | i1 << 7 | i2 << 14]);
+        }
+    }
+    let mut sg = vec![0u32; 128];
+    sg[17] = 0x100;
+    sg[layout.map_or(18, |l| l.1)] = 0x8000;
+    let of: Vec<usize> = (0..n).map(|g| if list.is_some() { n - 1 - g } else { g }).collect();
+    if let Some(format) = list {
+        // descriptor 3 of the table at s21, entries from 2 · 16
+        let stride = if format == 11 { 2u32 } else { 4 };
+        put(&mut bytes, 0x200 + 3 * 32, &[0xC000, stride << 16, 0x1000, 0x1100_0FAC | format << 12]);
+        for g in 0..n {
+            let a = 0xC000 + (32 + g) * stride as usize;
+            if stride == 2 {
+                bytes[a..a + 2].copy_from_slice(&(of[g] as u16).to_le_bytes());
+            } else {
+                put(&mut bytes, a, &[of[g] as u32 | 0xABCD_0000]);
+            }
+        }
+        sg[20] = 1 << 28 | 2 << 10 | 3;
+        sg[21] = 0x200;
+    }
+    (sg, bytes.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect(), of)
+}
+
+/// The NGG program of a retail record, compiled for this adapter with its pass-through, and
+/// its `retail_meshlets` layout read from the code: the descriptor of the first
+/// `s_load_dwordx4` (the meshlets) and the register before the one or-ed with 0x10000 (the
+/// mesh's address, made into a descriptor of stride 1).
+/// `windows`, `heap`: `Options::mem_windows` and `heap_windows`.
+fn retail_mesh_program(data: &[u8], r: &crate::gpu::pack::Record, windows: u32, heap: bool) -> Option<(super::MsInterface, Vec<u8>, Vec<u8>, Option<(usize, usize)>)> {
+    let blob = crate::gpu::pack::inflate(data, r)?;
+    let sh = crate::gpu::xbox::parse(&blob)?;
+    let fs = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7))?;
+    let Some(Mode::Mesh(ms)) = super::interface(&blob, &sh, fs) else { return None };
+    let p = fs.programs[0];
+    let code = &fs.data[p.offset..p.offset + p.len];
+    let t = translate(code, &on_gpu(Options { mode: Mode::Mesh(ms.clone()), wave64: super::detect_wave64(code), mem_windows: windows, heap_windows: heap, ..Default::default() })).ok()?;
+    if !t.complete() {
+        return None;
+    }
+    let cs = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).ok()?;
+    let msb = super::dxc::compile(&super::mesh_passthrough(&ms), "main", "ms_6_6", &[]).ok()?;
+    let text: Vec<String> = crate::gpu::rdna2::disassemble(code, 0, true).into_iter().map(|l| l.text).collect();
+    let last_number = |l: &String| l.rsplit(", ").next().and_then(|x| usize::from_str_radix(x.trim_start_matches("0x"), 16).ok());
+    let table = text.iter().find(|l| l.starts_with("s_load_dwordx4 ")).and_then(last_number).map(|off| off / 0x20);
+    let mesh = text.iter().find(|l| l.starts_with("s_or_b32 ") && l.ends_with(", 0x10000")).and_then(|l| l.split(", ").nth(1)?.strip_prefix('s')?.parse::<usize>().ok());
+    Some((ms, cs, msb, table.zip(mesh.map(|hi| hi - 1))))
+}
+
+/// What is wrong in the record `r` of a meshlet of kind `k` drawn by the cascade shadow
+/// program with `retail_meshlets`' matrices: the counts, each thread's vertex (the position
+/// of the vertex index it fetched) and each thread's triangle.
+fn meshlet_record_errors(ms: &super::MsInterface, r: &[u32], k: usize, mul: u32) -> Vec<String> {
+    let (nv, np) = MESHLET_KINDS[k];
+    let vd = ms.vert_dwords();
+    let mut bad = Vec::new();
+    if (r[0], r[1]) != (nv, np) {
+        bad.push(format!("counts {:?}, expected {:?}", (r[0], r[1]), (nv, np)));
+    }
+    for t in 0..nv {
+        let b = super::MESH_HEADER + t as usize * vd;
+        let got = [f32::from_bits(r[b]), f32::from_bits(r[b + 1]), f32::from_bits(r[b + 2]), f32::from_bits(r[b + 3])];
+        let (x, y, z) = meshlet_position(meshlet_vertex(k, t, mul));
+        if got != [x as f32, y as f32, z as f32, 1.0] {
+            bad.push(format!("vertex {t}: {got:?}, expected {:?}", (x, y, z)));
+        }
+    }
+    for t in 0..np {
+        let [i0, i1, i2] = meshlet_triangle(nv, t);
+        let got = r[super::MESH_HEADER + ms.max_vertices as usize * vd + t as usize];
+        if got != (i0 | i1 << 10 | i2 << 20) {
+            bad.push(format!("triangle {t}: {got:#x}, expected {:?}", [i0, i1, i2]));
+        }
+    }
+    bad
+}
+
+/// A retail NGG program on synthetic meshlets (`XCL_SAMPLE_RPF`; `XCL_NAMES` = the record,
+/// default the cascade shadow draw): vertex indices permuted, so that every thread of both
+/// console waves (and of both 32-lane halves in the split form) fetches its own vertex and
+/// triangle. The records must hold each vertex in its thread's slot and each triangle with
+/// its three indices, for 3 and for 1024 groups, with the meshlet taken from the group and
+/// from a typed list – and with the meshlets and the mesh in a second memory window, by a
+/// switch over the windows and from the descriptor heap.
+#[test]
+#[ignore]
+fn retail_mesh_program_on_synthetic_meshlets() {
+    let Ok(path) = std::env::var("XCL_SAMPLE_RPF") else { return };
+    if !gpu_ready() || !mesh_ready() {
+        return;
+    }
+    let name = std::env::var("XCL_NAMES").unwrap_or_else(|_| "MS_VS_CascadeShadows_draw_f6ce4799".into());
+    let data = std::fs::read(path).unwrap();
+    let r = crate::gpu::pack::scan(&data, 0x40).into_iter().find(|r| r.name.contains(&name)).expect("record");
+    let (ms, cs, msb, _) = retail_mesh_program(&data, &r, 1, false).expect("an NGG program that translates");
+    let ps = super::dxc::compile("float4 main() : SV_Target0 { return 1.0; }\n", "main", "ps_6_6", &[]).unwrap();
+    let rd = ms.record_dwords();
+    for (n, list) in [(3, None), (1024, None), (3, Some(11)), (3, Some(20)), (1024, Some(20))] {
+        let (sg, mem, of) = retail_meshlets(n, list, 37, None);
+        let (_, rec) = runner::mesh_draw(&cs, &msb, &ps, n as u32, rd, &sg, &mem, 32, [0.0; 4]).unwrap();
+        let bad: Vec<String> = (0..n).flat_map(|g| meshlet_record_errors(&ms, &rec[g * rd..(g + 1) * rd], of[g] % 3, 37).into_iter().map(move |b| format!("group {g} {b}"))).collect();
+        for b in bad.iter().take(20) {
+            println!("{n} meshlets, list {list:?}: {b}");
+        }
+        assert!(bad.is_empty(), "{n} meshlets, list {list:?}: {} wrong record entries", bad.len());
+    }
+    // two windows 4 GiB apart: the tables and matrices in window 0 (32-bit pointers), the
+    // meshlets and the mesh in window 1 – window 0 holds nothing at their offsets
+    for heap in [false, true] {
+        let (ms, cs, _, _) = retail_mesh_program(&data, &r, 2, heap).expect("the program with two memory windows");
+        let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
+        let (w0, w1) = (arena.window(0).0, arena.window(1).0);
+        let (mut sg, mem, _) = retail_meshlets(1, None, 37, None);
+        for (k, &w) in mem.iter().enumerate() {
+            unsafe {
+                *((w1 + 4 * k) as *mut u32) = w;
+                *((w0 + 4 * k) as *mut u32) = if 4 * k < 0x1000 { w } else { 0 };
+            }
+        }
+        let hi = (w1 >> 32) as u32;
+        unsafe { *((w0 + 0x104) as *mut u32) = 0x10000 | hi };
+        sg[19] = hi;
+        let st = KernelState { sgpr: sg, ..Default::default() };
+        let rec = runner::run_in_arena(&cs, &st, &arena).unwrap().raw;
+        let bad = meshlet_record_errors(&ms, &rec[..rd], 0, 37);
+        for b in bad.iter().take(20) {
+            println!("two windows (heap {heap}): {b}");
+        }
+        assert!(bad.is_empty(), "two windows (heap {heap}): {} wrong record entries", bad.len());
+    }
+}
+
+/// The retail pack's NGG programs on the synthetic meshlets of `retail_meshlets`, one record
+/// per program name (`XCL_SAMPLE_RPF`; `XCL_NAMES` = substrings, `XCL_SURVEY_MAX` = how many,
+/// default 40; without `XCL_NAMES`, seven programs of the depth, shadow and G-buffer passes).
+/// The programs wrap different vertex shaders, whose constants are arbitrary floats here, so
+/// positions are not known – what is checked holds for every one of them: the counts,
+/// the triangles, and that a vertex's whole record entry depends on the vertex index alone,
+/// whatever thread fetched it (two runs with different thread → vertex permutations).
+#[test]
+#[ignore]
+fn retail_mesh_programs_keep_vertices_with_their_threads() {
+    let Ok(path) = std::env::var("XCL_SAMPLE_RPF") else { return };
+    if !gpu_ready() || !mesh_ready() {
+        return;
+    }
+    use super::MESH_HEADER;
+    // other programs read further descriptor tables, which the synthetic memory does not
+    // have: what they load there is no descriptor, and the GPU faults on its address
+    const KNOWN: &str = "MS_VS_CascadeShadows_draw_f6ce4799,MS_VS_Transform_PositionOnly_803fbbc7,MS_VS_TransformEntityMask_ee5cb9a8,MS_VS_LinearDepth_da28e022,MS_VS_Transform_38a9c582,MS_VS_TransformD_aa739e09,MS_VS_MirrorReflectionTransform_26b5d4ad";
+    let names = std::env::var("XCL_NAMES").unwrap_or_else(|_| KNOWN.into());
+    let max: usize = std::env::var("XCL_SURVEY_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+    let data = std::fs::read(path).unwrap();
+    let ps = super::dxc::compile("float4 main() : SV_Target0 { return 1.0; }\n", "main", "ps_6_6", &[]).unwrap();
+    let mut seen = std::collections::BTreeSet::new();
+    let (mut ran, mut wrong, mut unknown) = (0usize, Vec::new(), Vec::new());
+    for r in crate::gpu::pack::scan(&data, 0x40) {
+        if ran >= max || !r.name.starts_with("MS") || (!names.is_empty() && !names.split(',').any(|n| r.name.contains(n))) {
+            continue;
+        }
+        // one record per program name (the name without its hash)
+        let stem: String = r.name.rsplitn(3, '_').last().unwrap_or(&r.name).to_string();
+        if !seen.insert(stem) {
+            continue;
+        }
+        let Some((ms, cs, msb, layout)) = retail_mesh_program(&data, &r, 1, false) else { continue };
+        ran += 1;
+        let (rd, vd) = (ms.record_dwords(), ms.vert_dwords());
+        let Some(layout) = layout.filter(|l| l.0 < 8 && (17..100).contains(&l.1)) else {
+            unknown.push(r.name.clone());
+            println!("{}: {} outputs, layout not found", r.name, ms.outputs.len());
+            continue;
+        };
+        let mut by_index: std::collections::HashMap<u32, Vec<u32>> = Default::default();
+        let mut bad = Vec::new();
+        let mut distinct = std::collections::HashSet::new();
+        for mul in [37u32, 53] {
+            let (sg, mem, _) = retail_meshlets(3, None, mul, Some(layout));
+            let (_, rec) = runner::mesh_draw(&cs, &msb, &ps, 3, rd, &sg, &mem, 32, [0.0; 4]).unwrap();
+            for (g, &(nv, np)) in MESHLET_KINDS.iter().enumerate() {
+                let rec = &rec[g * rd..(g + 1) * rd];
+                if (rec[0], rec[1]) != (nv, np) {
+                    bad.push(format!("group {g}: counts {:?}, expected {:?}", (rec[0], rec[1]), (nv, np)));
+                }
+                for t in 0..nv {
+                    let b = MESH_HEADER + t as usize * vd;
+                    let entry = rec[b..b + vd].to_vec();
+                    distinct.insert(entry[..4].to_vec());
+                    let idx = meshlet_vertex(g, t, mul);
+                    let first = by_index.entry(idx).or_insert_with(|| entry.clone());
+                    if *first != entry {
+                        let at = (0..vd).find(|&k| first[k] != entry[k]).unwrap();
+                        bad.push(format!("group {g} thread {t} (permutation {mul}): vertex {idx} differs from its other fetch at dword {at} ({:#x} / {:#x})", first[at], entry[at]));
+                    }
+                }
+                for t in 0..np {
+                    let [i0, i1, i2] = meshlet_triangle(nv, t);
+                    let got = rec[MESH_HEADER + ms.max_vertices as usize * vd + t as usize];
+                    if got != (i0 | i1 << 10 | i2 << 20) {
+                        bad.push(format!("group {g} triangle {t}: {got:#x}, expected {:?}", [i0, i1, i2]));
+                    }
+                }
+            }
+        }
+        println!("{}: {} outputs, layout {layout:?}, {} distinct positions, {} wrong", r.name, ms.outputs.len(), distinct.len(), bad.len());
+        for b in bad.iter().take(6) {
+            println!("    {b}");
+        }
+        if !bad.is_empty() {
+            wrong.push(r.name.clone());
+        }
+    }
+    println!("{ran} programs, {} without a layout, {} wrong: {wrong:?}", unknown.len(), wrong.len());
+    assert!(wrong.is_empty());
 }
