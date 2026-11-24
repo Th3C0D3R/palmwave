@@ -830,6 +830,13 @@ pub fn page_bytes() -> (usize, usize) {
     })
 }
 
+/// (bytes of pages at the title's addresses, bytes of the extra tiles of textures whose PC
+/// layout takes more tiles than their addresses have pages) – `XCL_ACTIVITY`
+pub fn page_kinds() -> (usize, usize) {
+    let g = PAGES.lock().unwrap();
+    g.values().flatten().fold((0, 0), |(own, extra), p| (own + p.pages.len() * PAGE, extra + p.extra_pages.len() * PAGE))
+}
+
 /// Heaps of every kind of resource in one (resource heap tier 2) – else no arenas.
 fn tier2(dev: &ID3D12Device) -> bool {
     let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();

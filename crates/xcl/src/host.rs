@@ -121,9 +121,10 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 let (active, shadowed, pending, vecs, vecs_peak) = crate::hle::d3d12x::title_textures::memory();
                 let page_counts = crate::hle::d3d12x::vram::page_counts();
                 let (small, small_slots, small_heaps) = crate::hle::d3d12x::vram::small_counts();
+                let (own_pages, extra_pages) = crate::hle::d3d12x::vram::page_kinds();
                 crate::xlog_info!(
-                    "memory: title textures {} active ({} MB of title memory, {} KB of layout tables), {} shadowed ({} MB, {} KB), {} waiting for an upload; {} on pages; page pools {} heaps, {} tiles free, {} cooling; {} small textures in {} MB of their heaps ({} MB of slots)",
-                    active[0], mb(active[1]), active[2] >> 10, shadowed[0], mb(shadowed[1]), shadowed[2] >> 10, pending, page_counts[0], page_counts[1], page_counts[2], page_counts[3], small, mb(small_heaps as u64), mb(small_slots as u64)
+                    "memory: title textures {} active ({} MB of title memory, {} KB of layout tables), {} shadowed ({} MB, {} KB), {} waiting for an upload; {} on pages ({} MB at their addresses, {} MB of extra tiles); page pools {} heaps, {} tiles free, {} cooling; {} small textures in {} MB of their heaps ({} MB of slots)",
+                    active[0], mb(active[1]), active[2] >> 10, shadowed[0], mb(shadowed[1]), shadowed[2] >> 10, pending, page_counts[0], mb(own_pages as u64), mb(extra_pages as u64), page_counts[1], page_counts[2], page_counts[3], small, mb(small_heaps as u64), mb(small_slots as u64)
                 );
                 let staging = crate::gpu::texture::staging_counts();
                 let (sparse_heaps, sparse_upload, sparse_readback) = crate::hle::d3d12x::sparse::buffer_counts();
