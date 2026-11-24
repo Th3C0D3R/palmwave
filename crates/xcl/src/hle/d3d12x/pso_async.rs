@@ -4,12 +4,13 @@
 //! pipeline (shaders that draw nothing) at once and the real one is built on a worker; binding
 //! (`SetPipelineState`, console list replay, the two-pass lookups) uses the real one as soon
 //! as it is there. A draw waits for its graphics pipeline only so long (`resolve_for_draw`),
-//! then draws nothing until it is built; a compute pipeline is waited
-//! for at its first bind (a skipped dispatch would corrupt what it computes).
+//! then draws nothing until it is built; a compute pipeline is waited for at its first bind
+//! (a skipped dispatch loses what it computes). All these waits between two presents share
+//! one budget (`FrameBudget`): once it is spent, draws and dispatches go with the stand-in.
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -155,11 +156,15 @@ pub fn resolve(pso: usize) -> usize {
 /// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
 pub fn resolve_wait(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
+    wait_unbounded(pso, &p, frame_budget())
+}
+
+fn wait_unbounded(pso: usize, p: &Pending, budget: &FrameBudget) -> usize {
     let start = Instant::now();
     let job = p.job.lock().unwrap().take();
     let here = job.is_some();
     if let Some(job) = job {
-        complete(&p, job());
+        complete(p, job());
     }
     let mut done = p.done.lock().unwrap();
     while !*done {
@@ -167,6 +172,7 @@ pub fn resolve_wait(pso: usize) -> usize {
     }
     let real = p.real.load(Ordering::Acquire);
     drop(done);
+    budget.charge(start.elapsed());
     note_long_wait(pso, p.compute, here, start.elapsed());
     match real {
         0 => pso,
@@ -175,10 +181,10 @@ pub fn resolve_wait(pso: usize) -> usize {
 }
 
 /// A title's thread held this long in one pipeline wait is logged: a retail game's watchdog
-/// thread ends the process (`mov dword [0], 0` at title+0x2215c35, decoded in #232: it wakes
-/// once a second and compares watched timestamps with a constant 300.0) when a watched thread
-/// stops posting, and an NVIDIA driver takes 10 - 17 s for one big translated pixel shader,
-/// minutes for a big compute program (#156).
+/// thread (title+0x2215a60) ends the process (`mov dword [0], 0` at title+0x2215c35, decoded in
+/// #232) when it has woken 30 times in a row, a second apart, without a new heartbeat of the
+/// main thread – 300 s only inside the game's long-operation scopes – and an NVIDIA driver
+/// takes 10 - 17 s for one big translated pixel shader, minutes for a big compute program (#156).
 const LONG_WAIT: Duration = Duration::from_secs(2);
 
 fn note_long_wait(pso: usize, compute: bool, here: bool, took: Duration) {
@@ -197,7 +203,8 @@ fn note_long_wait(pso: usize, compute: bool, here: bool, took: Duration) {
 /// The longest one draw holds the title's thread for a graphics pipeline still being built
 /// (`XCL_PSO_WAIT_MS`, default 4000; 0: no limit, as before). Past it the draw goes on with the
 /// stand-in (draws nothing) and the pipeline is built on a worker. 4 s is a safety margin under
-/// the watchdog's one-call trigger seen in #156 (23 s), not a measured threshold.
+/// the title's watchdog (30 s without a main-thread heartbeat, see `LONG_WAIT`), not a measured
+/// threshold; what all the waits of a frame may add up to is `FrameBudget`'s.
 fn draw_wait_limit() -> Option<Duration> {
     static L: OnceLock<Option<Duration>> = OnceLock::new();
     *L.get_or_init(|| match std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
@@ -207,66 +214,197 @@ fn draw_wait_limit() -> Option<Duration> {
     })
 }
 
-/// draws issued with a stand-in because their pipeline was not built within the limit
+/// The time title threads spent waiting for pipelines still being built since the last PresentX,
+/// all threads together, and what it may come to. A retail game's main thread waits without a
+/// timeout for its render thread, which waits for its command-list jobs, and those wait here:
+/// eight pipelines at `draw_wait_limit` each already hold the main thread past its watchdog's
+/// 30 s (`LONG_WAIT`). Once the budget is spent a draw goes with its stand-in at once – and so
+/// does a compute bind or dispatch, unless `compute` is off.
+struct FrameBudget {
+    waited_us: AtomicU64,
+    /// `XCL_PSO_FRAME_BUDGET_MS` (default 8000; 0: None, no budget – every wait as before)
+    limit: Option<Duration>,
+    /// `XCL_PSO_COMPUTE_BUDGET` (default on; 0: compute pipelines are waited for without limit
+    /// and built in the title's thread, as before)
+    compute: bool,
+}
+
+/// the cumulative wait of a frame is logged each time it passes another one of these
+const WAIT_LOG_STEP: Duration = Duration::from_secs(2);
+
+impl FrameBudget {
+    const fn new(limit: Option<Duration>, compute: bool) -> Self {
+        Self { waited_us: AtomicU64::new(0), limit, compute }
+    }
+
+    fn waited(&self) -> Duration {
+        Duration::from_micros(self.waited_us.load(Ordering::Relaxed))
+    }
+
+    /// What is left of the budget (None: there is none).
+    fn left(&self) -> Option<Duration> {
+        self.limit.map(|l| l.saturating_sub(self.waited()))
+    }
+
+    fn spent(&self) -> bool {
+        self.left().is_some_and(|l| l.is_zero())
+    }
+
+    /// A thread waited `d` for a pipeline.
+    fn charge(&self, d: Duration) {
+        let d = d.as_micros() as u64;
+        if d == 0 {
+            return;
+        }
+        let before = self.waited_us.fetch_add(d, Ordering::Relaxed);
+        let step = WAIT_LOG_STEP.as_micros() as u64;
+        if (before + d) / step != before / step {
+            static N: AtomicUsize = AtomicUsize::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 256 {
+                crate::xlog_warn!(
+                    "D3D12.X: title threads have waited {:.1} s for pipelines since the last present (budget {}; a retail game's watchdog ends the process after 30 s without a main-thread heartbeat)",
+                    (before + d) as f32 / 1e6,
+                    self.limit.map_or("none".to_string(), |l| format!("{} ms, XCL_PSO_FRAME_BUDGET_MS", l.as_millis()))
+                );
+            }
+        }
+    }
+
+    /// A frame was presented: the next one has the whole budget.
+    fn reset(&self) {
+        self.waited_us.store(0, Ordering::Relaxed);
+    }
+}
+
+fn frame_budget() -> &'static FrameBudget {
+    static B: OnceLock<FrameBudget> = OnceLock::new();
+    B.get_or_init(|| budget_from(std::env::var("XCL_PSO_FRAME_BUDGET_MS").ok().as_deref(), std::env::var("XCL_PSO_COMPUTE_BUDGET").ok().as_deref()))
+}
+
+/// The budget `XCL_PSO_FRAME_BUDGET_MS` and `XCL_PSO_COMPUTE_BUDGET` ask for (None: not set).
+fn budget_from(ms: Option<&str>, compute: Option<&str>) -> FrameBudget {
+    let limit = match ms.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(0) => None,
+        Some(ms) => Some(Duration::from_millis(ms)),
+        None => Some(Duration::from_secs(8)),
+    };
+    FrameBudget::new(limit, compute.map_or(true, |v| v.trim() != "0"))
+}
+
+/// PresentX: the pipeline waits of the next frame start from nothing.
+pub fn frame_presented() {
+    frame_budget().reset();
+}
+
+/// draws and dispatches issued with a stand-in because their pipeline was not built in time
 static STANDIN_DRAWS: AtomicUsize = AtomicUsize::new(0);
 
-/// Draws that went to the GPU with a stand-in (drew nothing) because `resolve_for_draw` gave up
-/// on their pipeline (`report.json → d3d12.standin_draws`). Lost, not replayed.
+/// Draws and dispatches that went on with a stand-in (drew or computed nothing) because
+/// `resolve_for_draw` gave up on their pipeline (`report.json → d3d12.standin_draws`). Lost,
+/// not replayed.
 pub fn standin_draws() -> usize {
     STANDIN_DRAWS.load(Ordering::Relaxed)
 }
 
-/// For a draw (or ExecuteIndirect) of console code: a compute pipeline is waited for
-/// (`resolve_wait`); a graphics one at most `draw_wait_limit`, each draw on its own, and never
-/// built in the title's thread, where a driver compile cannot be cut short. A draw past the
-/// limit goes on with the stand-in, counted and logged.
-pub fn resolve_for_draw(pso: usize) -> usize {
-    resolve_within(pso, draw_wait_limit())
+/// stand-ins whose first give-up was logged (forgotten with the stand-in, `released`)
+static GAVE_UP: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+
+/// A wait for `pso` ended with its stand-in. `lost`: for a draw or a dispatch (not a bind).
+fn note_standin(pso: usize, compute: bool, lost: bool, waited: Duration, limit: Option<Duration>, budget: &FrameBudget) {
+    let n = if lost { STANDIN_DRAWS.fetch_add(1, Ordering::Relaxed) + 1 } else { STANDIN_DRAWS.load(Ordering::Relaxed) };
+    let first = {
+        let mut g = GAVE_UP.lock().unwrap();
+        let seen = g.get_or_insert_with(Default::default);
+        seen.len() < 64 && seen.insert(pso)
+    };
+    if first || (lost && n >= 64 && n.is_power_of_two()) {
+        let why = match (budget.spent(), budget.limit, limit) {
+            (true, Some(b), _) => format!("the frame's {} ms for pipeline waits are spent, XCL_PSO_FRAME_BUDGET_MS", b.as_millis()),
+            (_, _, Some(l)) => format!("limit {} ms, XCL_PSO_WAIT_MS", l.as_millis()),
+            _ => "no time left".to_string(),
+        };
+        crate::xlog_warn!(
+            "D3D12.X: thread '{}': {} pipeline {pso:#x} not built after {} ms ({why}) – {}, the pipeline still building on a worker ({n} draws and dispatches lost so far)",
+            std::thread::current().name().unwrap_or("title"),
+            if compute { "compute" } else { "graphics" },
+            waited.as_millis(),
+            match (lost, compute) {
+                (false, _) => "its stand-in is bound",
+                (true, false) => "the draw goes with its stand-in and is lost",
+                (true, true) => "the dispatch is skipped",
+            }
+        );
+    }
 }
 
-fn resolve_within(pso: usize, limit: Option<Duration>) -> usize {
+/// For a draw, a dispatch or an ExecuteIndirect of console code: the pipeline is waited for
+/// while the frame's budget lasts – a graphics one at most `draw_wait_limit` besides, each draw
+/// on its own – and built on a worker, not in the title's thread, where a driver compile cannot
+/// be cut short. Past that the call goes on with the stand-in (a draw draws nothing, a dispatch
+/// is skipped by its caller: the stand-in is not a translated pipeline), counted and logged.
+/// Without a budget for it (`FrameBudget`) a compute pipeline is waited for as `resolve_wait` does.
+pub fn resolve_for_draw(pso: usize) -> usize {
+    resolve_within(pso, draw_wait_limit(), frame_budget(), true)
+}
+
+/// Waits for `p`'s build as long as `limit` (this wait's own) and `budget` allow, charging the
+/// budget as it goes (in slices: other threads' waits spend it too): (built, time waited).
+fn wait_built(p: &Pending, limit: Option<Duration>, budget: &FrameBudget) -> (bool, Duration) {
+    const SLICE: Duration = Duration::from_millis(50);
+    let start = Instant::now();
+    let mut charged = start;
+    let mut done = p.done.lock().unwrap();
+    while !*done {
+        let now = Instant::now();
+        budget.charge(now - charged);
+        charged = now;
+        let mut slice = SLICE;
+        if let Some(l) = limit {
+            slice = slice.min(l.saturating_sub(now - start));
+        }
+        if let Some(left) = budget.left() {
+            slice = slice.min(left);
+        }
+        if slice.is_zero() {
+            break;
+        }
+        done = p.cv.wait_timeout(done, slice).unwrap().0;
+    }
+    let finished = *done;
+    drop(done);
+    budget.charge(charged.elapsed());
+    (finished, start.elapsed())
+}
+
+fn resolve_within(pso: usize, limit: Option<Duration>, budget: &FrameBudget, lost: bool) -> usize {
     let Some(p) = entry(pso) else { return pso };
-    let Some(limit) = limit.filter(|_| !p.compute) else { return resolve_wait(pso) };
+    // a compute pipeline has no limit of its own, only the frame's budget
+    let limit = limit.filter(|_| !p.compute);
+    let bounded = if p.compute { budget.limit.is_some() && budget.compute } else { limit.is_some() || budget.limit.is_some() };
+    if !bounded {
+        return wait_unbounded(pso, &p, budget);
+    }
     // to the workers (a lazy one has not gone yet)
     if !p.sent.swap(true, Ordering::AcqRel) {
         let _ = queue().lock().unwrap().send(p.clone());
     }
-    let start = Instant::now();
-    let deadline = start + limit;
-    let mut done = p.done.lock().unwrap();
-    while !*done {
-        let now = Instant::now();
-        if now >= deadline {
-            break;
-        }
-        done = p.cv.wait_timeout(done, deadline - now).unwrap().0;
-    }
-    let (finished, real) = (*done, p.real.load(Ordering::Acquire));
-    drop(done);
-    let waited = start.elapsed();
+    let (finished, waited) = wait_built(&p, limit, budget);
     if !finished {
-        let n = STANDIN_DRAWS.fetch_add(1, Ordering::Relaxed);
-        if n < 16 || n.is_power_of_two() {
-            crate::xlog_warn!(
-                "D3D12.X: graphics pipeline {pso:#x} not built after {:.1} s (limit {} ms, XCL_PSO_WAIT_MS) – the draw goes with its stand-in and is lost, the pipeline still building on a worker ({} such draws)",
-                waited.as_secs_f32(),
-                limit.as_millis(),
-                n + 1
-            );
-        }
+        note_standin(pso, p.compute, lost, waited, limit, budget);
     } else {
-        note_long_wait(pso, false, false, waited);
+        note_long_wait(pso, p.compute, false, waited);
     }
-    match real {
+    match p.real.load(Ordering::Acquire) {
         0 => pso,
         r => r,
     }
 }
 
-/// For binding: compute pipelines are waited for, graphics ones are not.
+/// For binding: compute pipelines are waited for (while the frame's budget lasts, as in
+/// `resolve_for_draw`; past it the stand-in is bound), graphics ones are not.
 pub fn resolve_for_bind(pso: usize) -> usize {
     match entry(pso) {
-        Some(p) if p.compute => resolve_wait(pso),
+        Some(p) if p.compute => resolve_within(pso, None, frame_budget(), false),
         Some(_) => resolve(pso),
         None => pso,
     }
@@ -277,6 +415,9 @@ pub fn resolve_for_bind(pso: usize) -> usize {
 /// the worker's result is then released when it arrives).
 pub fn released(pso: usize) -> usize {
     let Some(p) = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&pso)) else { return 0 };
+    if let Some(g) = GAVE_UP.lock().unwrap().as_mut() {
+        g.remove(&pso);
+    }
     let done = p.done.lock().unwrap();
     if *done {
         p.real.swap(0, Ordering::AcqRel)
@@ -321,11 +462,14 @@ mod draw_wait_tests {
             }),
         );
         let limit = Some(Duration::from_millis(300));
+        // no frame budget (`XCL_PSO_FRAME_BUDGET_MS=0`), whatever was waited before
+        let none = FrameBudget::new(None, true);
+        none.charge(Duration::from_secs(60));
         let lost = standin_draws();
         for draw in 0..2 {
             // every draw gets the whole limit, not what an earlier draw left of it
             let t = Instant::now();
-            assert_eq!(resolve_within(standin, limit), standin, "draw {draw} goes with the stand-in");
+            assert_eq!(resolve_within(standin, limit, &none, true), standin, "draw {draw} goes with the stand-in");
             let took = t.elapsed();
             assert!(took >= Duration::from_millis(290) && took < Duration::from_secs(5), "draw {draw} waited {took:?}");
         }
@@ -335,15 +479,19 @@ mod draw_wait_tests {
         assert!(is_pending(standin));
         // once built: the real pipeline
         go_tx.send(()).unwrap();
-        assert_eq!(resolve_within(standin, Some(Duration::from_secs(10))), real);
+        assert_eq!(resolve_within(standin, Some(Duration::from_secs(10)), &none, true), real);
         assert!(!is_pending(standin));
         let _ = released(standin);
     }
 
-    /// Compute pipelines are still waited for (a skipped dispatch corrupts its results), and
-    /// `XCL_PSO_WAIT_MS=0` (no limit) waits for graphics ones as before.
+    /// Without a frame budget (`XCL_PSO_FRAME_BUDGET_MS=0`) compute pipelines are still waited
+    /// for, and `XCL_PSO_WAIT_MS=0` (no limit) waits for graphics ones as before.
     #[test]
     fn compute_pipelines_and_no_limit_wait_as_before() {
+        let none = budget_from(Some("0"), None);
+        assert!(none.limit.is_none() && none.compute);
+        none.charge(Duration::from_secs(60));
+        assert!(!none.spent());
         let (c, c_real) = (0x7410_0011usize, 0x7410_0012usize);
         submit_lazy(
             c,
@@ -353,12 +501,135 @@ mod draw_wait_tests {
                 c_real
             }),
         );
-        assert_eq!(resolve_within(c, Some(Duration::ZERO)), c_real);
+        assert_eq!(resolve_within(c, Some(Duration::ZERO), &none, true), c_real);
         let (g, g_real) = (0x7410_0021usize, 0x7410_0022usize);
         submit_lazy(g, false, Box::new(move || g_real));
-        assert_eq!(resolve_within(g, None), g_real);
-        assert_eq!(resolve_within(0x7410_0031, Some(Duration::ZERO)), 0x7410_0031, "not a stand-in");
+        assert_eq!(resolve_within(g, None, &none, true), g_real);
+        assert_eq!(resolve_within(0x7410_0031, Some(Duration::ZERO), &none, true), 0x7410_0031, "not a stand-in");
         let _ = released(c);
         let _ = released(g);
+    }
+
+    /// The defaults: 8 s a frame, compute pipelines included.
+    #[test]
+    fn the_frame_budget_is_8_s_with_compute_unless_the_variables_say_otherwise() {
+        let b = budget_from(None, None);
+        assert_eq!((b.limit, b.compute), (Some(Duration::from_secs(8)), true));
+        let b = budget_from(Some("1500"), Some("0"));
+        assert_eq!((b.limit, b.compute), (Some(Duration::from_millis(1500)), false));
+        assert!(budget_from(Some("0"), Some("1")).limit.is_none());
+    }
+
+    /// A build that does not finish, waited for by two threads at once: they spend one budget
+    /// between them (each alone would have waited all of it), a later draw does not wait at
+    /// all, and after a present the next one waits again. Per draw (the 4 s of #267) eight
+    /// pending pipelines held a retail game's render thread 32 s, past its 30 s watchdog.
+    #[test]
+    fn the_frame_budget_is_shared_by_all_threads_and_a_present_gives_it_back() {
+        let standin = 0x7410_0041usize;
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        submit_lazy(
+            standin,
+            false,
+            Box::new(move || {
+                let _ = go_rx.recv();
+                0
+            }),
+        );
+        let budget = Arc::new(FrameBudget::new(Some(Duration::from_millis(600)), true));
+        let limit = Some(Duration::from_secs(20));
+        let waits: Vec<Duration> = (0..2)
+            .map(|_| {
+                let budget = budget.clone();
+                std::thread::spawn(move || {
+                    let t = Instant::now();
+                    assert_eq!(resolve_within(standin, limit, &budget, true), standin);
+                    t.elapsed()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect();
+        assert!(budget.spent(), "waited {:?} of 600 ms", budget.waited());
+        // what one thread waited, the other did not (each with the whole budget: 1200 ms)
+        assert!(waits.iter().sum::<Duration>() < Duration::from_millis(1000), "each thread had the whole budget: {waits:?}");
+        // spent: the next draw goes with the stand-in at once
+        let t = Instant::now();
+        assert_eq!(resolve_within(standin, limit, &budget, true), standin);
+        assert!(t.elapsed() < Duration::from_millis(500), "a draw past the budget waited {:?}", t.elapsed());
+        // a present: the whole budget again
+        budget.reset();
+        assert!(!budget.spent());
+        let t = Instant::now();
+        assert_eq!(resolve_within(standin, Some(Duration::from_millis(200)), &budget, true), standin);
+        assert!(t.elapsed() >= Duration::from_millis(190), "a draw after the present waited only {:?}", t.elapsed());
+        go_tx.send(()).unwrap();
+        let _ = released(standin);
+    }
+
+    /// Once the frame's budget is spent a compute pipeline still building is not waited for
+    /// either, at a dispatch or at a bind, and is built on a worker – not in the title's
+    /// thread, where its driver compile (minutes, #156) cannot be cut short. The stand-in
+    /// comes back: not a translated pipeline, so its dispatch is skipped by the caller.
+    /// `XCL_PSO_COMPUTE_BUDGET=0`: waited for and built here, as before.
+    #[test]
+    fn past_the_frame_budget_draws_and_compute_go_with_the_stand_in_at_once() {
+        let spent = FrameBudget::new(Some(Duration::from_millis(100)), true);
+        spent.charge(Duration::from_secs(1));
+        assert!(spent.spent());
+        let (g, c) = (0x7410_0051usize, 0x7410_0053usize);
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let go_rx = Arc::new(Mutex::new(go_rx));
+        let (who_tx, who_rx) = mpsc::channel::<Option<String>>();
+        for (standin, compute) in [(g, false), (c, true)] {
+            let (go_rx, who_tx) = (go_rx.clone(), who_tx.clone());
+            submit_lazy(
+                standin,
+                compute,
+                Box::new(move || {
+                    let _ = who_tx.send(std::thread::current().name().map(str::to_string));
+                    let _ = go_rx.lock().unwrap().recv();
+                    standin + 1
+                }),
+            );
+        }
+        let lost = standin_draws();
+        let t = Instant::now();
+        assert_eq!(resolve_within(g, Some(Duration::from_secs(20)), &spent, true), g, "the draw goes with the stand-in");
+        assert_eq!(resolve_within(c, None, &spent, true), c, "the dispatch gets the stand-in");
+        assert_eq!(resolve_within(c, None, &spent, false), c, "and so does a bind");
+        assert!(t.elapsed() < Duration::from_millis(500), "waited {:?} with the budget spent", t.elapsed());
+        assert!(standin_draws() >= lost + 2, "the draw and the dispatch are counted as lost");
+        for _ in 0..2 {
+            let who = who_rx.recv_timeout(Duration::from_secs(5)).expect("both builds went to the workers");
+            assert!(who.as_deref().is_some_and(|n| n.starts_with("xcl-pso")), "built on {who:?}");
+        }
+        assert!(is_pending(g) && is_pending(c));
+        // built: the real pipelines, budget or not
+        go_tx.send(()).unwrap();
+        go_tx.send(()).unwrap();
+        assert_eq!(resolve_within(c, None, &FrameBudget::new(Some(Duration::from_secs(20)), true), true), c + 1);
+        assert_eq!(resolve_within(g, Some(Duration::from_secs(20)), &FrameBudget::new(Some(Duration::from_secs(20)), true), true), g + 1);
+
+        // XCL_PSO_COMPUTE_BUDGET=0: the spent budget does not stop a compute wait
+        let old = budget_from(Some("100"), Some("0"));
+        old.charge(Duration::from_secs(1));
+        let (c2, me) = (0x7410_0061usize, std::thread::current().id());
+        let (here_tx, here_rx) = mpsc::channel::<bool>();
+        submit_lazy(
+            c2,
+            true,
+            Box::new(move || {
+                let _ = here_tx.send(std::thread::current().id() == me);
+                std::thread::sleep(Duration::from_millis(100));
+                c2 + 1
+            }),
+        );
+        assert_eq!(resolve_within(c2, None, &old, true), c2 + 1);
+        assert!(here_rx.recv().unwrap(), "built in the waiting thread, as before");
+        for p in [g, c, c2] {
+            let _ = released(p);
+        }
     }
 }

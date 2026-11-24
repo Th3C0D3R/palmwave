@@ -127,8 +127,9 @@ pub struct D3d12Stats {
     /// pipelines built in the background behind a stand-in: built, failed, still building
     #[serde(default)]
     pub background_pipelines: (usize, usize, usize),
-    /// draws that went with a stand-in (drew nothing) because their pipeline was not built
-    /// within `XCL_PSO_WAIT_MS` – lost, not replayed
+    /// draws and dispatches that went with a stand-in (drew or computed nothing) because their
+    /// pipeline was not built within `XCL_PSO_WAIT_MS` or the frame's
+    /// `XCL_PSO_FRAME_BUDGET_MS` – lost, not replayed
     #[serde(default)]
     pub standin_draws: usize,
     /// DXIL cache and compiler statistics.

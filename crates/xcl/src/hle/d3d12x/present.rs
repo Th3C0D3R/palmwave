@@ -62,6 +62,8 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
 }
 
 unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u8) {
+    // the next frame's pipeline waits have their whole budget again
+    super::pso_async::frame_presented();
     let frames = BOUNDARIES.fetch_add(1, Ordering::Relaxed) + 1;
     if frames % 300 == 0 {
         // the title's frame rate, for comparing runs (every 300 frames)
@@ -601,6 +603,8 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         }
     }
     let _reset = Reset;
+    // (also for a title presented without PresentX, whose budget would never come back)
+    super::pso_async::frame_presented();
     let (queue, src, mut guard) = if let Some((queue, res)) = frame {
         let raw = res as *mut c_void;
         let Some(src) = ID3D12Resource::from_raw_borrowed(&raw) else { return };

@@ -806,10 +806,11 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 at += 4;
                 match pso {
                     Some(p) if (*p).translated => {
-                        // a pipeline still being built in the background is waited for; if
-                        // the background translation failed, skip instead of binding XCL's
-                        // ABI root signature onto the stand-in
-                        let real = super::pso_async::resolve_wait((*p).pc);
+                        // a pipeline still being built in the background is waited for, while
+                        // the frame's budget for pipeline waits lasts; past it, or if the
+                        // background translation failed, skip instead of binding XCL's ABI
+                        // root signature onto the stand-in
+                        let real = super::pso_async::resolve_for_draw((*p).pc);
                         if !super::real::is_translated_compute(real) {
                             out.skipped_dispatches += 1;
                             continue;

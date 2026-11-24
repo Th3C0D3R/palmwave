@@ -680,13 +680,16 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
 
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
-    let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
+    // a pipeline still being built is waited for while the frame's budget for pipeline waits
+    // lasts; past it the stand-in comes back, which is not a translated pipeline
+    let pso = super::pso_async::resolve_for_draw(with(this, |s| s.pso));
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !super::real::is_translated_compute(pso) {
         // a console pipeline without a translation (including a background build that
-        // failed): nothing to run (its root arguments were not given to the PC list either)
+        // failed, or one not done in time – `pso_async` logged that one): nothing to run
+        // (its root arguments were not given to the PC list either)
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+        if !super::pso_async::is_pending(pso) && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
             crate::xlog_warn!("D3D12.X: Dispatch with a pipeline that has no translated console shader ({pso:#x}) skipped");
         }
         count(DISPATCHES_SKIPPED);
@@ -832,8 +835,12 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
         Ok(p as usize)
     };
-    // a pipeline still being built in the background is waited for
-    let real = super::pso_async::resolve_wait(pso);
+    // the callers waited for a pipeline still being built (`resolve_for_draw`) and come here
+    // only with a translated one; a stand-in still building never gets XCL's root signature
+    let real = super::pso_async::resolve(pso);
+    if real == pso && super::pso_async::is_pending(pso) {
+        return Err("its pipeline is still being built".into());
+    }
     // a compute shader takes no more arguments from registers than it has (`inline_for`)
     let user_sgprs = if gfx { None } else { super::real::pso_user_sgprs(real) };
     let inline = layout.as_ref().map_or(0, |l| if gfx { l.inline_gfx } else { console_list::inline_for(l, user_sgprs) } as usize).min(args.len());
