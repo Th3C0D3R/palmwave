@@ -66,7 +66,14 @@ Shader compilation does not block the start. Before it loads its world, the titl
 
 On a GPU with 32-lane waves, including the RTX 5080, the recompiler implements wave64 compute and mesh operations with two cooperating halves. Vertex and pixel shaders that read lanes 32–63 still have accuracy limits. [Wave64 implementation notes](docs/wave64-on-wave32.md)
 
-The 64 KiB pages of video memory that hold the title's textures keep to a budget: what is left of 90 % of the video memory Windows grants the process, or `XCL_VRAM_POOL_MB=<MiB>`. Past it, further pages are in system memory, which the GPU reads more slowly, and page heaps left without a texture are released. This is tested on an RTX 5080 with the unit tests only, not yet with the retail title.
+With `XCL_HEAPS_VRAM_MB` set (or `XCL_VRAM_BUDGET=1`; `XCL_VRAM_BUDGET=0` turns it off), the 64 KiB pages of video memory that hold the title's textures keep to a budget: what is left of 90 % of the video memory Windows grants the process, or of `XCL_VRAM_BUDGET_MB=<MiB>` of local video memory. At the budget:
+
+- textures the CPU fills that no view heap names give their pages back, and are mapped and uploaded again when the title uses them;
+- block-compressed textures of 1024 texels and more are placed without their top mip, of 2048 and more without their top two, and their views are clamped to the mips they have (`XCL_VRAM_TRIM=0`: placed whole). They stay so until the title releases them;
+- page heaps whose textures nothing used for 10 s get a low residency priority, so that Windows moves those out of video memory first;
+- further pages are in system memory, which the GPU reads more slowly, and page heaps left without a texture are released.
+
+`XCL_VRAM_POOL_MB=<MiB>` gives the page heaps a fixed size of video memory instead, with the last point only, and `XCL_PAGE_BUDGET_MB=<MiB>` caps the page heaps of both kinds by giving pages back alone. The `memory: page budget:` line of `XCL_ACTIVITY=1` says what was given back, trimmed and demoted. This is tested on an RTX 5080 with the unit tests only, not yet with the retail title.
 
 ## Build and run
 

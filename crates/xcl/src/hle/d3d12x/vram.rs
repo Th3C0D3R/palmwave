@@ -29,6 +29,18 @@
 //! instead of video memory the card does not have, and a heap none of whose tiles is in use is
 //! released once the GPU is past everything that could have used it (`Retiring`).
 //!
+//! The budget is on with `XCL_VRAM_BUDGET` (`budget_mode`; without the switch, when the title's
+//! GPU heaps are in video memory, `XCL_HEAPS_VRAM_MB`: they and the pages together are more than
+//! a 16 GB card has, and what Windows then moves out of video memory is not its to choose well –
+//! the GPU hung). At the budget, before a page goes to system memory: CPU-filled textures no view
+//! heap names give their tiles back (`evict_lru`, mapped and uploaded again when used); large
+//! block-compressed textures placed then leave their top mips unmapped, their views clamped to
+//! the mips they have (`trim_mips`); and pool heaps none of whose textures was used for
+//! `DEMOTE_AGE` get a low residency priority, so that Windows takes those first (`demote`).
+//! Nothing is evicted with `ID3D12Device::Evict`: a shader reaches a texture through the shared
+//! view heap without XCL seeing it, and a page that is not resident there is a GPU page fault.
+//! An unmapped tile of a reserved texture reads as zero instead (tiled resources tier 2).
+//!
 //! Provenance: the spilled heap's properties (a CUSTOM heap in memory pool L0 the CPU does not
 //! map, `spill_properties`) and the fall back to it when video memory runs out follow
 //! OpenScarlett's "L0 system-RAM spill" (https://github.com/californiaAlmonds/OpenScarlett, MIT,
@@ -472,6 +484,8 @@ struct Pool<H> {
     spilled: bool,
     /// its tiles no page has
     free: Vec<u32>,
+    /// has a low residency priority (`Pages::demote`)
+    demoted: bool,
 }
 
 /// The pool heaps and their tiles, apart from D3D12 (`H`: the heap; numbers in the tests).
@@ -480,11 +494,13 @@ struct Pools<H> {
     heaps: Vec<Option<Pool<H>>>,
     /// tiles given back, reusable after `COOL`
     cooling: std::collections::VecDeque<(Tile, std::time::Instant)>,
+    /// heaps left without a tile in use stay (no budget: as before there was one)
+    keep_empty: bool,
 }
 
 impl<H> Pools<H> {
     const fn new() -> Self {
-        Pools { heaps: Vec::new(), cooling: std::collections::VecDeque::new() }
+        Pools { heaps: Vec::new(), cooling: std::collections::VecDeque::new(), keep_empty: false }
     }
 
     /// A free tile of video memory (`spilled`: of system memory): of the lowest heap that has
@@ -498,7 +514,7 @@ impl<H> Pools<H> {
 
     /// A new heap: its first tile (the others are free).
     fn add(&mut self, heap: H, spilled: bool) -> Tile {
-        let pool = Some(Pool { heap, spilled, free: (1..POOL_PAGES).rev().collect() });
+        let pool = Some(Pool { heap, spilled, free: (1..POOL_PAGES).rev().collect(), demoted: false });
         let h = match self.heaps.iter().position(Option::is_none) {
             Some(h) => {
                 self.heaps[h] = pool;
@@ -526,7 +542,7 @@ impl<H> Pools<H> {
             }
         }
         let mut gone = Vec::new();
-        if cooled {
+        if cooled && !self.keep_empty {
             let mut spare = false;
             for slot in &mut self.heaps {
                 let Some(p) = slot else { continue };
@@ -567,8 +583,30 @@ enum Budget {
     Unlimited,
     /// this many bytes (`XCL_VRAM_POOL_MB`)
     Fixed(u64),
-    /// what the adapter's budget for the process leaves
-    Adapter(windows::Win32::Graphics::Dxgi::IDXGIAdapter3),
+    /// what the adapter's budget for the process leaves – of `BUDGET_PERCENT` of it, or of
+    /// this many bytes of local video memory (`XCL_VRAM_BUDGET_MB`)
+    Adapter(windows::Win32::Graphics::Dxgi::IDXGIAdapter3, Option<u64>),
+}
+
+/// Whether the pages keep to a budget of video memory (`XCL_VRAM_BUDGET`: `0` off, anything else
+/// on; without the switch, on when the title's GPU heaps are in video memory –
+/// `sparse::saving`). In the tests: on.
+fn budget_mode() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(test) || *ON.get_or_init(|| super::sparse::saving("XCL_VRAM_BUDGET"))
+}
+
+/// Whether textures placed at the budget leave their top mips unmapped (`XCL_VRAM_TRIM=0`: no).
+fn trimming() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("XCL_VRAM_TRIM").is_ok_and(|v| v.trim() == "0"))
+}
+
+/// The local video memory the process may reach with a new pool heap: `limit`
+/// (`XCL_VRAM_BUDGET_MB`, at most what the adapter grants), else `BUDGET_PERCENT` of the
+/// adapter's `budget`.
+fn local_limit(budget: u64, limit: Option<u64>) -> u64 {
+    limit.map_or(budget / 100 * BUDGET_PERCENT, |l| l.min(budget))
 }
 
 /// The share of the adapter's budget of local video memory the process may reach with a new
@@ -577,9 +615,10 @@ enum Budget {
 const BUDGET_PERCENT: u64 = 90;
 
 /// Bytes the pool heaps may take of video memory when they have `in_video` and the adapter
-/// reports `budget` for the process, `usage` of it in use (the pool heaps among it).
-fn adapter_cap(budget: u64, usage: u64, in_video: u64) -> u64 {
-    in_video + (budget / 100 * BUDGET_PERCENT).saturating_sub(usage)
+/// reports `budget` for the process, `usage` of it in use (the pool heaps among it); `limit`:
+/// `local_limit`.
+fn adapter_cap(budget: u64, limit: Option<u64>, usage: u64, in_video: u64) -> u64 {
+    in_video + local_limit(budget, limit).saturating_sub(usage)
 }
 
 impl Budget {
@@ -588,12 +627,16 @@ impl Budget {
         if let Some(mb) = std::env::var("XCL_VRAM_POOL_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
             return Budget::Fixed(mb << 20);
         }
+        if !budget_mode() {
+            return Budget::Unlimited;
+        }
+        let limit = std::env::var("XCL_VRAM_BUDGET_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&mb| mb != 0).map(|mb| mb << 20);
         let mut arch = D3D12_FEATURE_DATA_ARCHITECTURE::default();
         if dev.CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &mut arch as *mut _ as *mut c_void, std::mem::size_of_val(&arch) as u32).is_ok() && arch.UMA.as_bool() {
             return Budget::Unlimited;
         }
         let adapter = CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter3>(dev.GetAdapterLuid()));
-        adapter.map_or(Budget::Unlimited, Budget::Adapter)
+        adapter.map_or(Budget::Unlimited, |a| Budget::Adapter(a, limit))
     }
 
     /// Bytes the pool heaps may take of video memory, of which they have `in_video` (None: no limit).
@@ -602,10 +645,27 @@ impl Budget {
         match self {
             Budget::Unlimited => None,
             Budget::Fixed(bytes) => Some(*bytes),
-            Budget::Adapter(adapter) => {
+            Budget::Adapter(adapter, limit) => {
                 let mut i = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
                 adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut i).ok()?;
-                (i.Budget != 0).then(|| adapter_cap(i.Budget, i.CurrentUsage, in_video))
+                (i.Budget != 0).then(|| adapter_cap(i.Budget, *limit, i.CurrentUsage, in_video))
+            }
+        }
+    }
+
+    /// Bytes the process holds of video memory past the budget (the pool heaps `in_video`):
+    /// what the pools have to give back.
+    unsafe fn excess(&self, in_video: u64) -> u64 {
+        use windows::Win32::Graphics::Dxgi::*;
+        match self {
+            Budget::Unlimited => 0,
+            Budget::Fixed(bytes) => in_video.saturating_sub(*bytes),
+            Budget::Adapter(adapter, limit) => {
+                let mut i = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+                if adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut i).is_err() || i.Budget == 0 {
+                    return 0;
+                }
+                i.CurrentUsage.saturating_sub(local_limit(i.Budget, *limit))
             }
         }
     }
@@ -666,6 +726,101 @@ struct Target {
     touched: std::time::Instant,
     /// where the last look at the view heaps found its T# (`seen`)
     seen: Seen,
+    /// its top mips left unmapped (`trim_mips`): how many, and their tiles (first, count)
+    trimmed: u32,
+    skip: Vec<(u32, u32)>,
+}
+
+/// The tile of a texture that is left unmapped (`Target::skip`).
+const NO_TILE: Tile = (u32::MAX, u32::MAX);
+
+/// Budget: a pool heap none of whose textures was used for this long gets a low residency
+/// priority.
+const DEMOTE_AGE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Budget: whether `t` keeps its pool heaps at their normal priority at `now`. A GPU-owned
+/// target is always in use for all XCL sees (it is bound without a view); a texture is while
+/// its T# is in a shader-visible heap (`seen` makes it recent every look) or it was placed,
+/// uploaded or named by a transition within `DEMOTE_AGE`.
+fn in_use(t: &Target, now: std::time::Instant) -> bool {
+    t.mapped && (t.gpu_owned || t.seen == Seen::Visible || now.saturating_duration_since(t.touched) < DEMOTE_AGE)
+}
+
+/// Budget: how many top mips a sampled texture placed at the budget leaves unmapped: two from
+/// 2048 texels on its shorter side (15/16 of its memory), one from 1024 (3/4) – never a packed
+/// mip (`standard`: its mips with tiles of their own), never its last. Block-compressed 2D
+/// textures only: the streamed material textures, which nothing renders or copies into.
+fn trim_mips(desc: &D3D12_RESOURCE_DESC, standard: u32) -> u32 {
+    let bc = matches!(desc.Format.0, 70..=84 | 94..=99);
+    if !bc || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 {
+        return 0;
+    }
+    let want = match desc.Width.min(desc.Height as u64) {
+        2048.. => 2,
+        1024.. => 1,
+        _ => 0,
+    };
+    want.min(standard.saturating_sub(1)).min((desc.MipLevels as u32).saturating_sub(1))
+}
+
+/// The tiles (first, count) of the mips below `trim` of a texture of `mips` mips a slice, from
+/// its subresource tilings (D3D12 order: every mip of slice 0, then of slice 1 …).
+fn trimmed_tiles(tilings: &[D3D12_SUBRESOURCE_TILING], mips: u32, trim: u32) -> Vec<(u32, u32)> {
+    tilings
+        .iter()
+        .enumerate()
+        .filter(|(s, t)| mips != 0 && (*s as u32 % mips) < trim && t.StartTileIndexInOverallResource != u32::MAX)
+        .map(|(_, t)| (t.StartTileIndexInOverallResource, t.WidthInTiles * t.HeightInTiles as u32 * t.DepthInTiles as u32))
+        .filter(|r| r.1 != 0)
+        .collect()
+}
+
+/// A view of a texture whose `trim` top mips are unmapped: `view` (None: the default view of
+/// `desc`) with its LOD clamped to the mips the texture has. Views of other dimensions stay.
+pub(super) fn clamp_view(desc: &D3D12_RESOURCE_DESC, view: Option<D3D12_SHADER_RESOURCE_VIEW_DESC>, trim: u32) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
+    let mut v = match view {
+        Some(v) => v,
+        None if desc.DepthOrArraySize > 1 => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: desc.Format,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2DArray: D3D12_TEX2D_ARRAY_SRV { MipLevels: u32::MAX, ArraySize: u32::MAX, ..Default::default() } },
+        },
+        None => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: desc.Format,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MipLevels: u32::MAX, ..Default::default() } },
+        },
+    };
+    let lod = trim as f32;
+    // SAFETY: the union member the view dimension names
+    unsafe {
+        let clamp = match v.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => &mut v.Anonymous.Texture2D.ResourceMinLODClamp,
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => &mut v.Anonymous.Texture2DArray.ResourceMinLODClamp,
+            D3D12_SRV_DIMENSION_TEXTURECUBE => &mut v.Anonymous.TextureCube.ResourceMinLODClamp,
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => &mut v.Anonymous.TextureCubeArray.ResourceMinLODClamp,
+            _ => return Some(v),
+        };
+        *clamp = clamp.max(lod);
+    }
+    Some(v)
+}
+
+/// texture → its top mips left unmapped (`Target::trimmed`), for the views made of it
+static TRIMMED: Mutex<Option<std::collections::HashMap<usize, u32>>> = Mutex::new(None);
+static TRIMMED_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// tiles the evictions gave back, and the times a pool heap got a low priority – `XCL_ACTIVITY`
+static EVICTED_TILES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DEMOTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many top mips of `res` are unmapped (0: none; `clamp_view` for its views).
+pub(super) fn trimmed_mips(res: usize) -> u32 {
+    if !TRIMMED_ANY.load(std::sync::atomic::Ordering::Relaxed) {
+        return 0;
+    }
+    TRIMMED.lock().unwrap().as_ref().and_then(|m| m.get(&res).copied()).unwrap_or(0)
 }
 
 /// Where a texture's T# was at the last look at the console view heaps.
@@ -697,6 +852,11 @@ struct Pages {
     released: usize,
     /// when `sweep` last ran
     swept: std::time::Instant,
+    /// when `keep_budget` last ran
+    looked: std::time::Instant,
+    /// at the budget: no room for another pool heap of video memory, or pages in system
+    /// memory (`keep_budget`, `take_tile`)
+    over: bool,
     /// title page address → its video memory
     pages: std::collections::HashMap<usize, Page>,
     /// extra / sub-64 KiB tiles keyed by `(va, tile_index)` so repeated placements at the same
@@ -732,14 +892,20 @@ impl Pages {
         crate::xlog_info!("D3D12.X: textures in title memory: tiled resources on 64 KiB pages of video memory, one per page of the title's");
         let budget = Budget::of(dev);
         match budget.cap(0) {
-            Some(cap) => crate::xlog_info!("D3D12.X: the pages may take {} MB of video memory now; past the budget they are in system memory", cap >> 20),
+            Some(cap) => crate::xlog_info!(
+                "D3D12.X: the pages may take {} MB of video memory now (XCL_VRAM_BUDGET); at the budget unused textures give their pages back, large ones are placed without their top mips{}, idle pool heaps get a low priority, and further pages are in system memory",
+                cap >> 20,
+                if trimming() { "" } else { " (off: XCL_VRAM_TRIM=0)" }
+            ),
             None => crate::xlog_info!("D3D12.X: no budget of video memory for the pages"),
         }
+        let mut pools = Pools::new();
+        pools.keep_empty = matches!(budget, Budget::Unlimited);
         Some(Pages {
             queue,
             fence,
             value: 0,
-            pools: Pools::new(),
+            pools,
             budget,
             video_full: None,
             retiring: Vec::new(),
@@ -747,6 +913,8 @@ impl Pages {
             marks: std::collections::HashMap::new(),
             released: 0,
             swept: std::time::Instant::now(),
+            looked: std::time::Instant::now(),
+            over: false,
             pages: std::collections::HashMap::new(),
             extra_pages: std::collections::HashMap::new(),
             idle: std::collections::VecDeque::new(),
@@ -830,6 +998,17 @@ impl Pages {
             }
             self.video_full = Some(std::time::Instant::now());
         }
+        // at the budget: textures nothing uses give their tiles back before a page goes to
+        // system memory (a round when the last one's tiles are used up, as above)
+        if budget_mode() {
+            self.over = true;
+            if self.pools.cooling.is_empty() {
+                self.evict_lru(EVICT_BATCH);
+            }
+            if let Some((t, _)) = self.pools.cooling.pop_front() {
+                return Some(t);
+            }
+        }
         if let Some(t) = self.pools.take(true) {
             return Some(t);
         }
@@ -863,7 +1042,7 @@ impl Pages {
 
     /// Map every tile of `res` (`tiles[i]`: overall tile i) – one call per pool heap.
     unsafe fn map(&mut self, res: &ID3D12Resource, tiles: &[Tile]) {
-        let mut heaps: Vec<u32> = tiles.iter().map(|t| t.0).collect();
+        let mut heaps: Vec<u32> = tiles.iter().filter(|&&t| t != NO_TILE).map(|t| t.0).collect();
         heaps.sort_unstable();
         heaps.dedup();
         for h in heaps {
@@ -1009,12 +1188,14 @@ impl Pages {
                 LOGGED.store(n.max(1) * 2, std::sync::atomic::Ordering::Relaxed);
                 crate::xlog_info!("D3D12.X: page budget: {} textures evicted ({} MB back) this round, {n} so far; {shared} passed over, all their pages shared", evicted.len(), (freed * PAGE) >> 20);
             }
+            EVICTED_TILES.fetch_add(freed as u64, std::sync::atomic::Ordering::Relaxed);
             EVICTED.lock().unwrap().get_or_insert_with(HashSet::new).extend(evicted);
         }
     }
 
     /// Acquire/share all `total` tiles for `res` at `va` and map them on the `Pages` queue.
-    unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
+    /// The tiles in `skip` (first, count) stay unmapped and take no page.
+    unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32, skip: &[(u32, u32)]) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
         let (first, own) = (total > 0).then(|| owned_pages(va, console_bytes, total as usize)).flatten()?;
         let now = std::time::Instant::now();
         self.sweep(now);
@@ -1022,6 +1203,10 @@ impl Pages {
         let mut used = Vec::with_capacity(own);
         let mut used_extra = Vec::new();
         for i in 0..total as usize {
+            if skip.iter().any(|&(s, n)| (s..s.saturating_add(n)).contains(&(i as u32))) {
+                tiles.push(NO_TILE);
+                continue;
+            }
             let tile = if i < own {
                 let a = first + i * PAGE;
                 let tile = match self.pages.get_mut(&a) {
@@ -1064,6 +1249,64 @@ impl Pages {
         }
         self.map(res, &tiles);
         Some((used, used_extra))
+    }
+
+    /// Budget, about once a second before a submission: whether the pools are at it (`over`);
+    /// past it – what else the process holds in video memory grew – textures nothing uses give
+    /// their tiles back, so that their pool heaps empty and go; and the priorities (`demote`).
+    unsafe fn keep_budget(&mut self, dev: &ID3D12Device, now: std::time::Instant) {
+        self.looked = now;
+        let heaps = self.pools.count();
+        let in_video = heaps.0 as u64 * POOL_BYTES;
+        let Some(cap) = self.budget.cap(in_video) else {
+            self.over = false;
+            return;
+        };
+        self.over = heaps.1 > 0 || in_video + POOL_BYTES > cap;
+        let excess = self.budget.excess(in_video);
+        if excess > 0 {
+            self.evict_lru(((excess / PAGE as u64) as usize).clamp(1, 4 * EVICT_BATCH));
+        }
+        self.demote(dev, now);
+    }
+
+    /// The pool heaps (their numbers) with a tile of a texture in use at `now` (`in_use`).
+    fn heaps_in_use(&self, now: std::time::Instant) -> HashSet<u32> {
+        let mut hot = HashSet::new();
+        for t in self.targets.values().filter(|t| in_use(t, now)) {
+            hot.extend(t.used.iter().filter_map(|a| self.pages.get(a)).map(|p| p.tile.0));
+            hot.extend(t.used_extra.iter().filter_map(|k| self.extra_pages.get(k)).map(|p| p.tile.0));
+        }
+        hot
+    }
+
+    /// Budget: at it, a pool heap with tiles in use none of whose textures is in use
+    /// (`heaps_in_use`) gets a low residency priority – what Windows moves out of video memory
+    /// first when it is short – and its normal one back when one is, or the pools are under
+    /// the budget again. Only while the view heaps are looked at: without them no texture is
+    /// ever seen in use. (Not `Evict`: see the module's comment.)
+    unsafe fn demote(&mut self, dev: &ID3D12Device, now: std::time::Instant) {
+        if !self.over && !self.pools.heaps.iter().flatten().any(|p| p.demoted) {
+            return;
+        }
+        let looked = HEAPS_LOOKED.load(std::sync::atomic::Ordering::Relaxed);
+        let hot = self.heaps_in_use(now);
+        let Ok(dev1) = dev.cast::<ID3D12Device1>() else { return };
+        for (h, p) in self.pools.heaps.iter_mut().enumerate() {
+            let Some(p) = p else { continue };
+            let cold = self.over && looked && p.free.len() < POOL_PAGES as usize && !hot.contains(&(h as u32));
+            if cold == p.demoted {
+                continue;
+            }
+            let Ok(pageable) = p.heap.cast::<ID3D12Pageable>() else { continue };
+            let priority = if cold { D3D12_RESIDENCY_PRIORITY_LOW } else { D3D12_RESIDENCY_PRIORITY_NORMAL };
+            if dev1.SetResidencyPriority(1, &Some(pageable), &priority).is_ok() {
+                p.demoted = cold;
+                if cold {
+                    DEMOTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
     }
 }
 
@@ -1170,13 +1413,31 @@ unsafe fn place_on_pages(
     let res = ID3D12Resource::from_raw_borrowed(&raw)?;
     let mut total = 0u32;
     dev.GetResourceTiling(res, Some(&mut total), None, None, None, 0, std::ptr::null_mut());
-    let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total) else {
+    // at the budget a large sampled texture is placed without its top mips
+    let (mut trimmed, mut skip) = (0, Vec::new());
+    if !require_aligned && pages.over && trimming() {
+        let made = res.GetDesc();
+        let mut subs = made.MipLevels as u32 * made.DepthOrArraySize as u32;
+        let mut tilings = vec![D3D12_SUBRESOURCE_TILING::default(); subs as usize];
+        let mut packed = D3D12_PACKED_MIP_INFO::default();
+        dev.GetResourceTiling(res, None, Some(&mut packed), None, Some(&mut subs), 0, tilings.as_mut_ptr());
+        trimmed = trim_mips(&made, packed.NumStandardMips as u32);
+        skip = trimmed_tiles(&tilings[..(subs as usize).min(tilings.len())], made.MipLevels as u32, trimmed);
+        if skip.is_empty() {
+            trimmed = 0;
+        }
+    }
+    let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total, &skip) else {
         drop(g);
         drop(windows::core::IUnknown::from_raw(raw));
         *ppv = std::ptr::null_mut();
         return None;
     };
-    pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, evictable: false, gpu_owned: require_aligned, touched: std::time::Instant::now(), seen: Seen::None });
+    if trimmed > 0 {
+        TRIMMED.lock().unwrap().get_or_insert_with(Default::default).insert(raw as usize, trimmed);
+        TRIMMED_ANY.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, evictable: false, gpu_owned: require_aligned, touched: std::time::Instant::now(), seen: Seen::None, trimmed, skip });
     drop(g);
     PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw as usize);
     Some(hr)
@@ -1213,13 +1474,13 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
     let key = res.as_raw() as usize;
     let mut g = PAGES.lock().unwrap();
     let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return false };
-    let Some((va, console_bytes, total, mapped)) = pages.targets.get(&key).map(|t| (t.va, t.console_bytes, t.total, t.mapped)) else {
+    let Some((va, console_bytes, total, mapped, skip)) = pages.targets.get(&key).map(|t| (t.va, t.console_bytes, t.total, t.mapped, t.skip.clone())) else {
         return false;
     };
     if mapped {
         return true;
     }
-    let Some((used, used_extra)) = pages.bind(&dev, res, va, console_bytes, total) else {
+    let Some((used, used_extra)) = pages.bind(&dev, res, va, console_bytes, total, &skip) else {
         return false;
     };
     if let Some(t) = pages.targets.get_mut(&key) {
@@ -1257,7 +1518,7 @@ pub(super) fn any_evicted() -> bool {
 
 /// Whether the page budget follows the use of textures (always in the tests).
 pub(super) fn tracking() -> bool {
-    cfg!(test) || pool_cap() != 0
+    cfg!(test) || pool_cap() != 0 || budget_mode()
 }
 
 /// Page budget: the T# of the textures `visible` is in a shader-visible view heap (they may be
@@ -1357,6 +1618,11 @@ fn forget_pages(resource: usize) {
         if let Some(s) = EVICTED.lock().unwrap().as_mut() {
             s.remove(&resource);
         }
+        if t.trimmed > 0 {
+            if let Some(m) = TRIMMED.lock().unwrap().as_mut() {
+                m.remove(&resource);
+            }
+        }
         return;
     }
 }
@@ -1393,6 +1659,9 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     } else {
         pages.release_retired(now);
     }
+    if budget_mode() && now.duration_since(pages.looked) >= SETTLE {
+        pages.keep_budget(&dev, now);
+    }
 }
 
 #[cfg(test)]
@@ -1425,6 +1694,25 @@ pub fn page_budget() -> (Option<u64>, [usize; 4]) {
         let own = unsafe { p.budget.cap(heaps.0 as u64 * POOL_BYTES) };
         (own.map(|c| c + cap.unwrap_or(0)).or(cap), [a[0] + heaps.1, a[1] + p.pools.spilled_tiles(), a[2] + p.released, a[3] + p.retiring.len()])
     })
+}
+
+/// What the budget did – `XCL_ACTIVITY`: [textures evicted so far, bytes their tiles gave back,
+/// textures mapped again, textures on the pages without their top mips now, bytes of the tiles
+/// those leave unmapped, pool heaps with a low priority now, times a pool heap got one,
+/// 1 when the pools are at their budget].
+pub fn budget_counts() -> [u64; 8] {
+    use std::sync::atomic::Ordering::Relaxed;
+    let g = PAGES.lock().unwrap();
+    let mut c = [EVICTIONS.load(Relaxed), EVICTED_TILES.load(Relaxed) * PAGE as u64, REMAPS.load(Relaxed), 0, 0, 0, DEMOTIONS.load(Relaxed), 0];
+    for p in g.values().flatten() {
+        for t in p.targets.values().filter(|t| t.trimmed > 0) {
+            c[3] += 1;
+            c[4] += t.skip.iter().map(|r| r.1 as u64).sum::<u64>() * PAGE as u64;
+        }
+        c[5] += p.pools.heaps.iter().flatten().filter(|h| h.demoted).count() as u64;
+        c[7] |= p.over as u64;
+    }
+    c
 }
 
 /// (bytes of pages in use by tiled textures, bytes of pool heaps) – `XCL_ACTIVITY`
@@ -1711,10 +1999,10 @@ mod tests {
     fn the_pools_budget_is_what_the_adapters_leaves() {
         const MIB64: u64 = 1 << 20;
         // 90 % of 10,000 MiB; 4,000 in use, 2,000 of them the pools': 5,000 more for them
-        assert_eq!(adapter_cap(10_000 * MIB64, 4_000 * MIB64, 2_000 * MIB64), 7_000 * MIB64);
+        assert_eq!(adapter_cap(10_000 * MIB64, None, 4_000 * MIB64, 2_000 * MIB64), 7_000 * MIB64);
         // at the budget or past it (other programs took video memory): what they have, no more
-        assert_eq!(adapter_cap(10_000 * MIB64, 9_000 * MIB64, 2_000 * MIB64), 2_000 * MIB64);
-        assert_eq!(adapter_cap(4_000 * MIB64, 9_000 * MIB64, 2_000 * MIB64), 2_000 * MIB64);
+        assert_eq!(adapter_cap(10_000 * MIB64, None, 9_000 * MIB64, 2_000 * MIB64), 2_000 * MIB64);
+        assert_eq!(adapter_cap(4_000 * MIB64, None, 9_000 * MIB64, 2_000 * MIB64), 2_000 * MIB64);
     }
 
     /// On the GPU: with the pools at their budget of video memory, new pages are in system
@@ -2337,5 +2625,230 @@ mod tests {
             assert!(PAGES.lock().unwrap().get(&dev_key).unwrap().as_ref().unwrap().targets[&key(&old)].mapped, "mapped again");
             drop((old, newer, written, alone));
         }
+    }
+
+    /// Budget: the top mips a texture placed at the budget goes without – two from 2048 texels,
+    /// one from 1024, block-compressed 2D textures with a chain only, never a packed mip.
+    #[test]
+    fn large_block_compressed_textures_lose_their_top_mips_at_the_budget() {
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let tex = |w: u64, h: u32, mips: u16, format| D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: w, Height: h, DepthOrArraySize: 1, MipLevels: mips, Format: format, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
+        assert_eq!(trim_mips(&tex(4096, 4096, 13, DXGI_FORMAT_BC7_UNORM), 6), 2);
+        assert_eq!(trim_mips(&tex(2048, 2048, 12, DXGI_FORMAT_BC1_UNORM_SRGB), 5), 2);
+        assert_eq!(trim_mips(&tex(4096, 1024, 13, DXGI_FORMAT_BC5_UNORM), 4), 1, "by its shorter side");
+        assert_eq!(trim_mips(&tex(1024, 1024, 11, DXGI_FORMAT_BC3_UNORM), 4), 1);
+        assert_eq!(trim_mips(&tex(512, 512, 10, DXGI_FORMAT_BC7_UNORM), 3), 0, "small: whole");
+        assert_eq!(trim_mips(&tex(2048, 2048, 1, DXGI_FORMAT_BC7_UNORM), 1), 0, "its only mip stays");
+        assert_eq!(trim_mips(&tex(2048, 2048, 2, DXGI_FORMAT_BC7_UNORM), 2), 1, "its last mip stays");
+        assert_eq!(trim_mips(&tex(2048, 2048, 12, DXGI_FORMAT_BC7_UNORM), 2), 1, "a packed mip is not left out");
+        assert_eq!(trim_mips(&tex(2048, 2048, 12, DXGI_FORMAT_R8G8B8A8_UNORM), 5), 0, "not block-compressed: the GPU may write it");
+        let volume = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE3D, DepthOrArraySize: 64, ..tex(2048, 2048, 12, DXGI_FORMAT_BC7_UNORM) };
+        assert_eq!(trim_mips(&volume, 5), 0);
+
+        // two slices of 4 mips (64, 16, 4 tiles and a packed one): mips 0 and 1 of each slice
+        let t = |start: u32, w: u32| D3D12_SUBRESOURCE_TILING { WidthInTiles: w, HeightInTiles: w as u16, DepthInTiles: 1, StartTileIndexInOverallResource: start };
+        let packed = D3D12_SUBRESOURCE_TILING { StartTileIndexInOverallResource: u32::MAX, ..Default::default() };
+        let tilings = [t(0, 8), t(64, 4), t(80, 2), packed, t(85, 8), t(149, 4), t(165, 2), packed];
+        assert_eq!(trimmed_tiles(&tilings, 4, 2), [(0, 64), (64, 16), (85, 64), (149, 16)]);
+        assert_eq!(trimmed_tiles(&tilings, 4, 1), [(0, 64), (85, 64)]);
+        assert!(trimmed_tiles(&tilings, 4, 0).is_empty());
+        assert!(trimmed_tiles(&[packed, packed], 2, 1).is_empty(), "packed mips have no tiles of their own");
+    }
+
+    /// Budget: a view of a texture without its top mips never reads below the mips it has,
+    /// whatever the title asked for; the default view too.
+    #[test]
+    fn views_of_a_trimmed_texture_are_clamped_to_its_mips() {
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 2048, Height: 2048, DepthOrArraySize: 1, MipLevels: 12, Format: DXGI_FORMAT_BC7_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
+        unsafe {
+            let v = clamp_view(&desc, None, 2).unwrap();
+            assert_eq!((v.ViewDimension, v.Format, v.Shader4ComponentMapping), (D3D12_SRV_DIMENSION_TEXTURE2D, DXGI_FORMAT_BC7_UNORM, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING));
+            assert_eq!((v.Anonymous.Texture2D.MostDetailedMip, v.Anonymous.Texture2D.MipLevels, v.Anonymous.Texture2D.ResourceMinLODClamp), (0, u32::MAX, 2.0));
+            let array = clamp_view(&D3D12_RESOURCE_DESC { DepthOrArraySize: 6, ..desc }, None, 1).unwrap();
+            assert_eq!((array.ViewDimension, array.Anonymous.Texture2DArray.ArraySize, array.Anonymous.Texture2DArray.ResourceMinLODClamp), (D3D12_SRV_DIMENSION_TEXTURE2DARRAY, u32::MAX, 1.0));
+            // the title's own view keeps what it says, with the clamp raised – never lowered
+            let mut own = D3D12_SHADER_RESOURCE_VIEW_DESC { Format: DXGI_FORMAT_BC7_UNORM_SRGB, ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBE, Shader4ComponentMapping: 0x1234, ..Default::default() };
+            own.Anonymous.TextureCube = D3D12_TEXCUBE_SRV { MostDetailedMip: 1, MipLevels: 5, ResourceMinLODClamp: 0.5 };
+            let v = clamp_view(&desc, Some(own), 2).unwrap();
+            assert_eq!((v.Format, v.Shader4ComponentMapping, v.Anonymous.TextureCube.MostDetailedMip, v.Anonymous.TextureCube.MipLevels, v.Anonymous.TextureCube.ResourceMinLODClamp), (DXGI_FORMAT_BC7_UNORM_SRGB, 0x1234, 1, 5, 2.0));
+            own.Anonymous.TextureCube.ResourceMinLODClamp = 4.0;
+            assert_eq!(clamp_view(&desc, Some(own), 2).unwrap().Anonymous.TextureCube.ResourceMinLODClamp, 4.0);
+            // a view that is not of a 2D texture or cube is left as it is
+            let mut buffer = D3D12_SHADER_RESOURCE_VIEW_DESC { ViewDimension: D3D12_SRV_DIMENSION_BUFFER, ..Default::default() };
+            buffer.Anonymous.Buffer = D3D12_BUFFER_SRV { FirstElement: 7, NumElements: 9, StructureByteStride: 4, ..Default::default() };
+            let v = clamp_view(&desc, Some(buffer), 2).unwrap();
+            assert_eq!((v.Anonymous.Buffer.FirstElement, v.Anonymous.Buffer.NumElements, v.Anonymous.Buffer.StructureByteStride), (7, 9, 4));
+        }
+    }
+
+    /// Budget: the local video memory the pools keep the process under – 90 % of what the
+    /// adapter grants, or `XCL_VRAM_BUDGET_MB`, never more than the adapter grants.
+    #[test]
+    fn the_budget_of_local_video_memory_is_the_adapters_or_the_switchs() {
+        const MIB64: u64 = 1 << 20;
+        assert_eq!(local_limit(15_000 * MIB64, None), 13_500 * MIB64);
+        assert_eq!(local_limit(15_000 * MIB64, Some(14_500 * MIB64)), 14_500 * MIB64);
+        assert_eq!(local_limit(15_000 * MIB64, Some(20_000 * MIB64)), 15_000 * MIB64);
+        // 14.5 GB asked for, 12 GB in use of which 6 GB of pool heaps: 2.5 GB more for them
+        assert_eq!(adapter_cap(15_000 * MIB64, Some(14_500 * MIB64), 12_000 * MIB64, 6_000 * MIB64), 8_500 * MIB64);
+        assert_eq!(adapter_cap(15_000 * MIB64, Some(14_500 * MIB64), 19_700 * MIB64, 6_000 * MIB64), 6_000 * MIB64, "past it: no more");
+    }
+
+    /// The first hardware adapter's device with tiled resources, as the page-budget tests use.
+    unsafe fn hardware_device() -> Option<ID3D12Device> {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+        let adapter = factory.EnumAdapters1(0).ok()?;
+        if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+            return None;
+        }
+        let mut dev: Option<ID3D12Device> = None;
+        let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+        let dev = dev.filter(|d| tier2(d))?;
+        super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+        Some(dev)
+    }
+
+    /// Budget, on the GPU: a large block-compressed texture placed at the budget takes no page
+    /// for its two top mips, is known as trimmed for its views, and stays so when it is mapped
+    /// again; the same texture placed under the budget, and one that is not block-compressed,
+    /// are whole.
+    #[test]
+    fn a_texture_placed_at_the_budget_takes_no_pages_for_its_top_mips() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        unsafe {
+            let Some(dev) = hardware_device() else { return };
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let place_at = |va: usize, format: DXGI_FORMAT| {
+                let desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 2048, Height: 2048, DepthOrArraySize: 1, MipLevels: 12, Format: format, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
+                let mut p = std::ptr::null_mut();
+                let hr = place_pages(dev.as_raw(), va, &desc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), Some(32 << 20), riid, &mut p);
+                (hr.is_some_and(|hr| hr >= 0) && !p.is_null()).then(|| ID3D12Resource::from_raw(p))
+            };
+            let dev_key = dev.as_raw() as usize;
+            let set_over = |over: bool| {
+                if let Some(p) = PAGES.lock().unwrap().get_mut(&dev_key).and_then(Option::as_mut) {
+                    p.over = over;
+                }
+            };
+            let Some(whole) = place_at(0x62_0000_0000, DXGI_FORMAT_BC7_UNORM) else {
+                crate::gpu::recomp::runner::skip_test("no reserved textures");
+                return;
+            };
+            set_over(false);
+            let Some(under) = place_at(0x62_1000_0000, DXGI_FORMAT_BC7_UNORM) else { return };
+            set_over(true);
+            let (Some(trimmed), Some(rgba)) = (place_at(0x62_2000_0000, DXGI_FORMAT_BC7_UNORM), place_at(0x62_4000_0000, DXGI_FORMAT_R8G8B8A8_UNORM)) else {
+                set_over(false);
+                return;
+            };
+            set_over(false);
+            let key = |r: &ID3D12Resource| r.as_raw() as usize;
+            let held = |r: &ID3D12Resource| {
+                let g = PAGES.lock().unwrap();
+                let t = &g.get(&dev_key).unwrap().as_ref().unwrap().targets[&key(r)];
+                (t.total as usize, t.used.len() + t.used_extra.len(), t.trimmed, t.skip.iter().map(|s| s.1 as usize).sum::<usize>())
+            };
+            let (total, pages, mips, left_out) = held(&under);
+            assert_eq!((pages, mips, left_out), (total, 0, 0), "under the budget: every tile has a page");
+            assert_eq!(trimmed_mips(key(&under)), 0);
+            let (total, pages, mips, left_out) = held(&trimmed);
+            // BC7 2048x2048: 4 MiB and 1 MiB for mips 0 and 1 – 64 and 16 tiles
+            assert_eq!((mips, left_out, pages), (2, 80, total - 80), "at the budget: no page for mips 0 and 1");
+            assert_eq!(trimmed_mips(key(&trimmed)), 2, "its views are clamped");
+            let (total, pages, mips, _) = held(&rgba);
+            assert_eq!((pages, mips), (total, 0), "not block-compressed: whole");
+            // unmapped and mapped again (an eviction, a superseding placement): trimmed still
+            unmap_superseded(&trimmed);
+            assert_eq!(held(&trimmed).1, 0);
+            assert!(remap_if_unmapped(&trimmed));
+            assert_eq!(held(&trimmed), (total_of(&trimmed), total_of(&trimmed) - 80, 2, 80));
+            assert!(dev.GetDeviceRemovedReason().is_ok(), "the device took the partial mappings");
+            let k = key(&trimmed);
+            drop((whole, under, trimmed, rgba));
+            assert_eq!(trimmed_mips(k), 0, "released: forgotten");
+        }
+    }
+
+    unsafe fn total_of(r: &ID3D12Resource) -> usize {
+        let mut dev: Option<ID3D12Device> = None;
+        r.GetDevice(&mut dev).unwrap();
+        let mut total = 0u32;
+        dev.unwrap().GetResourceTiling(r, Some(&mut total), None, None, None, 0, std::ptr::null_mut());
+        total as usize
+    }
+
+    /// Budget, on the GPU: at the budget a pool heap whose textures nothing has used for
+    /// `DEMOTE_AGE` gets a low residency priority; it has its normal one again when a texture
+    /// on it is in a shader-visible heap, or the pools are under the budget. A GPU-owned target
+    /// always counts as in use.
+    #[test]
+    fn idle_pool_heaps_get_a_low_priority_at_the_budget() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        unsafe {
+            let Some(dev) = hardware_device() else { return };
+            let desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 512, Height: 512, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8G8B8A8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let mut p = std::ptr::null_mut();
+            let hr = place_pages(dev.as_raw(), 0x63_0000_0000, &desc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), Some(1 << 20), riid, &mut p);
+            if !hr.is_some_and(|hr| hr >= 0) || p.is_null() {
+                crate::gpu::recomp::runner::skip_test("no reserved textures");
+                return;
+            }
+            let tex = ID3D12Resource::from_raw(p);
+            let (key, dev_key) = (tex.as_raw() as usize, dev.as_raw() as usize);
+            let now = Instant::now();
+            let looked = HEAPS_LOOKED.swap(true, std::sync::atomic::Ordering::Relaxed);
+            {
+                let mut g = PAGES.lock().unwrap();
+                let pages = g.get_mut(&dev_key).unwrap().as_mut().unwrap();
+                // nothing on the pages was used for a minute
+                for t in pages.targets.values_mut() {
+                    t.touched = now - Duration::from_secs(60);
+                    t.seen = Seen::None;
+                }
+                let heap = pages.pages[&pages.targets[&key].used[0]].tile.0 as usize;
+                let demoted = |pages: &Pages| pages.pools.heaps[heap].as_ref().unwrap().demoted;
+                pages.over = false;
+                pages.demote(&dev, now);
+                assert!(!demoted(pages), "under the budget nothing is demoted");
+                pages.over = true;
+                pages.demote(&dev, now);
+                assert!(demoted(pages), "at the budget: a heap nothing uses");
+                assert!(budget_counts_of(pages) >= 1);
+                pages.targets.get_mut(&key).unwrap().seen = Seen::Visible;
+                pages.demote(&dev, now);
+                assert!(!demoted(pages), "its texture is in a shader-visible heap: normal again");
+                pages.targets.get_mut(&key).unwrap().seen = Seen::None;
+                pages.demote(&dev, now);
+                assert!(demoted(pages));
+                pages.targets.get_mut(&key).unwrap().gpu_owned = true;
+                pages.demote(&dev, now);
+                assert!(!demoted(pages), "a GPU-owned target is in use for all XCL sees");
+                pages.targets.get_mut(&key).unwrap().gpu_owned = false;
+                pages.demote(&dev, now);
+                assert!(demoted(pages));
+                pages.targets.get_mut(&key).unwrap().touched = now;
+                pages.demote(&dev, now);
+                assert!(!demoted(pages), "used just now");
+                pages.targets.get_mut(&key).unwrap().touched = now - Duration::from_secs(60);
+                pages.demote(&dev, now);
+                assert!(demoted(pages));
+                pages.over = false;
+                pages.demote(&dev, now);
+                assert!(!demoted(pages), "under the budget again: normal again");
+                assert!(dev.GetDeviceRemovedReason().is_ok());
+            }
+            HEAPS_LOOKED.store(looked, std::sync::atomic::Ordering::Relaxed);
+            drop(tex);
+        }
+    }
+
+    fn budget_counts_of(pages: &Pages) -> usize {
+        pages.pools.heaps.iter().flatten().filter(|h| h.demoted).count()
     }
 }

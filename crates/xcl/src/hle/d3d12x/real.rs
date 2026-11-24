@@ -2082,6 +2082,13 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     if let Some(v) = ID3D12Resource::from_raw_borrowed(&res).and_then(|r| pc_srv(&r.GetDesc(), copy.as_ref())) {
         copy = Some(v);
     }
+    // a texture placed without its top mips (`vram::trim_mips`): its views are of the mips it has
+    let trimmed = super::vram::trimmed_mips(res as usize);
+    if trimmed > 0 {
+        if let Some(r) = ID3D12Resource::from_raw_borrowed(&res) {
+            copy = super::vram::clamp_view(&r.GetDesc(), copy.or(desc.as_ref().copied()), trimmed);
+        }
+    }
     let desc = copy.as_ref().map_or(desc, |c| c as *const _);
     let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, desc, cpu) };
     // Raytracing acceleration structure SRV (pResource == NULL, Location == console GPU VA):

@@ -144,9 +144,12 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     "memory: DXC {} compiling, {} queued; ShaderCache {} shaders, {} KB; DirectStorage buffers {} KB in flight; default heap {} MB committed ({} MB allocated), {} other heaps {} MB committed (largest {} MB) [{} ms]",
                     compiling, queued, shaders, shader_bytes >> 10, crate::hle::dstorage::in_flight_bytes() >> 10, mb(heap as u64), mb(heap_used as u64), others, mb(others_bytes as u64), mb(largest as u64), heaps_t0.elapsed().as_millis()
                 );
-                let (evicted, mapped_again) = crate::hle::d3d12x::vram::eviction_counts();
-                if evicted > 0 {
-                    crate::xlog_info!("page budget: {evicted} textures evicted, {mapped_again} mapped again");
+                let b = crate::hle::d3d12x::vram::budget_counts();
+                if b[..7].iter().any(|&n| n != 0) || b[7] != 0 {
+                    crate::xlog_info!(
+                        "memory: page budget: {}; {} textures evicted ({} MB given back), {} mapped again; {} textures without their top mips ({} MB not mapped); {} pool heaps at a low priority ({} demotions)",
+                        if b[7] != 0 { "at the budget" } else { "under the budget" }, b[0], mb(b[1]), b[2], b[3], mb(b[4]), b[5], b[6]
+                    );
                 }
                 last = now;
             }
