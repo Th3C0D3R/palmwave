@@ -158,6 +158,14 @@ impl Access {
     fn orders_earlier_work(&self) -> bool {
         self.sync_before != SYNC_NONE && self.access_before != ACCESS_NO_ACCESS
     }
+
+    /// a global barrier waits on earlier work whenever it has a SyncBefore: it is the legacy
+    /// UAV barrier for all resources, and names no access when it only orders (SyncBefore ALL
+    /// with AccessBefore NO_ACCESS is valid; XboxBvhBuilder.dll's passes relied on the UAV
+    /// barrier every #146 call used to get)
+    fn global_orders_earlier_work(&self) -> bool {
+        self.sync_before != SYNC_NONE
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -308,7 +316,11 @@ pub fn translate(items: &[Item], info: &dyn Fn(usize) -> Option<TexInfo>, tracke
     let mut local: HashMap<usize, u32> = HashMap::new();
     for item in items {
         let tex = match *item {
-            Item::Global(a) | Item::Buffer { access: a, .. } => {
+            Item::Global(a) => {
+                uav |= a.global_orders_earlier_work();
+                continue;
+            }
+            Item::Buffer { access: a, .. } => {
                 uav |= a.orders_earlier_work();
                 continue;
             }
@@ -758,6 +770,10 @@ mod tests {
         // orders nothing before it: nothing
         let n = Item::Global(Access { sync_before: SYNC_NONE, sync_after: 0x80, access_before: ACCESS_NO_ACCESS, access_after: 0x10 });
         assert!(translate(&[n], &info, &none, u32::MAX).barriers.is_empty());
+        // a global barrier that only orders (SyncBefore ALL, no access named): still the UAV barrier
+        let sync_all = D3D12_BARRIER_SYNC_ALL.0 as u32;
+        let o = Item::Global(Access { sync_before: sync_all, sync_after: sync_all, access_before: ACCESS_NO_ACCESS, access_after: ACCESS_NO_ACCESS });
+        assert_eq!(translate(&[o], &info, &none, u32::MAX).barriers, vec![UAV_ALL]);
         // shader resource → shader resource: nothing
         assert!(translate(&[texture(RT, 6, 21)], &info, &none, u32::MAX).barriers.is_empty());
     }
