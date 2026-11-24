@@ -722,7 +722,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     }
     p.last = Instant::now();
     if !p.dumps.is_empty() {
-        match fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 2000) {
+        match fence::wait(&p.fence, p.value, &p.dev, Some(p.event), frame_dump_wait_ms()) {
             Ok(()) => {
                 for dump in p.dumps.drain(..) {
                     write_frame(&dump.buffer, &dump.footprint, dump.format, &dump.tag);
@@ -746,6 +746,14 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
 /// `XCL_FRAME_DUMP=1`: every 120th shown frame is written to the logs folder (`XCL_FRAME_DUMP=n`,
 /// n > 1: every n-th; a title loading at a few frames a second shows few)
 /// (`frame_<n>.bmp`, a quarter of each side; `XCL_FRAME_DUMP_FULL=1`: full size) – what the title presented, before the window.
+/// `XCL_FRAME_DUMP_WAIT_MS`: how long a frame dump waits for the GPU to finish the frame it
+/// copies (default 2000 ms). A retail title's first world frames took the GPU longer than 2 s,
+/// and their dumps were given up.
+fn frame_dump_wait_ms() -> u32 {
+    static W: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("XCL_FRAME_DUMP_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).filter(|&ms| ms > 0).unwrap_or(2000))
+}
+
 /// `XCL_FRAME_DUMP_FROM=n`: every shown frame from the n-th on is written too – a retail title's
 /// first world frames came tens of seconds apart, and every 30th frame missed them.
 fn frame_dump_due() -> bool {
