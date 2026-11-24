@@ -7957,8 +7957,9 @@ fn retail_meshlets(n: usize, list: Option<u32>, mul: u32, layout: Option<(usize,
             for k in 0..8 {
                 put(&mut bytes, 0x100 + 0x20 * k, &desc(if k == d { 0x1000 } else { 0x400 }));
             }
+            // (read as a descriptor, four of these dwords are a buffer of no records at 0x400)
             for k in 0..0x300usize {
-                put(&mut bytes, 0x400 + 4 * k, &[f(0.25 + (k * 7 % 13) as f32 * 0.125)]);
+                put(&mut bytes, 0x400 + 4 * k, &[[0x400, f(0.25 + (k * 7 % 13) as f32 * 0.125), 0, f(1.0 + (k % 5) as f32)][k % 4]]);
             }
         }
     }
@@ -8008,8 +8009,8 @@ fn retail_meshlets(n: usize, list: Option<u32>, mul: u32, layout: Option<(usize,
 }
 
 /// The NGG program of a retail record, compiled for this adapter with its pass-through, and
-/// its `retail_meshlets` layout read from the code: the descriptor of the first
-/// `s_load_dwordx4` (the meshlets) and the register before the one or-ed with 0x10000 (the
+/// its `retail_meshlets` layout read from the code: the descriptor whose buffer starts with
+/// the meshlet count and the register before the one or-ed with 0x10000 (the
 /// mesh's address, made into a descriptor of stride 1).
 /// `windows`, `heap`: `Options::mem_windows` and `heap_windows`.
 fn retail_mesh_program(data: &[u8], r: &crate::gpu::pack::Record, windows: u32, heap: bool) -> Option<(super::MsInterface, Vec<u8>, Vec<u8>, Option<(usize, usize)>)> {
@@ -8026,8 +8027,14 @@ fn retail_mesh_program(data: &[u8], r: &crate::gpu::pack::Record, windows: u32, 
     let cs = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).ok()?;
     let msb = super::dxc::compile(&super::mesh_passthrough(&ms), "main", "ms_6_6", &[]).ok()?;
     let text: Vec<String> = crate::gpu::rdna2::disassemble(code, 0, true).into_iter().map(|l| l.text).collect();
+    if let Ok(dir) = std::env::var("XCL_HLSL_OUT") {
+        let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{}_{:016x}.s", r.name.replace(['/', '\\', ':'], "_"), crate::gpu::shader::fnv64(&blob))), text.join("\n"));
+    }
     let last_number = |l: &String| l.rsplit(", ").next().and_then(|x| usize::from_str_radix(x.trim_start_matches("0x"), 16).ok());
-    let table = text.iter().find(|l| l.starts_with("s_load_dwordx4 ")).and_then(last_number).map(|off| off / 0x20);
+    // the meshlets' descriptor: its first dword is the meshlet count (`& 0x1ffff`)
+    let count = text.iter().position(|l| l.ends_with(", 0x1ffff")).and_then(|i| text[..i].iter().rev().find(|l| l.starts_with("s_buffer_load_dword ")));
+    let loaded = count.and_then(|l| Some(format!("s_load_dwordx4 {},", l.split(", ").nth(1)?)));
+    let table = loaded.and_then(|d| text.iter().find(|l| l.starts_with(&d))).and_then(last_number).map(|off| off / 0x20);
     let mesh = text.iter().find(|l| l.starts_with("s_or_b32 ") && l.ends_with(", 0x10000")).and_then(|l| l.split(", ").nth(1)?.strip_prefix('s')?.parse::<usize>().ok());
     Some((ms, cs, msb, table.zip(mesh.map(|hi| hi - 1))))
 }
@@ -8134,19 +8141,33 @@ fn retail_mesh_programs_keep_vertices_with_their_threads() {
     // have: what they load there is no descriptor, and the GPU faults on its address
     const KNOWN: &str = "MS_VS_CascadeShadows_draw_f6ce4799,MS_VS_Transform_PositionOnly_803fbbc7,MS_VS_TransformEntityMask_ee5cb9a8,MS_VS_LinearDepth_da28e022,MS_VS_Transform_38a9c582,MS_VS_TransformD_aa739e09,MS_VS_MirrorReflectionTransform_26b5d4ad";
     let names = std::env::var("XCL_NAMES").unwrap_or_else(|_| KNOWN.into());
+    // `XCL_HASHES`: the programs by the hash of their container, as a frame census names them
+    let hashes: Vec<u64> = std::env::var("XCL_HASHES").unwrap_or_default().split(',').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).collect();
     let max: usize = std::env::var("XCL_SURVEY_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
     let data = std::fs::read(path).unwrap();
     let ps = super::dxc::compile("float4 main() : SV_Target0 { return 1.0; }\n", "main", "ps_6_6", &[]).unwrap();
     let mut seen = std::collections::BTreeSet::new();
     let (mut ran, mut wrong, mut unknown) = (0usize, Vec::new(), Vec::new());
+    let mut faulted: Option<String> = None;
     for r in crate::gpu::pack::scan(&data, 0x40) {
-        if ran >= max || !r.name.starts_with("MS") || (!names.is_empty() && !names.split(',').any(|n| r.name.contains(n))) {
+        if ran >= max || !r.name.starts_with("MS") {
             continue;
         }
-        // one record per program name (the name without its hash)
-        let stem: String = r.name.rsplitn(3, '_').last().unwrap_or(&r.name).to_string();
-        if !seen.insert(stem) {
-            continue;
+        if !hashes.is_empty() {
+            let hash = crate::gpu::pack::inflate(&data, &r).map(|b| crate::gpu::shader::fnv64(&b));
+            if !hash.is_some_and(|h| hashes.contains(&h) && seen.insert(format!("{h:016x}"))) {
+                continue;
+            }
+            println!("{:016x} = {}", hash.unwrap(), r.name);
+        } else {
+            if !names.is_empty() && !names.split(',').any(|n| r.name.contains(n)) {
+                continue;
+            }
+            // one record per program name (the name without its hash)
+            let stem: String = r.name.rsplitn(3, '_').last().unwrap_or(&r.name).to_string();
+            if !seen.insert(stem) {
+                continue;
+            }
         }
         let Some((ms, cs, msb, layout)) = retail_mesh_program(&data, &r, 1, false) else { continue };
         ran += 1;
@@ -8161,7 +8182,16 @@ fn retail_mesh_programs_keep_vertices_with_their_threads() {
         let mut distinct = std::collections::HashSet::new();
         for mul in [37u32, 53] {
             let (sg, mem, _) = retail_meshlets(3, None, mul, Some(layout));
-            let (_, rec) = runner::mesh_draw(&cs, &msb, &ps, 3, rd, &sg, &mem, 32, [0.0; 4]).unwrap();
+            let rec = match runner::mesh_draw(&cs, &msb, &ps, 3, rd, &sg, &mem, 32, [0.0; 4]) {
+                Ok((_, rec)) => rec,
+                Err(e) => {
+                    // a program that reads more than the synthetic memory has (a descriptor
+                    // from a table that is not there): the device is gone, nothing more runs
+                    println!("{}: {e}", r.name);
+                    faulted = Some(r.name.clone());
+                    break;
+                }
+            };
             for (g, &(nv, np)) in MESHLET_KINDS.iter().enumerate() {
                 let rec = &rec[g * rd..(g + 1) * rd];
                 if (rec[0], rec[1]) != (nv, np) {
@@ -8187,6 +8217,9 @@ fn retail_mesh_programs_keep_vertices_with_their_threads() {
                 }
             }
         }
+        if faulted.is_some() {
+            break;
+        }
         println!("{}: {} outputs, layout {layout:?}, {} distinct positions, {} wrong", r.name, ms.outputs.len(), distinct.len(), bad.len());
         for b in bad.iter().take(6) {
             println!("    {b}");
@@ -8195,6 +8228,6 @@ fn retail_mesh_programs_keep_vertices_with_their_threads() {
             wrong.push(r.name.clone());
         }
     }
-    println!("{ran} programs, {} without a layout, {} wrong: {wrong:?}", unknown.len(), wrong.len());
+    println!("{ran} programs, {} without a layout, {} wrong: {wrong:?}; stopped at {faulted:?}", unknown.len(), wrong.len());
     assert!(wrong.is_empty());
 }
