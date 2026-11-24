@@ -16,17 +16,17 @@ Palmwave runs Xbox Series X|S games on Windows. It is made with **Moon AI**, the
 
 ## Status
 
-### A retail Xbox Series game: in game, first mission reached, its world not visible yet
+### A retail Xbox Series game: in game, first mission – its world's geometry is drawn, not lit yet
 
-Measured with Palmwave `b3bef8b` on an RTX 5080 (driver 621.14), a Ryzen 9 9950X3D and 61 GB of RAM, offline, with the shader caches of earlier runs, A pressed at 30 s and 40 s, `XCL_PATCH` (below), `XCL_DSTORAGE_BCPACK_FILL=neutral`, `XCL_GPU_WAIT_WATCHDOG_MS=3000`, `XCL_PSO_PRELOAD_THREADS=2` and `XCL_DXC_THREADS=6`.
+Measured with Palmwave `6e68cf2` (branch `world-loading`) on an RTX 5080 (driver 621.14), a Ryzen 9 9950X3D and 61 GB of RAM, offline, with the shader caches of earlier runs, A pressed at 30 s and 40 s, `XCL_PATCH` (below), `XCL_DSTORAGE_BCPACK_FILL=neutral`, `XCL_GPU_WAIT_WATCHDOG_MS=3000`, `XCL_PSO_PRELOAD_THREADS=4` and `XCL_DXC_THREADS=8`.
 
 | Time | What happens |
 |---|---|
 | 0–4 s | The title boots and presents its own frames after about 4 s. |
 | 5–30 s | Its first screens, at 30 fps. |
 | 32–58 s | The intro video, at 30 fps. |
-| 60–84 s | The world loads behind its loading screens, at 5–30 fps. The compute pipelines of the world are built ahead of their use on background threads, so the title no longer stops to build them. |
-| from 84 s | **In game, first mission.** The title starts its first mission: it presents the mission's opening card (its text over the title's background colour, with cinematic bars), then the mission's world frames, and its sound plays. Its first world frame records about 7,000 draws and 7,000 compute dispatches. Nothing of the world is visible yet: the image is a uniform colour, and one world frame takes from 18 s to 2 minutes of GPU work. |
+| 60–120 s | The world loads behind its loading screens, at 5–30 fps. The compute pipelines of the world are built ahead of their use on background threads, so the title no longer stops to build them. |
+| from about 120 s | **In game, first mission.** The title starts its first mission: it presents the mission's opening card (its text over the title's background colour, with cinematic bars), then the mission's world frames with their subtitles, and its sound plays. Its first world frame records about 7,000 draws and 7,000 compute dispatches. **The world's geometry is drawn:** its depth buffer and G-buffer hold the mission's street – utility poles, power lines, fences, an awning, bike racks (`XCL_RT_DUMP=1`). The presented picture is still one flat colour, because the world is not lit yet (below). A world frame takes 12–19 s. Runs stayed in the world up to 3 minutes, until they were stopped, without a crash or a graphics fault. |
 
 A first launch is much slower, because the world's compute programs are compiled then. A few of them are giants of 12–25 MB of DXIL that take the NVIDIA driver up to about 30 minutes each. Everything built is kept on disk, both the DXIL and the driver's result.
 
@@ -34,11 +34,13 @@ A first launch is much slower, because the world's compute programs are compiled
 
 - The first three patches turn off its hang detector, which ends the title after 30 s without a heartbeat from its main thread.
 - The next two turn off its indirect-diffuse and stochastic-reflection passes, whose compute programs are the largest (up to about 88,000 instructions).
-- The last one sets its render-resolution mode, which gives world targets of 2560×1440.
+- The next one sets its render-resolution mode, which gives world targets of 2560×1440.
+- The next three turn off three more passes that are slow here: an alpha-resolve blur, the scattering applied in the deferred combine, and a ray-marched gather.
+- The last one avoids a stop after about two minutes, where the title's audio code keeps a lock held on one path.
 
 ```powershell
 $g = "game_scarlett_master.exe"
-$env:XCL_PATCH = "$g+0x2215bdc:732e=9090;$g+0x2215c70:7404=9090;$g+0x2215d84:7404=9090;$g+0x22a3b5:e8a6f7ffff=31c0909090;$g+0x22aee6:e875ecffff=31c0909090;$g+0x7b4e6a:8b8944010000=b90100000090"
+$env:XCL_PATCH = "$g+0x2215bdc:732e=9090;$g+0x2215c70:7404=9090;$g+0x2215d84:7404=9090;$g+0x22a3b5:e8a6f7ffff=31c0909090;$g+0x22aee6:e875ecffff=31c0909090;$g+0x7b4e6a:8b8944010000=b90100000090;$g+0x25d2fe2:e819a4ffff=0f1f440000;$g+0x327b92e:7408=9090;$g+0x125912d:e85ef50102=0f1f440000;$g+0x5267747:0f84ae050000=0f8432050000"
 ```
 
 Road to a playable 30 fps, most urgent first:
@@ -49,8 +51,8 @@ Road to a playable 30 fps, most urgent first:
    - With that switch, the heap memory under the title's render targets takes no video memory of its own (`XCL_SPARSE_UNDER_TARGETS=0` turns this off, `=1` turns it on without the switch). Its sampled textures of 32 KiB or less are packed in heaps of their own instead of taking a 64 KiB page each (`XCL_SMALL_TEXTURE_HEAPS`, same values). What the two save on the title is not measured yet.
    - GPU waits between the title's queues complete only when `XCL_GPU_WAIT_WATCHDOG_MS` releases them.
    - When GPU work runs too long, Windows resets the GPU and the title stops on "device removed".
-2. **Nothing of the world is visible.** The world's geometry is drawn with mesh shaders. Through XCL's two-pass mesh path, its depth buffer receives thin "needle" triangles, as if correct vertices were joined by wrong indices; with `XCL_MESH=0` it stays empty. Its colour targets keep their cleared values (`XCL_RT_DUMP=1` writes them as images).
-3. **Video memory.** 15–17 GB on a 16 GB card. The title's render targets, kept on 64 KiB pages of video memory, take 9.8 GB of it.
+2. **The world is not lit yet.** Its mesh shaders draw the geometry into the depth buffer and the G-buffer, but the lighting targets stay black. At each world frame the title's five queues wait for each other at a barrier of memory fences: every queue has submitted its own signal, none of them completes, and only `XCL_GPU_WAIT_WATCHDOG_MS` releases the waits, in no particular order, so the lighting passes can run before the G-buffer is drawn. A fix of the barrier is in progress.
+3. **Video memory.** 15–20 GB on a 16 GB card. The title's render targets, kept on 64 KiB pages of video memory, take 9.8 GB of it.
 4. **BCPack textures.** BC1, BC3, BC4, BC5, BC6H and BC7 streams are decoded; the title's BC1, BC5, BC6H and BC7 requests unpack in its runs. BC2 is refused. With `XCL_DSTORAGE_BCPACK_FILL=neutral`, a request that is refused or whose stream the decoder does not take completes with neutral grey blocks instead of failing.
 
 Tools used for these measurements:
