@@ -4251,6 +4251,16 @@ impl OwnedDesc {
         })
     }
 
+    /// The size of its largest shader (console bytes).
+    fn largest_shader(&self) -> usize {
+        let blobs = match self {
+            OwnedDesc::Compute(_, b) => b,
+            OwnedDesc::Graphics(_, b, ..) => b,
+            OwnedDesc::Stream(_, _, b) => b,
+        };
+        blobs.iter().map(|b| b.len()).max().unwrap_or(0)
+    }
+
     fn ptr(&self) -> *const c_void {
         match self {
             OwnedDesc::Compute(d, _) => &**d as *const _ as *const c_void,
@@ -4408,6 +4418,7 @@ unsafe fn go_background(
     }
     let dev = Dev(this as usize, f as usize);
     let key = owned.shaders_key();
+    let largest = owned.largest_shader();
     let job: super::pso_async::Job = Box::new(move || {
         let mut out: *mut c_void = std::ptr::null_mut();
         if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
@@ -4417,7 +4428,12 @@ unsafe fn go_background(
         }
     });
     if super::pso_async::lazy() {
-        super::pso_async::submit_lazy(*ppv as usize, compute, job, key);
+        // a compute program of `preload_max_shader` or more is left to its first bind: a retail
+        // title's giant ones (88 000 instructions, 12 - 25 MB of DXIL, half an hour in an NVIDIA
+        // driver) are of a system the title may never dispatch (`XCL_PATCH` can turn it off), and
+        // built ahead they held the slots of the big programs it does bind
+        let ahead = !compute || largest < super::pso_async::preload_max_shader();
+        super::pso_async::submit_lazy_ahead(*ppv as usize, compute, job, key, ahead);
     } else {
         super::pso_async::submit(*ppv as usize, compute, job);
     }

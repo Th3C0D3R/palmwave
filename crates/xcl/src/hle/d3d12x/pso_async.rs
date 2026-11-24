@@ -137,7 +137,7 @@ pub fn release(p: usize) {
 
 /// `standin` went to the title; `job` builds the real pipeline on a worker.
 pub fn submit(standin: usize, compute: bool, job: Job) {
-    submit_as(standin, compute, job, true, 0);
+    submit_as(standin, compute, job, true, 0, true);
 }
 
 /// Lazy pipeline creation (`XCL_LAZY_PSO=0`: off): a title's pipelines with console shaders get
@@ -154,10 +154,27 @@ pub fn lazy() -> bool {
 /// priority, when an earlier run used a pipeline of these shaders (`key`, 0 = none; `used`),
 /// and for every compute pipeline (after those: `Preload`).
 pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
-    submit_as(standin, compute, job, false, key);
+    submit_as(standin, compute, job, false, key, true);
 }
 
-fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
+/// `submit_lazy`; `ahead` false: a compute pipeline no earlier run used is not built ahead.
+pub fn submit_lazy_ahead(standin: usize, compute: bool, job: Job, key: u64, ahead: bool) {
+    submit_as(standin, compute, job, false, key, ahead);
+}
+
+/// `XCL_PRELOAD_MAX_SHADER_KB`: compute programs whose console shader is this large or larger
+/// (default 512 KB; 0: no limit) are not built ahead unless an earlier run used them. A retail
+/// title's typical big compute program is under 200 KB; its three giants are over 600 KB.
+pub fn preload_max_shader() -> usize {
+    static M: OnceLock<usize> = OnceLock::new();
+    *M.get_or_init(|| match std::env::var("XCL_PRELOAD_MAX_SHADER_KB").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(0) => usize::MAX,
+        Some(kb) => kb << 10,
+        None => 512 << 10,
+    })
+}
+
+fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, ahead: bool) {
     let p = Arc::new(Pending {
         job: Mutex::new(Some(job)),
         sent: std::sync::atomic::AtomicBool::new(send),
@@ -184,7 +201,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
     });
     if send {
         let _ = queue().lock().unwrap().send(p);
-    } else if used::known(key) || compute {
+    } else if used::known(key) || (compute && ahead) {
         if let Some(q) = preload() {
             let mut g = q.list.lock().unwrap();
             if used::known(key) {
@@ -488,6 +505,27 @@ mod used_tests {
         assert_eq!(priority_after(THREAD_PRIORITY_LOWEST), THREAD_PRIORITY_LOWEST, "back to the lowest once built");
         unsafe { CloseHandle(h) };
         released(standin);
+    }
+
+    /// A compute pipeline left out of building ahead (`submit_lazy_ahead`, a giant program) waits
+    /// for its first bind, unless an earlier run used it.
+    #[test]
+    fn a_compute_pipeline_left_out_of_building_ahead_waits_for_its_bind() {
+        let giant = 0x7E57_7021usize;
+        submit_lazy_ahead(giant, true, Box::new(|| 0x4331), 0x5EED_0021, false);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(is_pending(giant), "not built ahead");
+        assert_eq!(resolve_wait(giant), 0x4331, "built at its bind");
+        released(giant);
+        let (known, known_key) = (0x7E57_7022usize, 0x5EED_0022u64);
+        used::earlier_run_used(known_key);
+        submit_lazy_ahead(known, true, Box::new(|| 0x4332), known_key, false);
+        let start = std::time::Instant::now();
+        while is_pending(known) && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!is_pending(known), "an earlier run used it: built ahead all the same");
+        released(known);
     }
 
     /// A compute pipeline is built without a bind even when no earlier run used it: its first
