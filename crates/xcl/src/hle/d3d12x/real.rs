@@ -2678,6 +2678,34 @@ creator!(dev_create_command_queue1, "CreateCommandQueue1", Kind::CommandQueue, [
 creator!(dev_create_command_allocator, "CreateCommandAllocator", Kind::CommandAllocator, [a1]);
 creator!(dev_create_command_list, "CreateCommandList", Kind::CommandList, [a1, a2, a3, a4]);
 creator!(dev_create_command_list1, "CreateCommandList1", Kind::CommandList, [a1, a2, a3]);
+
+/// Create a raw adopted PC `ID3D12GraphicsCommandList` without wrapping it in `title_list`
+/// (used for deferred mid-list split segments on the same allocator).
+pub(super) unsafe fn create_raw_pc_command_list(
+    dev: *mut c_void,
+    ty: D3D12_COMMAND_LIST_TYPE,
+    alloc: usize,
+    init_pso: usize,
+) -> Option<*mut c_void> {
+    if dev.is_null() || alloc == 0 {
+        return None;
+    }
+    let iid = layout::parse_guid(layout::find("ID3D12GraphicsCommandList")?.iid);
+    let mut out: *mut c_void = std::ptr::null_mut();
+    let hr = if is_ext(vt(dev) as usize) {
+        dev_create_command_list(dev, 0, ty.0 as usize, alloc, init_pso, &iid, &mut out)
+    } else {
+        type F = unsafe extern "system" fn(*mut c_void, u32, D3D12_COMMAND_LIST_TYPE, usize, usize, *const GUID, *mut *mut c_void) -> HRESULT;
+        let slot = layout::slot(layout::find("ID3D12Device")?, "CreateCommandList")?;
+        let f: F = std::mem::transmute(*vt(dev).add(slot));
+        let hr = f(dev, 0, ty, alloc, init_pso, &iid, &mut out);
+        if hr >= 0 && !out.is_null() {
+            adopt(out, Kind::CommandList);
+        }
+        hr
+    };
+    (hr >= 0 && !out.is_null()).then_some(out)
+}
 creator!(dev_create_descriptor_heap, "CreateDescriptorHeap", Kind::DescriptorHeap, [a1]);
 creator!(dev_create_committed_resource, "CreateCommittedResource", Kind::Resource, [a1, a2, a3, a4, a5]);
 creator!(dev_create_committed_resource1, "CreateCommittedResource1", Kind::Resource, [a1, a2, a3, a4, a5, a6]);
@@ -5092,11 +5120,16 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     }
     // textures in title memory the CPU wrote since: uploaded again first
     super::title_textures::refresh(this);
-    // console-shaped lists run as the PC lists they were translated into
-    let mapped: Vec<*mut c_void> = std::slice::from_raw_parts(lists, n as usize)
-        .iter()
-        .map(|&l| super::console_list::pc_list(l).or_else(|| super::title_list::backing(l)).unwrap_or(l))
-        .collect();
+    // console-shaped lists run as the PC lists they were translated into (split title lists expand
+    // into all of their recorded PC segments in exact chronological order)
+    let mut mapped: Vec<*mut c_void> = Vec::with_capacity(n as usize);
+    for &l in std::slice::from_raw_parts(lists, n as usize) {
+        if let Some(pc) = super::console_list::pc_list(l) {
+            mapped.push(pc);
+        } else if !super::title_list::push_segments(l, &mut mapped) {
+            mapped.push(l);
+        }
+    }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         f(this, chunk.len() as u32, chunk.as_ptr());
