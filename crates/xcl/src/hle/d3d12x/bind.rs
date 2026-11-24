@@ -57,12 +57,17 @@ fn hold_res_until_reset(allocator: usize, mut bufs: Vec<(ID3D12Resource, u64, us
 pub(super) fn release_allocator_res(allocator: usize) {
     let Some(bufs) = ALLOC_RES.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)) else { return };
     let mut free = FREE_RES.lock().unwrap();
-    for b in bufs {
+    // (the small ones – scaled or guarded indirect arguments – go: `ensure_res_buffer` takes
+    // none of them, and they would keep its buffers out of the pool)
+    for b in bufs.into_iter().filter(|b| b.1 >= RES_MIN) {
         if free.len() < 16 {
             free.push(b);
         }
     }
 }
+
+/// the smallest two-pass res buffer (`ensure_res_buffer`)
+const RES_MIN: u64 = 4 << 20;
 
 static STATES: Mutex<Option<HashMap<usize, State>>> = Mutex::new(None);
 
@@ -315,6 +320,29 @@ fn dispatch_mesh_sig_of(sig: usize) -> Option<DispatchMeshSig> {
     DISPATCH_MESH_SIGS.lock().unwrap().as_ref()?.get(&sig).copied()
 }
 
+/// command signatures of dispatches → (bytes a command, where its D3D12_DISPATCH_ARGUMENTS are)
+static DISPATCH_SIGS: Mutex<Option<HashMap<usize, (u32, u32)>>> = Mutex::new(None);
+
+/// The command signature `sig` was made: `layout` (byte stride, offset of the dispatch
+/// arguments) for one of dispatches, None for another kind (a new signature at the address of
+/// one released).
+pub(super) fn note_dispatch_signature(sig: usize, layout: Option<(u32, u32)>) {
+    let mut g = DISPATCH_SIGS.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    match layout {
+        Some(l) => {
+            m.insert(sig, l);
+        }
+        None => {
+            m.remove(&sig);
+        }
+    }
+}
+
+fn dispatch_sig_of(sig: usize) -> Option<(u32, u32)> {
+    DISPATCH_SIGS.lock().unwrap().as_ref()?.get(&sig).copied()
+}
+
 unsafe fn emit_uav_barrier(list: &ID3D12GraphicsCommandList, res: Option<&ID3D12Resource>) {
     let mut b = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -374,7 +402,7 @@ unsafe fn default_uav_buffer(dev: &ID3D12Device, bytes: u64, what: &str) -> Resu
 
 /// The capacity `ensure_res_buffer` gives a need of `need_bytes`.
 fn res_capacity(need_bytes: u64) -> u64 {
-    need_bytes.max(4 << 20).next_multiple_of(1 << 20).min(RES_MAX)
+    need_bytes.max(RES_MIN).next_multiple_of(1 << 20).min(RES_MAX)
 }
 
 /// largest two-pass record buffer
@@ -554,48 +582,46 @@ fn root_arguments(this: *mut c_void) -> Vec<(usize, super::mesh_input_dump::Root
         .collect()
 }
 
-unsafe fn scale_indirect_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
-    static CACHE: Mutex<Option<HashMap<usize, (ID3D12RootSignature, ID3D12PipelineState)>>> = Mutex::new(None);
+/// device → the root signature and pipeline of one of XCL's own compute passes
+type OwnPipelines = Mutex<Option<HashMap<usize, (ID3D12RootSignature, ID3D12PipelineState)>>>;
+
+/// XCL's own compute pass `hlsl` (`what` in its errors), made once a device (`cache`): root
+/// parameters `constants` 32-bit constants (b0), a root SRV (t0) and `uavs` root UAVs (u0 …).
+unsafe fn own_compute_pipeline(dev: &ID3D12Device, cache: &OwnPipelines, what: &str, hlsl: &str, constants: u32, uavs: u32) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
     let key = dev.as_raw() as usize;
-    if let Some(pair) = CACHE.lock().unwrap().as_ref().and_then(|m| m.get(&key).cloned()) {
+    if let Some(pair) = cache.lock().unwrap().as_ref().and_then(|m| m.get(&key).cloned()) {
         return Ok(pair);
     }
-    let hlsl = "cbuffer C : register(b0) { uint count; uint stride; uint offset; uint mult; };\nByteAddressBuffer src : register(t0);\nRWByteAddressBuffer dst : register(u0);\n[numthreads(64, 1, 1)]\nvoid main(uint tid : SV_DispatchThreadID) {\n    if (tid >= count) return;\n    uint base = tid * stride;\n    uint dwords = stride / 4u;\n    for (uint i = 0u; i < dwords; ++i) {\n        uint w = src.Load(base + i * 4u);\n        if (i * 4u == offset) w = w * mult;\n        dst.Store(base + i * 4u, w);\n    }\n}\n";
     let dxil = crate::gpu::recomp::dxc::compile_cached(hlsl, "main", "cs_6_6")?.0;
-    let params = [
+    let view = |ty, register| D3D12_ROOT_PARAMETER {
+        ParameterType: ty,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: register, RegisterSpace: 0 },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    };
+    let mut params = vec![
         D3D12_ROOT_PARAMETER {
             ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
             Anonymous: D3D12_ROOT_PARAMETER_0 {
-                Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 4 },
+                Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: constants },
             },
             ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
         },
-        D3D12_ROOT_PARAMETER {
-            ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
-            Anonymous: D3D12_ROOT_PARAMETER_0 {
-                Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 0, RegisterSpace: 0 },
-            },
-            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-        },
-        D3D12_ROOT_PARAMETER {
-            ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
-            Anonymous: D3D12_ROOT_PARAMETER_0 {
-                Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 0, RegisterSpace: 0 },
-            },
-            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-        },
+        view(D3D12_ROOT_PARAMETER_TYPE_SRV, 0),
     ];
+    params.extend((0..uavs).map(|k| view(D3D12_ROOT_PARAMETER_TYPE_UAV, k)));
     let desc = D3D12_ROOT_SIGNATURE_DESC {
         NumParameters: params.len() as u32,
         pParameters: params.as_ptr(),
         ..Default::default()
     };
     let mut blob = None;
-    D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None).map_err(|e| format!("scale rs serialize: {e}"))?;
-    let blob = blob.ok_or("scale rs blob")?;
+    D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None).map_err(|e| format!("{what} rs serialize: {e}"))?;
+    let blob = blob.ok_or(format!("{what} rs blob"))?;
     let rs: ID3D12RootSignature = dev
         .CreateRootSignature(0, std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()))
-        .map_err(|e| format!("scale rs create: {e}"))?;
+        .map_err(|e| format!("{what} rs create: {e}"))?;
     let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
         pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
         CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const c_void, BytecodeLength: dxil.len() },
@@ -603,9 +629,139 @@ unsafe fn scale_indirect_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSigna
     };
     let res_pso: Result<ID3D12PipelineState, _> = dev.CreateComputePipelineState(&cdesc);
     std::mem::ManuallyDrop::drop(&mut cdesc.pRootSignature);
-    let pso = res_pso.map_err(|e| format!("scale pso create: {e}"))?;
-    CACHE.lock().unwrap().get_or_insert_with(HashMap::new).insert(key, (rs.clone(), pso.clone()));
+    let pso = res_pso.map_err(|e| format!("{what} pso create: {e}"))?;
+    cache.lock().unwrap().get_or_insert_with(HashMap::new).insert(key, (rs.clone(), pso.clone()));
     Ok((rs, pso))
+}
+
+unsafe fn scale_indirect_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+    static CACHE: OwnPipelines = Mutex::new(None);
+    let hlsl = "cbuffer C : register(b0) { uint count; uint stride; uint offset; uint mult; };\nByteAddressBuffer src : register(t0);\nRWByteAddressBuffer dst : register(u0);\n[numthreads(64, 1, 1)]\nvoid main(uint tid : SV_DispatchThreadID) {\n    if (tid >= count) return;\n    uint base = tid * stride;\n    uint dwords = stride / 4u;\n    for (uint i = 0u; i < dwords; ++i) {\n        uint w = src.Load(base + i * 4u);\n        if (i * 4u == offset) w = w * mult;\n        dst.Store(base + i * 4u, w);\n    }\n}\n";
+    own_compute_pipeline(dev, &CACHE, "scale", hlsl, 4, 1)
+}
+
+/// `D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION`: the thread groups a dispatch may ask
+/// for in each dimension (the console's D3D12 has the same limit)
+const MAX_GROUPS: u32 = 65535;
+
+/// Whether D3D12 allows a dispatch of `groups` thread groups (`guard_indirect_pipeline` makes
+/// the same test on the GPU).
+fn dispatch_allowed(groups: [u32; 3]) -> bool {
+    groups.iter().all(|&g| g <= MAX_GROUPS)
+}
+
+/// `XCL_INDIRECT_GUARD=0`: indirect dispatches run whatever counts their arguments hold
+/// (`guarded_dispatch_args`).
+fn indirect_guard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_INDIRECT_GUARD").map_or(true, |v| v.trim() != "0"))
+}
+
+/// The pass of `guarded_dispatch_args`: `count` commands of `stride` bytes from t0 to u0, a
+/// command whose dispatch arguments (at `offset` in it) ask for more than `MAX_GROUPS` in a
+/// dimension with no groups, and counted in u1 – [commands, its counts, its pipeline state].
+unsafe fn guard_indirect_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+    static CACHE: OwnPipelines = Mutex::new(None);
+    let hlsl = format!(
+        "cbuffer C : register(b0) {{ uint count; uint stride; uint offset; uint pso_lo; uint pso_hi; }};\nByteAddressBuffer src : register(t0);\nRWByteAddressBuffer dst : register(u0);\nRWByteAddressBuffer report : register(u1);\n[numthreads(64, 1, 1)]\nvoid main(uint tid : SV_DispatchThreadID) {{\n    if (tid >= count) return;\n    uint base = tid * stride;\n    uint3 groups = uint3(src.Load(base + offset), src.Load(base + offset + 4u), src.Load(base + offset + 8u));\n    bool over = any(groups > {MAX_GROUPS}u);\n    for (uint at = 0u; at < stride; at += 4u) {{\n        bool counts = at >= offset && at < offset + 12u;\n        dst.Store(base + at, (over && counts) ? 0u : src.Load(base + at));\n    }}\n    if (over) {{\n        uint seen;\n        report.InterlockedAdd(0, 1u, seen);\n        report.Store3(4, groups);\n        report.Store2(16, uint2(pso_lo, pso_hi));\n    }}\n}}\n"
+    );
+    own_compute_pipeline(dev, &CACHE, "dispatch guard", &hlsl, 5, 2)
+}
+
+/// The commands an indirect dispatch reads instead of the title's: `max` commands of `stride`
+/// bytes at `src_off` of `src`, copied on the GPU into a buffer of XCL's (in INDIRECT_ARGUMENT
+/// after this), each whose D3D12_DISPATCH_ARGUMENTS (at `offset` in it) ask for more than
+/// D3D12 allows (`dispatch_allowed`) with no thread groups – and counted, with its counts and
+/// `pso`, at the GPU address `report` (`guard_report`). A retail game's world asked for such a
+/// dispatch: one ExecuteIndirect of a loop-free shader took 141 s of GPU time (P55), the other
+/// compute queues' work waited behind it and the title's frame barrier with them.
+#[allow(clippy::too_many_arguments)]
+unsafe fn guarded_dispatch_args(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, src: &ID3D12Resource, src_off: u64, max: u32, stride: u32, offset: u32, report: u64, pso: usize) -> Result<ID3D12Resource, String> {
+    let (rs, guard) = guard_indirect_pipeline(dev)?;
+    let bytes = (max as u64).saturating_mul(stride as u64).max(256).next_multiple_of(256);
+    let dst = default_uav_buffer(dev, bytes, "guarded dispatch arguments")?;
+    // only the commands the title's buffer holds are read (a root view has no bounds): the
+    // others stay zero – no groups
+    let room = src.GetDesc().Width.saturating_sub(src_off) / stride.max(1) as u64;
+    let count = (max as u64).min(room) as u32;
+    // a buffer the title's barriers left in INDIRECT_ARGUMENT is read as a shader resource
+    // here; in COMMON (its usual state) the read promotes it
+    let src_raw = src.as_raw() as usize;
+    let indirect = super::enhanced_barrier::tracked_state(src_raw) == Some(D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT.0 as u32);
+    if indirect {
+        emit_transition(list, src, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    list.SetComputeRootSignature(&rs);
+    list.SetPipelineState(&guard);
+    let consts = [count, stride, offset, pso as u32, (pso as u64 >> 32) as u32];
+    list.SetComputeRoot32BitConstants(0, consts.len() as u32, consts.as_ptr() as *const c_void, 0);
+    list.SetComputeRootShaderResourceView(1, src.GetGPUVirtualAddress() + src_off);
+    list.SetComputeRootUnorderedAccessView(2, dst.GetGPUVirtualAddress());
+    list.SetComputeRootUnorderedAccessView(3, report);
+    list.Dispatch(count.div_ceil(64).max(1), 1, 1);
+    emit_transition(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    if indirect {
+        emit_transition(list, src, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    }
+    Ok(dst)
+}
+
+/// What the guard counts the dispatches it kept from the GPU in: [dispatches, the last one's
+/// counts, its pipeline state] – in the coherent window, where the CPU reads what the GPU
+/// wrote – and its GPU address.
+fn guard_report() -> Option<(usize, u64)> {
+    static AT: std::sync::OnceLock<Option<(usize, u64)>> = std::sync::OnceLock::new();
+    *AT.get_or_init(|| {
+        let p = crate::gpu::uma::get()?.alloc(256, 256)? as usize;
+        Some((p, super::real::uma_va_of(p)?))
+    })
+}
+
+/// The guard's count at `at` (`guard_report`), logged when it has passed a power of two.
+unsafe fn note_guard_report(at: usize) {
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    let word = |k: usize| (*((at + 4 * k) as *const std::sync::atomic::AtomicU32)).load(Ordering::Acquire);
+    let (n, seen) = (word(0) as u64, SEEN.load(Ordering::Relaxed));
+    let last = [word(1), word(2), word(3)];
+    // (a count whose counts are not stored yet: at the next look)
+    if n <= seen || dispatch_allowed(last) || SEEN.compare_exchange(seen, n, Ordering::Relaxed, Ordering::Relaxed).is_err() || (seen != 0 && seen.ilog2() == n.ilog2()) {
+        return;
+    }
+    let pso = word(4) as u64 | (word(5) as u64) << 32;
+    crate::xlog_warn!(
+        "D3D12.X: {n} indirect dispatches so far asked for more thread groups than D3D12 allows ({MAX_GROUPS} a dimension) – not run; the last {} x {} x {}, pipeline {pso:#x} (XCL_INDIRECT_GUARD=0 runs them)",
+        last[0],
+        last[1],
+        last[2]
+    );
+}
+
+/// … for an ExecuteIndirect on `this` with the dispatch signature `sig`: the buffer and offset
+/// it reads its commands from (`guarded_dispatch_args`, kept until the list's allocator is
+/// reset), or the title's own when the guard is off or could not be made.
+unsafe fn guarded_indirect(this: *mut c_void, list: &ID3D12GraphicsCommandList, sig: usize, max: u32, args: usize, args_off: u64, pso: usize) -> (usize, u64) {
+    let keep = (args, args_off);
+    if !indirect_guard() || max == 0 || args == 0 {
+        return keep;
+    }
+    let (Some((stride, offset)), Some(dev), Some((report, report_va))) = (dispatch_sig_of(sig), super::real::list_device(this), guard_report()) else { return keep };
+    note_guard_report(report);
+    let raw = args as *mut c_void;
+    let Some(src) = ID3D12Resource::from_raw_borrowed(&raw) else { return keep };
+    match guarded_dispatch_args(&dev, list, src, args_off, max, stride, offset, report_va, pso) {
+        Ok(dst) => {
+            let (raw, bytes, dev_key) = (dst.as_raw() as usize, dst.GetDesc().Width, dev.as_raw() as usize);
+            with(this, |s| s.res_retired.push((dst, bytes, dev_key)));
+            (raw, 0)
+        }
+        Err(e) => {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_warn!("D3D12.X: an indirect dispatch's counts are not checked: {e}");
+            }
+            keep
+        }
+    }
 }
 
 unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsCommandList, src_raw: usize, src_off: u64, max: u32, stride: u32, mesh_offset: u32, mult: u32) -> Result<ID3D12Resource, String> {
@@ -849,6 +1005,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         return;
     }
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
+    // (before `bind_abi`, which binds the list's root signature and pipeline again: a dispatch
+    // past D3D12's limits does not reach the GPU)
+    let (cmds, cmds_off) = if gfx { (args, args_off) } else { guarded_indirect(this, list, sig, max, args, args_off, pso) };
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
             if compute && super::present::trace_frame() {
@@ -857,7 +1016,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             count(if gfx { DRAWS } else { DISPATCHES });
             {
                 let _timed = gpu_profile::scope(this, Kind::ExecuteIndirect, [max, 0, 0], count_buf != 0, || pso);
-                pc(this, sig, max, args, args_off, count_buf, count_off);
+                pc(this, sig, max, cmds, cmds_off, count_buf, count_off);
             }
             census_indirect(this, sig, max, args, args_off, count_buf, count_off, None)
         }
@@ -2101,6 +2260,106 @@ mod tests {
         );
         DISPATCH_MESH_SIGS.lock().unwrap().as_mut().unwrap().remove(&sig);
         assert_eq!(dispatch_mesh_sig_of(sig), None);
+    }
+
+    /// A signature of dispatches is known with where its counts are; one of another kind made
+    /// at the same address later is not taken for it.
+    #[test]
+    fn dispatch_signatures_are_tracked_with_their_layout() {
+        let sig = 0x7400_0011usize;
+        assert_eq!(dispatch_sig_of(sig), None);
+        note_dispatch_signature(sig, Some((16, 4)));
+        assert_eq!(dispatch_sig_of(sig), Some((16, 4)));
+        note_dispatch_signature(sig, None);
+        assert_eq!(dispatch_sig_of(sig), None);
+    }
+
+    /// D3D12's limit is per dimension: 65535 thread groups in each, any count of them in all.
+    #[test]
+    fn dispatches_past_65535_groups_a_dimension_are_not_allowed() {
+        assert!(dispatch_allowed([2946, 1, 1]));
+        assert!(dispatch_allowed([0, 0, 0]));
+        assert!(dispatch_allowed([65535, 65535, 65535]));
+        assert!(!dispatch_allowed([65536, 1, 1]));
+        assert!(!dispatch_allowed([0x8000_0000, 1, 1]));
+        assert!(!dispatch_allowed([5, 70_000, 1]));
+        assert!(!dispatch_allowed([1, 1, u32::MAX]));
+    }
+
+    /// An indirect dispatch whose arguments ask for more thread groups than D3D12 allows does
+    /// not reach the GPU: the commands the ExecuteIndirect reads have no groups for it, the
+    /// others (and each command's other words) are the title's, a command past the end of the
+    /// title's buffer has none, and the guard counts what it left out with the last one's counts
+    /// and pipeline state. Before the guard the ExecuteIndirect read the title's buffer as it
+    /// was: a retail game's world asked for such counts, and one ExecuteIndirect of a loop-free
+    /// shader took 141 s of GPU time (P55).
+    #[test]
+    fn indirect_dispatches_past_the_group_limit_are_not_run() {
+        use crate::gpu::recomp::runner::skip_test;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC};
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                return skip_test("no GPU");
+            }
+            let dev = dev.unwrap();
+            if guard_indirect_pipeline(&dev).is_err() {
+                return skip_test("no DXC");
+            }
+            let buffer = |heap: D3D12_HEAP_TYPE, bytes: u64, state: D3D12_RESOURCE_STATES| -> ID3D12Resource {
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: bytes,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: DXGI_FORMAT_UNKNOWN,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                };
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut r).unwrap();
+                r.unwrap()
+            };
+            // four commands of 16 bytes (a word, then the dispatch counts) 16 bytes into the
+            // title's buffer, which ends there: a fifth one is asked for and not in it
+            let cmds: [[u32; 4]; 4] = [[7, 2946, 1, 1], [8, 0x8000_0000, 1, 1], [9, 5, 70_000, 1], [10, 65_535, 65_535, 65_535]];
+            let src = buffer(D3D12_HEAP_TYPE_UPLOAD, 16 + 64, D3D12_RESOURCE_STATE_GENERIC_READ);
+            let mut p: *mut c_void = std::ptr::null_mut();
+            src.Map(0, None, Some(&mut p)).unwrap();
+            std::ptr::copy_nonoverlapping(cmds.as_ptr() as *const u8, (p as *mut u8).add(16), 64);
+            src.Unmap(0, None);
+            let report = default_uav_buffer(&dev, 256, "report").unwrap();
+            let rb = buffer(D3D12_HEAP_TYPE_READBACK, 256, D3D12_RESOURCE_STATE_COPY_DEST);
+
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &alloc, None).unwrap();
+            let pso = 0x1234_5678_9ABCusize;
+            let dst = guarded_dispatch_args(&dev, &list, &src, 16, 5, 16, 4, report.GetGPUVirtualAddress(), pso).unwrap();
+            emit_transition(&list, &dst, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            emit_transition(&list, &report, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list.CopyBufferRegion(&rb, 0, &dst, 0, 80);
+            list.CopyBufferRegion(&rb, 128, &report, 0, 24);
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Signal(&fence, 1).unwrap();
+            crate::gpu::fence::wait(&fence, 1, &dev, None, 5000).unwrap();
+
+            let mut out: *mut c_void = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut out)).unwrap();
+            let words = std::slice::from_raw_parts(out as *const u32, 64).to_vec();
+            rb.Unmap(0, None);
+            let read: Vec<[u32; 4]> = (0..5).map(|k| words[4 * k..4 * k + 4].try_into().unwrap()).collect();
+            assert_eq!(read, vec![[7, 2946, 1, 1], [8, 0, 0, 0], [9, 0, 0, 0], [10, 65_535, 65_535, 65_535], [0, 0, 0, 0]], "the commands the ExecuteIndirect reads");
+            let rep = &words[32..38];
+            assert_eq!(rep[0], 2, "the commands left out: {rep:x?}");
+            assert!([[0x8000_0000, 1, 1], [5, 70_000, 1]].contains(&[rep[1], rep[2], rep[3]]), "the last one's counts: {rep:x?}");
+            assert_eq!(rep[4] as usize | (rep[5] as usize) << 32, pso, "its pipeline state");
+        }
     }
 
     #[test]

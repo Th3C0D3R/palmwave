@@ -1138,6 +1138,15 @@ fn queue_id(q: usize) -> usize {
     }
 }
 
+/// `q<n>` for a queue `queue_id` has numbered, else its address (naming one numbers none: XCL's
+/// own queues do not shift the title's numbers in later lines).
+fn queue_name(q: usize) -> String {
+    match QUEUE_IDS.lock().unwrap().iter().position(|&x| x == q) {
+        Some(id) => format!("q{id}"),
+        None => format!("{q:#x}"),
+    }
+}
+
 /// Remove any `armed_waits` and `submitted_signals` already satisfied on the GPU (or if the device
 /// was removed). Returns the fence's current completed value (or `0` if no fence exists yet).
 unsafe fn prune_completed_waits(cell: &mut SyncCell) -> u64 {
@@ -1576,6 +1585,25 @@ fn wake_sync_watchdog() {
             }
             if had_expired {
                 crate::xlog_warn!("D3D12.X: pending title ID3D12Fences during GPU wait timeout: {}", super::fence_x::pending_summary());
+                // XCL's own fences that the title's queues wait for or that hold its signals
+                // back: once a timeout (its releases come in a burst of ticks)
+                static OWN: Mutex<Option<Instant>> = Mutex::new(None);
+                let due = {
+                    let mut last = OWN.lock().unwrap();
+                    let due = last.is_none_or(|t| t.elapsed() >= Duration::from_secs(10));
+                    if due {
+                        *last = Some(Instant::now());
+                    }
+                    due
+                };
+                if due {
+                    crate::xlog_warn!(
+                        "D3D12.X: XCL's own fences at the GPU wait timeout (completed/signalled): {}; {}; {}",
+                        super::sparse::fence_summary(&queue_name),
+                        super::vram::fence_summary(&queue_name),
+                        super::title_textures::upload_summary(&queue_name)
+                    );
+                }
                 static GRAPHS: AtomicU64 = AtomicU64::new(0);
                 if let Some(summary) = graph_at_timeout.filter(|_| once(&GRAPHS, 4)) {
                     crate::xlog_warn!("D3D12.X: sync graph at GPU wait timeout (per queue: armed waits cell>=value@seq, fence signals the GPU has not passed cell=value@seq): {summary}");
