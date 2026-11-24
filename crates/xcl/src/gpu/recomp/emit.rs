@@ -4104,7 +4104,7 @@ impl Em {
             let ty = if *cmp { "SamplerComparisonState" } else { "SamplerState" };
             let _ = writeln!(h, "{ty} xcl_ss{k} : register(s{k}, space1);");
         }
-        h.push_str(PRELUDE);
+        h.push_str(&prelude(if self.opt.loop_budget != 0 { self.opt.loop_budget } else { loop_budget_env() }, body));
         if self.x64() {
             self.x64_prelude(&mut h);
         }
@@ -5301,6 +5301,27 @@ uint2 xcl_x_ballot_local(bool b) {
 // DPP16, DPP8, ds_swizzle, v_permlane(x)16: the ISA keeps the source in the reader's half
 uint xcl_x_rla_half(uint v, uint l) { return WaveReadLaneAt(v, l & 31u); }
 "#;
+
+/// `XCL_LOOP_BUDGET=n`: the loop iterations a lane may run in every program with a loop (0 or
+/// not set: `PRELUDE`'s 65 536, the HLSL as it always was). The 65 536 end a lane that never
+/// leaves its loops, but a dispatch whose every lane runs them is still seconds to minutes of
+/// GPU time, and past 2 s the system removes the device: console code reading memory nothing
+/// wrote (its producer's dispatch skipped, `XCL_PSO_COMPUTE_BUDGET=1`) can need a lower one.
+/// The HLSL is the cache key: every program with a loop is compiled again with it.
+fn loop_budget_env() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("XCL_LOOP_BUDGET").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// `PRELUDE`, with `budget` loop iterations a lane (0: its own) when `body` has a loop.
+fn prelude(budget: u32, body: &str) -> std::borrow::Cow<'static, str> {
+    const DEFAULT: &str = "static uint xcl_budget = 1u << 16;";
+    if budget == 0 || !body.contains("xcl_budget") {
+        return PRELUDE.into();
+    }
+    debug_assert!(PRELUDE.contains(DEFAULT));
+    PRELUDE.replacen(DEFAULT, &format!("static uint xcl_budget = {budget}u;"), 1).into()
+}
 
 const PRELUDE: &str = r#"
 static uint lane_id;

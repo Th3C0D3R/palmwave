@@ -508,11 +508,14 @@ pub struct Options {
     /// structured control flow when the program allows it (false, or `XCL_RECOMP_NO_STRUCTURED`:
     /// always the guarded block chain)
     pub structured: bool,
+    /// the loop iterations a lane may run (`LOOP_GUARD`); 0: `XCL_LOOP_BUDGET`'s, else 65 536
+    /// (the HLSL as it always was)
+    pub loop_budget: u32,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true, loop_budget: 0 }
     }
 }
 

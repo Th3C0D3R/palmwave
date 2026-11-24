@@ -1201,6 +1201,54 @@ fn gpu_scalar_loop_and_scc() {
     assert_eq!((r.sgpr[41], r.sgpr[42], r.sgpr[43]), (48, 33, u32::MAX), "flbit_i64 high-then-low scan");
 }
 
+/// A loop the program never leaves: s0 counts its iterations, v1 = s0 comes after it.
+fn endless_loop() -> Vec<u8> {
+    prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 128)], None),             // 0: s0 = 0
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None), // 4: loop: s0 += 1
+        ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 128), ("SSRC1", 128)], None),       // 8: 0 == 0
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)], None),                 // 12: → 4, always
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 0)], None),                // v1 = s0
+    ])
+}
+
+/// `Options::loop_budget` (`XCL_LOOP_BUDGET`) changes one line of a program with a loop and
+/// nothing of a program without one; 0 is the HLSL as it always was (the shader caches' key).
+#[test]
+fn loop_budget_changes_only_the_budget_of_programs_with_loops() {
+    const DEFAULT: &str = "static uint xcl_budget = 1u << 16;";
+    let code = endless_loop();
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported);
+    assert!(t.hlsl.contains(DEFAULT) && t.hlsl.contains("if (xcl_budget == 0u) break; xcl_budget--;"), "{}", t.hlsl);
+    let low = translate(&code, &Options { loop_budget: 512, ..Options::default() }).unwrap();
+    assert_eq!(low.hlsl, t.hlsl.replacen(DEFAULT, "static uint xcl_budget = 512u;", 1));
+    assert_ne!(low.hlsl, t.hlsl);
+    // no loop: the same HLSL with any budget
+    let code = prog(&[("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 129)], None)]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.hlsl.contains(DEFAULT), "{}", t.hlsl);
+    assert_eq!(translate(&code, &Options { loop_budget: 512, ..Options::default() }).unwrap().hlsl, t.hlsl);
+}
+
+/// A lane that never leaves its loop runs the budget's iterations, then the loop is left and
+/// the program goes on to its end: 65 536 by default, `Options::loop_budget` when it is set.
+#[test]
+fn gpu_endless_loop_ends_at_the_loop_budget() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = endless_loop();
+    for (budget, want) in [(0u32, 1u32 << 16), (100, 100)] {
+        let t = translate(&code, &Options { loop_budget: budget, ..runner::options(Mode::Kernel) }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|x| panic!("{x}\n--- HLSL ---\n{}", t.hlsl));
+        let r = runner::run(&dxil, &KernelState::default(), &[]).unwrap();
+        assert_eq!(r.sgpr[0], want, "budget {budget}: iterations run");
+        assert!(r.vgpr.iter().all(|v| v[1] == want), "budget {budget}: the code after the loop ran");
+    }
+}
+
 #[test]
 fn gpu_divergence_through_exec() {
     if !gpu_ready() {
