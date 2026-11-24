@@ -1199,6 +1199,11 @@ pub unsafe fn free(p: usize) -> bool {
 /// After `queue.ExecuteCommandLists`: copy GPU-written sparse ranges (e.g. `Write32/64`,
 /// `FillMemoryWith32BitValueX`, `CopyMemoryToMemoryX`) back to their CPU view so CPU reads
 /// and spin-waits see the GPU writes without clobbering `sent` hashes.
+/// The queue tile mappings go out on, once there is one.
+pub fn queue() -> Option<ID3D12CommandQueue> {
+    STATE.lock().unwrap().as_ref().map(|s| s.queue.clone())
+}
+
 pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usize, usize)]) {
     if ranges.is_empty() {
         return;
