@@ -4698,6 +4698,12 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
 /// from then on, which was the translated mesh shaders failing their output budget (ms_6_6),
 /// not the slot. With the chunk budget fixed they translate and the title keeps rendering.
 /// Returns (MS to translate, AS left): the moved shader is not an AS any more.
+/// `XCL_MESH` is not 0: a console MS in the AS slot is translated as the mesh shader it is.
+fn as_slot_ms_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_MESH").map_or(true, |v| v.trim() != "0"))
+}
+
 fn mesh_shader_slots<'a>(ms_slot: Option<&'a [u8]>, as_slot: Option<&'a [u8]>) -> (Option<&'a [u8]>, Option<&'a [u8]>) {
     use crate::gpu::recomp::pso::is_console;
     match (ms_slot, as_slot) {
@@ -4860,6 +4866,12 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     let Some(ms) = ms else { return None };
     if !is_console(ms) {
         return None;
+    }
+    // `XCL_MESH=0`: a console MS in the AS slot is refused, as before it was translated – to tell
+    // whether the GPU work a retail title's world frames never finish is its mesh draws
+    if moved && !as_slot_ms_on() {
+        note_translation_error(format!("mesh pipeline with its MS {:016x} in the AS slot – refused (XCL_MESH=0)", crate::gpu::shader::fnv64(ms)));
+        return Some(E_INVALIDARG);
     }
     if let Some(a) = as_slot {
         let types: Vec<u32> = subs.iter().map(|s| s.0).collect();
