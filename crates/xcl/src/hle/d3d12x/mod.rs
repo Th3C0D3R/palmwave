@@ -36,6 +36,7 @@ pub mod real;
 mod rt_dump;
 pub mod sparse;
 pub mod standin;
+mod target_memory;
 pub mod title_list;
 pub mod title_textures;
 pub mod vram;

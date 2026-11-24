@@ -99,6 +99,7 @@ fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
 pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
     gpu_profile::discard(list);
     frame_census::discard(list);
+    super::target_memory::list_reset(list as usize);
     let (old, blocks, res_bufs) = with(list, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
@@ -156,6 +157,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
 pub(super) fn forget(list: *mut c_void) {
     gpu_profile::discard(list);
     frame_census::discard(list);
+    super::target_memory::list_reset(list as usize);
     if let Some(mut s) = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize))) {
         console_list::hold_until_reset(s.allocator, s.uma);
         if let Some(b) = s.res_buf.take() {
@@ -827,6 +829,7 @@ unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertic
         list.DrawInstanced(rects as u32 * 6, instances, 0, first_instance);
     }
     census(this, frame_census::Kind::Draw, [vertices, instances, 0], None);
+    super::target_memory::after_draw(this);
     for &(slot, _, pc) in &vbs {
         if let Some(v) = pc {
             list.IASetVertexBuffers(slot, Some(&[v]));
@@ -857,6 +860,7 @@ pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices:
         let _timed = gpu_profile::scope(this, Kind::Draw, [vertices, instances, 0], false, || bound_pipeline(this));
         list.DrawInstanced(vertices, instances, first_vertex, first_instance);
         census(this, frame_census::Kind::Draw, [vertices, instances, 0], None);
+        super::target_memory::after_draw(this);
     }
 }
 
@@ -898,6 +902,7 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
     let _timed = gpu_profile::scope(this, Kind::DrawIndexed, [indices, instances, 0], false, || bound_pipeline(this));
     list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
     census(this, frame_census::Kind::DrawIndexed, [indices, instances, 0], None);
+    super::target_memory::after_draw(this);
 }
 
 /// The pipeline state a draw on `this` runs with (a stand-in as its real pipeline) – for the

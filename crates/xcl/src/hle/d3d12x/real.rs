@@ -1634,6 +1634,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         super::title_textures::forget(this as usize);
         super::enhanced_barrier::forget(this as usize);
         super::depth_twin::forget(this as usize);
+        super::target_memory::forget(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
@@ -5561,7 +5562,8 @@ unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *co
             super::present::note_use(r, super::present::USE_CLEAR);
         }
     }
-    f(this, rtv, color, n, rects)
+    f(this, rtv, color, n, rects);
+    super::target_memory::after_clear(this, rtv);
 }
 
 unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rtvs: *const usize, single: i32, dsv: *const usize) {
@@ -5569,6 +5571,7 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "OMSetRenderTargets")));
     f(this, n, rtvs, single, dsv);
     super::list_x::note_render_targets(this, n, rtvs, single, dsv);
+    super::target_memory::note_bound(this as usize, n, rtvs, single);
     if let Some(&d) = dsv.as_ref().filter(|_| super::rt_dump::enabled()) {
         super::rt_dump::note_depth_bound(this as usize, d);
     }
