@@ -115,16 +115,20 @@ pub(super) struct Pipeline {
 static PIPELINES: Mutex<Option<HashMap<usize, Pipeline>>> = Mutex::new(None);
 
 /// The pipeline state `pso` was built from these console shaders (`info` is not run when the
-/// profiler is off).
+/// profiler and frame trace are off).
 pub(super) fn note_pipeline(pso: usize, info: impl FnOnce() -> Pipeline) {
-    if enabled() && pso != 0 {
+    if (enabled() || super::present::trace_frame()) && pso != 0 {
         PIPELINES.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, info());
     }
 }
 
+pub(super) fn pipeline(pso: usize) -> Option<Pipeline> {
+    PIPELINES.lock().unwrap().as_ref().and_then(|m| m.get(&pso).copied())
+}
+
 /// The pipeline state is gone (another may get its address).
 pub(super) fn forget_pipeline(pso: usize) {
-    if enabled() {
+    if enabled() || super::present::trace_frame() {
         if let Some(m) = PIPELINES.lock().unwrap().as_mut() {
             m.remove(&pso);
         }

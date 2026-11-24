@@ -58,9 +58,12 @@ Tools used for these measurements:
 - `XCL_GPU_PROFILE=1` times each draw and dispatch on the GPU.
 - `XCL_FRAME_DUMP_FROM=n` writes every presented frame from frame n.
 - `XCL_RT_DUMP=1` writes the frame's render targets and depth.
+- `XCL_TRACE_FRAME=1 XCL_TRACE_COMPUTE_FROM=n` logs compute bindings from present count n, including indirect dispatches, once per pipeline. `XCL_TRACE_MANY=m` caps the number of captures (12); `XCL_TRACE_BUFFER_WORDS=w` sets the CPU words read from each root buffer (64, at most 4096). The log includes CS hashes, root arguments and inferred descriptor candidates with their T#/V# words and tracked resources. These are CPU snapshots and candidate bindings, not GPU light-list readbacks or proof of shader reads. `XCL_TRACE_SHADERS=hash,...` selects CS hashes and permits repeated captures of them.
 - `XCL_FRAME_CENSUS=n` lists frame n's draws and dispatches (pipeline, targets, viewport, depth state, the counts the GPU ran of each ExecuteIndirect) in the log and in `census_<n>.csv`; `XCL_FRAME_CENSUS_FROM=n` does so for frames n to n+2. With `XCL_FRAME_CENSUS_MIN_OPS=m`, frames with fewer than m operations are passed over and the first three from n that have m are kept (the world's first frame is not the same from run to run).
 
 Sound: the title's Opus sound is decoded. It has not been checked by ear on the test machine yet.
+
+Stencil shader views preserve unsigned integer reads and map a console `R8_UINT` view to the PC stencil channel. The change includes synthetic regression tests; its effect on the title's dark lighting has not been measured.
 
 Shader compilation does not block the start. Before it loads its world, the title creates 58,759 pipelines and uses 12 or 13 of them, which are built at first use. On a second launch the DXIL cache cuts that build time from 2.9 s to 0.2 s. The window title's "pipelines queued" counts the pipelines that were created and never used.
 

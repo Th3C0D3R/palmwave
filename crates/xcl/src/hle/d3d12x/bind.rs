@@ -851,6 +851,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
+            if compute && super::present::trace_frame() {
+                trace_fullscreen(this, pso, None);
+            }
             count(if gfx { DRAWS } else { DISPATCHES });
             {
                 let _timed = gpu_profile::scope(this, Kind::ExecuteIndirect, [max, 0, 0], count_buf != 0, || pso);
@@ -1112,8 +1115,8 @@ unsafe fn trace_draw_kinds(this: *mut c_void, pso: usize) {
 
 /// `XCL_TRACE_SHADERS=hash,…` (dump hashes, hex): the draws traced with their root arguments
 /// are those whose vertex or pixel shader is listed – into any target, at any time (the first
-/// 24); without it, draws into a presented target (or any – `XCL_TRACE_UI_ANY`) after 300
-/// presents.
+/// 24); compute traces also match CS hashes. Without it, draws into a presented target
+/// (or any – `XCL_TRACE_UI_ANY`) after 300 presents.
 fn traced_shaders() -> &'static [u64] {
     static S: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     S.get_or_init(|| std::env::var("XCL_TRACE_SHADERS").unwrap_or_default().split(',').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).collect())
@@ -1351,13 +1354,30 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
     }
 }
 
-/// `XCL_TRACE_FRAME`: a full-screen dispatch (enough groups to cover a 4K target in tiles of up
-/// to 128 pixels) – what its root arguments say. A bindless title passes the indices of its
-/// descriptors in root constants and constant buffers: every small value there is looked up
-/// in the dispatch's descriptor tables, and the resources found (the pass's inputs and
-/// outputs) are logged.
-unsafe fn trace_fullscreen(this: *mut c_void, pso: usize, groups: [u32; 3]) {
-    if groups[0] < 30 || groups[1] < 17 {
+fn trace_compute_selected(frame: u64, from: Option<u64>, wanted: &[u64], cs: Option<u64>, groups: Option<[u32; 3]>) -> bool {
+    if from.is_some_and(|f| frame < f) {
+        return false;
+    }
+    if !wanted.is_empty() {
+        return cs.is_some_and(|h| wanted.contains(&h));
+    }
+    from.is_some() || groups.is_some_and(|g| g[0] >= 30 && g[1] >= 17)
+}
+
+/// CPU snapshots at compute recording time; small words are inferred descriptor indices,
+/// not proof of shader reads. XCL_TRACE_COMPUTE_FROM starts at a present count, with any
+/// dispatch dimensions (including indirect); otherwise the default is full-screen dispatches.
+unsafe fn trace_fullscreen(this: *mut c_void, pso: usize, groups: Option<[u32; 3]>) {
+    static FROM: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static WORDS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let from = *FROM.get_or_init(|| std::env::var("XCL_TRACE_COMPUTE_FROM").ok().and_then(|v| v.parse().ok()));
+    let cap = *CAP.get_or_init(|| std::env::var("XCL_TRACE_MANY").ok().and_then(|v| v.parse().ok()).unwrap_or(12));
+    let n = *WORDS.get_or_init(|| std::env::var("XCL_TRACE_BUFFER_WORDS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(64).min(4096));
+    let frame = super::present::activity().0;
+    let cs = gpu_profile::pipeline(pso).and_then(|p| p.stages.into_iter().find(|s| s.0 == "CS").map(|s| s.1));
+    let wanted = traced_shaders();
+    if !trace_compute_selected(frame, from, wanted, cs, groups) {
         return;
     }
     let Some(u) = crate::gpu::uma::get() else { return };
@@ -1366,13 +1386,13 @@ unsafe fn trace_fullscreen(this: *mut c_void, pso: usize, groups: [u32; 3]) {
     static SEEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
     {
         let mut g = SEEN.lock().unwrap();
-        if g.contains(&pso) || g.len() >= 12 {
+        if (wanted.is_empty() && g.contains(&pso)) || g.len() >= cap {
             return;
         }
         g.push(pso);
     }
     let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
-    let mut tables: Vec<u32> = Vec::new();
+    let mut tables: Vec<(usize, u32)> = Vec::new();
     let mut values: Vec<u32> = Vec::new();
     let mut what: Vec<String> = Vec::new();
     for (i, p) in layout.params.iter().enumerate() {
@@ -1386,10 +1406,9 @@ unsafe fn trace_fullscreen(this: *mut c_void, pso: usize, groups: [u32; 3]) {
                 let lo = word(at as usize).unwrap_or(0) as u64;
                 let hi = word(at as usize + 4).unwrap_or(0) as u64;
                 let va = (lo | hi << 32) as usize;
-                let n = 64usize;
                 if va != 0 && crate::gpu::shader::readable(va, 4 * n) {
                     let w: Vec<u32> = (0..n).map(|k| ((va + 4 * k) as *const u32).read_unaligned()).collect();
-                    what.push(format!("p{i} buffer {va:#x}: {w:x?}"));
+                    what.push(format!("p{i} buffer {va:#x} CPU words: {w:x?}"));
                     values.extend(&w);
                 } else {
                     what.push(format!("p{i} buffer {va:#x} (not readable)"));
@@ -1398,33 +1417,29 @@ unsafe fn trace_fullscreen(this: *mut c_void, pso: usize, groups: [u32; 3]) {
             Param::Table { at } => {
                 let v = word(at as usize).unwrap_or(0);
                 what.push(format!("p{i} table {v:#x}"));
-                tables.push(v);
+                tables.push((i, v));
             }
         }
     }
-    let mut found: Vec<(u32, usize)> = Vec::new();
-    for &v in &values {
-        if v >= 1 << 20 {
-            continue;
-        }
-        for &t in &tables {
-            let slot = u.base() + t as usize + 32 * v as usize;
-            if let Some(r) = super::console_heap::resource_at(slot) {
-                if !found.iter().any(|x| x.1 == r) {
-                    found.push((v, r));
-                }
+    let dispatch = groups.map_or_else(|| "ExecuteIndirect compute (groups unknown)".to_string(), |g| format!("Dispatch{g:?}"));
+    crate::xlog_info!("frame trace: compute frame {frame} list {this:p} pipeline {pso:#x} CS {cs:016x?} {dispatch}: CPU root snapshot: {}", what.join("; "));
+    let mut found = Vec::new();
+    for v in values.into_iter().filter(|&v| v < 1 << 20).chain(0..16) {
+        for &(i, t) in &tables {
+            if found.len() >= 128 || found.contains(&(i, v)) {
+                continue;
             }
+            found.push((i, v));
+            let Some(offset) = v.checked_mul(32).and_then(|v| t.checked_add(v)) else { continue };
+            let words = super::console_heap::words_at(offset);
+            let resource = super::console_heap::resource_at(u.base() + offset as usize).map(|r| {
+                let d = ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| x.GetDesc());
+                let address = super::real::title_address(r).or_else(|| super::title_textures::address(r));
+                format!("resource {r:#x} title {address:x?} desc {d:?}")
+            }).unwrap_or_else(|| "no tracked resource (buffer, null or unresolved view)".to_string());
+            crate::xlog_info!("frame trace: inferred descriptor candidate p{i} table {t:#x} index {v}: T#/V# CPU words {words:08x?}; {resource}");
         }
     }
-    let res: Vec<String> = found
-        .iter()
-        .map(|&(v, r)| {
-            let d = ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| x.GetDesc());
-            format!("[{v}] {r:#x} {:?}{}", d.map(|d| (d.Dimension.0, d.Width, d.Height, d.Format.0)), if super::present::is_presented(r) { " PRESENTED" } else { "" })
-        })
-        .collect();
-    crate::xlog_info!("frame trace: full-screen dispatch {groups:?}, pipeline {pso:#x}: {}", what.join("; "));
-    crate::xlog_info!("frame trace: … its indices name: {}", if res.is_empty() { "nothing".to_string() } else { res.join("; ") });
 }
 
 /// #148 AllocateUploadMemory(size, alignment) → CPU/GPU pointer in unified memory (used by
@@ -1458,7 +1473,7 @@ pub(super) unsafe extern "system" fn allocate_upload_memory(this: *mut c_void, s
 
 unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, x: u32, y: u32, z: u32) -> Result<(), String> {
     if super::present::trace_frame() {
-        trace_fullscreen(this, pso, [x, y, z]);
+        trace_fullscreen(this, pso, Some([x, y, z]));
     }
     bind_abi(this, list, pso, false)?;
     let _timed = gpu_profile::scope(this, Kind::Dispatch, [x, y, z], false, || pso);
@@ -1587,6 +1602,23 @@ mod tests {
             assert!(with(list, |s| !s.res_upper && !s.res_open));
             forget(list);
         }
+    }
+
+    #[test]
+    fn compute_trace_selection_preserves_fullscreen_and_filters_world_shaders() {
+        let full = Some([30, 17, 1]);
+        let small = Some([1, 1, 1]);
+        assert!(trace_compute_selected(10, None, &[], None, full));
+        assert!(!trace_compute_selected(10, None, &[], None, small));
+        assert!(!trace_compute_selected(10, None, &[], None, None));
+        assert!(!trace_compute_selected(1779, Some(1780), &[], None, full));
+        assert!(trace_compute_selected(1780, Some(1780), &[], None, small));
+        assert!(trace_compute_selected(1780, Some(1780), &[], None, None));
+        assert!(trace_compute_selected(10, None, &[0xCAFE], Some(0xCAFE), small));
+        assert!(trace_compute_selected(10, None, &[0xCAFE], Some(0xCAFE), None));
+        assert!(!trace_compute_selected(1779, Some(1780), &[0xCAFE], Some(0xCAFE), full));
+        assert!(!trace_compute_selected(1780, Some(1780), &[0xCAFE], Some(0xBEEF), full));
+        assert!(!trace_compute_selected(1780, Some(1780), &[0xCAFE], None, full));
     }
 
     /// A pipeline with the rect list GS draws its rect lists whole: draw_rects leaves them alone.
