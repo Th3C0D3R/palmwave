@@ -3443,6 +3443,65 @@ fn wait_for_commit() {
     }
 }
 
+/// Builds a pipeline (`build`: with the driver's kept blob or without) from the blob if there is
+/// one; without one, or when the driver refuses it, compiles it under what `admit` returns – a
+/// pipeline made from its blob is not a compile and skips the admission. (result, the admission if
+/// it was compiled: the caller's to let go; None = made from the blob)
+fn build_reusing<G>(blob: bool, admit: impl FnOnce() -> G, mut build: impl FnMut(bool) -> HRESULT) -> (HRESULT, Option<G>) {
+    if blob {
+        let hr = build(true);
+        if hr >= 0 {
+            return (hr, None);
+        }
+    }
+    let admitted = admit();
+    (build(false), Some(admitted))
+}
+
+#[cfg(test)]
+mod build_reusing_tests {
+    use super::{build_reusing, HRESULT};
+    use std::cell::RefCell;
+
+    /// What a build did, in order: "admit", "blob" / "compile", "kept" (what the caller does with
+    /// the result), "done" (the admission let go); its result, and whether the blob was used.
+    fn steps(blob: bool, refused: bool, compile: HRESULT) -> (Vec<&'static str>, (HRESULT, bool)) {
+        struct Guard<'a>(&'a RefCell<Vec<&'static str>>);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.borrow_mut().push("done");
+            }
+        }
+        let log = RefCell::new(Vec::new());
+        let (hr, admitted) = build_reusing(
+            blob,
+            || {
+                log.borrow_mut().push("admit");
+                Guard(&log)
+            },
+            |with_blob| {
+                log.borrow_mut().push(if with_blob { "blob" } else { "compile" });
+                if with_blob && refused { -1 } else if with_blob { 0 } else { compile }
+            },
+        );
+        log.borrow_mut().push("kept");
+        let reused = admitted.is_none();
+        drop(admitted);
+        (log.into_inner(), (hr, reused))
+    }
+
+    /// A blob the driver refuses leaves a full compile to do: it waits its turn like one with no
+    /// blob (a driver update can refuse many kept blobs in one run).
+    #[test]
+    fn a_refused_blob_is_compiled_under_the_admission_of_a_compile() {
+        assert_eq!(steps(true, true, 0), (vec!["blob", "admit", "compile", "kept", "done"], (0, false)));
+        assert_eq!(steps(true, true, -5), (vec!["blob", "admit", "compile", "kept", "done"], (-5, false)));
+        // no blob: as before; a blob the driver takes is not a compile
+        assert_eq!(steps(false, false, 0), (vec!["admit", "compile", "kept", "done"], (0, false)));
+        assert_eq!(steps(true, false, 0), (vec!["blob", "kept"], (0, true)));
+    }
+}
+
 unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
     with_switch_fallback(|| translated_compute_pso_once(this, f, desc, riid, ppv))
 }
@@ -3496,23 +3555,32 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
     }
     let started = std::time::Instant::now();
-    // in the background, one at a time and within the commit left (each ~1.5 GB in the driver)
-    let _slot = (big && cached.is_none() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"))).then(|| {
-        let slot = BIG_COMPILES.acquire();
-        wait_for_commit();
-        slot
-    });
-    let mut hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
-    if hr < 0 && cached.is_some() {
-        // a blob the driver does not take (another root signature at the same address…): compiled
-        forget_compute_blob(key);
-        if from_disk {
-            driver_cache::note(false, disk.as_deref());
-        }
-        copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
-        hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
-    }
-    let reused = hr >= 0 && cached.is_some() && copy.CachedPSO.CachedBlobSizeInBytes != 0;
+    let (hr, admitted) = build_reusing(
+        cached.is_some(),
+        // in the background, one at a time and within the commit left (each ~1.5 GB in the driver)
+        || {
+            (big && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"))).then(|| {
+                let slot = BIG_COMPILES.acquire();
+                wait_for_commit();
+                slot
+            })
+        },
+        |with_blob| {
+            let hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+            if with_blob && hr < 0 {
+                // a blob the driver does not take (another root signature at the same address…): compiled
+                forget_compute_blob(key);
+                if from_disk {
+                    driver_cache::note(false, disk.as_deref());
+                }
+                copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+            }
+            hr
+        },
+    );
+    let reused = admitted.is_none();
+    // (held to the end, as the compile's blob is kept)
+    let _slot = admitted.flatten();
     if hr >= 0 && !reused {
         keep_compute_blob(key, *ppv, dxil.len());
         if let (Some(p), Some(b)) = (disk.as_deref(), compute_blob(key)) {
