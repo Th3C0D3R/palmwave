@@ -944,6 +944,71 @@ unsafe fn reread_pages(array: u64, pages: &mut [usize]) -> (Option<(usize, usize
     (first, changed)
 }
 
+/// `XCL_DSTORAGE_VERIFY=1`: a request with a destination page array is checked against the
+/// title's array and the page allocator right before it runs (`check_pages`), its pages are read
+/// back after the write (`written_differs`), and the log says where its pages are (the first 16
+/// requests, then every power of two) and how many such requests ran before the title's Submit
+/// that covers them. For a title whose memory gets bytes of a texture where it has none: each
+/// finding is a warning that names the request. Unset, empty or `0`: none of this.
+fn verify_switch(v: Option<&str>) -> bool {
+    let v = v.map_or("", str::trim);
+    !v.is_empty() && v != "0"
+}
+
+fn verify() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| verify_switch(std::env::var("XCL_DSTORAGE_VERIFY").ok().as_deref()))
+}
+
+/// What is wrong with the pages a request is about to write (`XCL_DSTORAGE_VERIFY`): `pages` as
+/// the request has them after `fill_in_pages`, `array` the title's array they came from.
+unsafe fn check_pages(array: u64, pages: &[usize]) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut now = vec![0usize; pages.len()];
+    if !read_own(array as usize, now.as_mut_ptr() as *mut u8, std::mem::size_of_val(pages)) {
+        found.push(format!("the page array at {array:#x} cannot be read any more"));
+        now.copy_from_slice(pages);
+    }
+    for (i, (&p, &n)) in pages.iter().zip(&now).enumerate() {
+        if !crate::hle::kernelx::physical_page_live(p) {
+            found.push(format!("entry {i}: {p:#x} is not an allocated page (the write is refused)"));
+        }
+        if n != p {
+            let what = if crate::hle::kernelx::physical_page_live(n) { "another allocated page" } else { "no allocated page" };
+            found.push(format!("entry {i}: the request writes page {p:#x}, the array holds {n:#x} now ({what})"));
+        }
+        if let Some(j) = pages[..i].iter().position(|&q| q == p && p != 0) {
+            found.push(format!("entries {j} and {i} name the same page {p:#x}"));
+        }
+    }
+    found
+}
+
+/// Where the pages of a request are now, for the log: `page@address` and `h` for a page at its
+/// home (not mapped by the title).
+fn page_places(pages: &[usize]) -> String {
+    let place = |&p: &usize| match crate::hle::kernelx::physical_page_address(p) {
+        Some((at, away)) => format!("{p:#x}@{at:#x}{}", if away { "" } else { "h" }),
+        None => format!("{p:#x}@?"),
+    };
+    let mut out: Vec<String> = pages.iter().take(8).map(place).collect();
+    if pages.len() > 8 {
+        out.push(format!("… {} more", pages.len() - 8));
+    }
+    out.join(" ")
+}
+
+/// The first byte at which `pages` (from `offset`) read back differ from `written`
+/// (`XCL_DSTORAGE_VERIFY`): another writer got there, a page moved under the write, or two
+/// entries name one page. `usize::MAX` if they cannot be read.
+unsafe fn written_differs(pages: &[usize], offset: usize, written: &[u8]) -> Option<usize> {
+    let mut back = vec![0u8; written.len()];
+    if !crate::hle::kernelx::read_physical_pages(pages, offset, &mut back) {
+        return Some(usize::MAX);
+    }
+    back.iter().zip(written).position(|(a, b)| a != b)
+}
+
 /// Run a request; the destination gets the bytes or nothing.
 unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
     let n = r.destination_size as usize;
@@ -1026,6 +1091,21 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
         if !crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &payload[..n]) {
             return Err(E_ACCESS_VIOLATION);
+        }
+        if verify() {
+            if let Some(at) = written_differs(pages, r.destination_page_offset as usize, &payload[..n]) {
+                static N: AtomicU64 = AtomicU64::new(0);
+                let k = N.fetch_add(1, Ordering::Relaxed) + 1;
+                if k <= 64 || k.is_power_of_two() {
+                    crate::xlog_warn!(
+                        "DirectStorage verify: the pages of a request read back differ from what it wrote from byte {at:#x} of {n:#x} (options {:#x}, page array {:#x}, page offset {:#x}; pages {}) – {k} so far",
+                        r.options,
+                        r.destination,
+                        r.destination_page_offset,
+                        page_places(pages)
+                    );
+                }
+            }
         }
     } else if n > 0 {
         std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination as *mut u8, n);
@@ -1247,6 +1327,11 @@ impl QueueInner {
                         {
                             continue;
                         }
+                        if verify() {
+                            if let Some(p) = dest_pages.as_deref() {
+                                self.verify_pages(seq, &req, p, until);
+                            }
+                        }
                         if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref()) } {
                             // a BCPack stream the decoder did not take gets what a refused request
                             // gets under `XCL_DSTORAGE_BCPACK_FILL`, into the pages at its turn
@@ -1360,6 +1445,33 @@ impl QueueInner {
                 self,
                 if covered { "after" } else { "before" }
             );
+        }
+    }
+
+    /// `XCL_DSTORAGE_VERIFY`: the destination pages of request `seq`, right before it runs.
+    fn verify_pages(&self, seq: u64, req: &Request, pages: &[usize], until: u64) {
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        static EARLY: AtomicU64 = AtomicU64::new(0);
+        static FOUND: AtomicU64 = AtomicU64::new(0);
+        let k = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+        let early = *self.submits.0.lock().unwrap() < until;
+        let e = if early { EARLY.fetch_add(1, Ordering::Relaxed) + 1 } else { EARLY.load(Ordering::Relaxed) };
+        let what = format!(
+            "queue {:p} request {seq} (options {:#x}, {:#x} bytes at page offset {:#x}, page array {:#x})",
+            self, req.options, req.destination_size, req.destination_page_offset, req.destination
+        );
+        if k <= 16 || k.is_power_of_two() || (early && e.is_power_of_two()) {
+            crate::xlog_info!(
+                "DirectStorage verify: {what} writes pages {}{} – {k} requests with page arrays so far, {e} of them before the title's Submit that covers them",
+                page_places(pages),
+                if early { format!(", before the title's Submit #{until}") } else { String::new() }
+            );
+        }
+        for finding in unsafe { check_pages(req.destination, pages) } {
+            let f = FOUND.fetch_add(1, Ordering::Relaxed) + 1;
+            if f <= 256 || f.is_power_of_two() {
+                crate::xlog_warn!("DirectStorage verify: {what}: {finding} (pages {}) – {f} findings so far", page_places(pages));
+            }
         }
     }
 
@@ -3085,6 +3197,55 @@ mod tests {
             status_release(s);
             MapTitlePhysicalPages(reserved, 2, 0, 4, std::ptr::null_mut());
             VirtualFree(reserved, 0, MEM_RELEASE);
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
+        }
+    }
+
+    /// `XCL_DSTORAGE_VERIFY`: what it finds in a request's pages before the write – an array that
+    /// names something else by then, a page that is not allocated, a page named twice – and after
+    /// it, pages that do not hold what was written.
+    #[test]
+    fn verify_finds_stale_dead_and_doubled_pages() {
+        use crate::hle::kernelx::{physical_page_address, write_physical_pages, AllocateTitlePhysicalPages, FreeTitlePhysicalPages, PHYS_PAGE_SIZE};
+        assert_eq!((verify_switch(None), verify_switch(Some("")), verify_switch(Some(" 0 ")), verify_switch(Some("1"))), (false, false, false, true));
+        if crate::gpu::uma::get().is_none() {
+            return;
+        }
+        unsafe {
+            let mut count = 3usize;
+            let mut pages = [0usize; 3];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, pages.as_mut_ptr()), 1);
+            let mut dead = [pages[2]];
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, dead.as_mut_ptr()), 1);
+
+            // as the array says, allocated, each once: nothing
+            let table = [pages[0], pages[1]];
+            assert_eq!(check_pages(table.as_ptr() as u64, &table), Vec::<String>::new());
+            // the array names another page now, or none
+            let found = check_pages(table.as_ptr() as u64, &[pages[1], pages[1]]);
+            assert_eq!(found.len(), 2, "{found:?}");
+            assert!(found[0].contains("entry 0") && found[0].contains("another allocated page"), "{found:?}");
+            assert!(found[1].contains("entries 0 and 1 name the same page"), "{found:?}");
+            let gone = [0x1237usize, pages[2]];
+            let found = check_pages(gone.as_ptr() as u64, &[pages[0], pages[2]]);
+            assert_eq!(found.len(), 2, "{found:?}");
+            assert!(found[0].contains("entry 0") && found[0].contains("no allocated page"), "{found:?}");
+            assert!(found[1].contains("entry 1") && found[1].contains("is not an allocated page"), "{found:?}");
+            assert!(check_pages(8, &table)[0].contains("cannot be read"));
+
+            // read back: what was written, unless a page is named twice (its second part wins)
+            let data: Vec<u8> = (0..PHYS_PAGE_SIZE + 0x100).map(|i| (i % 251) as u8).collect();
+            assert!(write_physical_pages(&table, 0, &data));
+            assert_eq!(written_differs(&table, 0, &data), None);
+            let twice = [pages[0], pages[0]];
+            assert!(write_physical_pages(&twice, 0, &data));
+            assert_eq!(written_differs(&twice, 0, &data), Some(0));
+            assert_eq!(written_differs(&[pages[2]], 0, &data[..16]), Some(usize::MAX));
+
+            let (home, away) = physical_page_address(pages[0]).unwrap();
+            assert!(!away);
+            assert_eq!(page_places(&[pages[0], pages[2]]), format!("{:#x}@{home:#x}h {:#x}@?", pages[0], pages[2]));
+
             assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
         }
     }
