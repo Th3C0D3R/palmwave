@@ -1344,9 +1344,9 @@ mod tests {
     fn execute_indirect_with_a_pipeline_still_building_is_skipped() {
         let (building, built, failed, pc) = (0x7E57_6001usize, 0x7E57_6002usize, 0x7E57_6003usize, 0x7E57_6004usize);
         // a lazy submit: no worker starts it, so it stays pending under the test's control
-        pso_async::submit_lazy(building, false, Box::new(|| 0x1234));
-        pso_async::submit_lazy(built, false, Box::new(|| 0x1235));
-        pso_async::submit_lazy(failed, false, Box::new(|| 0));
+        pso_async::submit_lazy(building, false, Box::new(|| 0x1234), 0);
+        pso_async::submit_lazy(built, false, Box::new(|| 0x1235), 0);
+        pso_async::submit_lazy(failed, false, Box::new(|| 0), 0);
         assert!(pso_async::is_pending(building));
         assert!(standin_indirect_skipped(building, building), "still being built: skipped");
         assert!(pso_async::is_pending(building), "the gate did not wait for it");
