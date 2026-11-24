@@ -1455,8 +1455,11 @@ pub unsafe fn probe_gpu_content(res: usize) {
 }
 
 /// XCL's upload queues made so far.
-pub(super) fn upload_queues() -> Vec<ID3D12CommandQueue> {
-    QUEUES.lock().unwrap().values().cloned().collect()
+pub(super) fn upload_queues(wait: bool) -> Option<Vec<ID3D12CommandQueue>> {
+    // `wait` false (inside a resource's Release, `late_release::hold`): not while another thread
+    // holds the lock – it can be inside D3D12, making a queue (`upload_queue`)
+    let g = if wait { QUEUES.lock().unwrap() } else { QUEUES.try_lock().ok()? };
+    Some(g.values().cloned().collect())
 }
 
 /// XCL's queue for uploads on `dev`.
