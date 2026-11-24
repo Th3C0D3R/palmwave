@@ -749,7 +749,15 @@ struct Pipelines {
     /// biggest takes ~1.5 GB in the driver – fifteen at once took 24 GB
     running: (Mutex<usize>, std::sync::Condvar),
     most: usize,
+    /// the same for programs of `BIG_DXIL` or more (`XCL_PIPELINE_BIG_THREADS`, 2), which an
+    /// NVIDIA driver can compile for half an hour: with one pool, three of them held every other
+    /// program of a retail pack for more than 15 minutes
+    big: (Mutex<usize>, std::sync::Condvar),
+    most_big: usize,
 }
+
+/// DXIL size from which a program's driver compile goes to the pool of the big ones
+const BIG_DXIL: usize = 2 << 20;
 
 // D3D12 devices and root signatures are free-threaded
 unsafe impl Sync for Pipelines {}
@@ -764,7 +772,17 @@ impl Pipelines {
             let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
             let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?;
             let most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).max(1);
-            Ok(Pipelines { dev, signatures: Mutex::new(Default::default()), made: AtomicUsize::new(0), refused: AtomicUsize::new(0), running: (Mutex::new(0), std::sync::Condvar::new()), most })
+            let most_big = std::env::var("XCL_PIPELINE_BIG_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(2usize).max(1);
+            Ok(Pipelines {
+                dev,
+                signatures: Mutex::new(Default::default()),
+                made: AtomicUsize::new(0),
+                refused: AtomicUsize::new(0),
+                running: (Mutex::new(0), std::sync::Condvar::new()),
+                most,
+                big: (Mutex::new(0), std::sync::Condvar::new()),
+                most_big,
+            })
         }
     }
 
@@ -794,16 +812,17 @@ impl Pipelines {
             CS: D3D12_SHADER_BYTECODE { pShaderBytecode: c.dxil.as_ptr() as *const _, BytecodeLength: c.dxil.len() },
             ..Default::default()
         };
+        let (pool, most) = if c.dxil.len() >= BIG_DXIL { (&self.big, self.most_big) } else { (&self.running, self.most) };
         {
-            let mut n = self.running.0.lock().unwrap();
-            while *n >= self.most {
-                n = self.running.1.wait(n).unwrap();
+            let mut n = pool.0.lock().unwrap();
+            while *n >= most {
+                n = pool.1.wait(n).unwrap();
             }
             *n += 1;
         }
         let r: windows::core::Result<ID3D12PipelineState> = unsafe { self.dev.CreateComputePipelineState(&desc) };
-        *self.running.0.lock().unwrap() -= 1;
-        self.running.1.notify_one();
+        *pool.0.lock().unwrap() -= 1;
+        pool.1.notify_one();
         drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
         let oom = matches!(&r, Err(e) if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY);
         let done = match r {
