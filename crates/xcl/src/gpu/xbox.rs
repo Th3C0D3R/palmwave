@@ -22,8 +22,10 @@
 //!            +0x100 hardware-stage descriptor u64 0x000000C0_0002_AAHH
 //!                   (HH = PAL hardware stage, AA = API stage; one more every 0x88 B,
 //!                   e.g. GS + its VS copy shader); unused fields are 0xDEADBEEF.
-//!            The code is padded with s_code_end; metadata (user data mapping?) and the
-//!            shader name follow it.
+//!            +0xE8 u64 offset of the resource table (relative to +0x10), +0xF8 u32 its
+//!            entries (5 dwords each: kind … user data register; `Fssm::heap_registers`).
+//!            The code is padded with s_code_end; metadata (the resource table, the user
+//!            data mapping) and the shader name follow it.
 //! ```
 //!
 //! Exact semantics of most FSSM fields are unknown, so every step has a fallback: the
@@ -156,6 +158,48 @@ impl Fssm {
             return "?".into();
         }
         self.stages.iter().map(|s| hw_stage_name(s.hw)).collect::<Vec<_>>().join("+")
+    }
+
+    /// The user data registers in which the console's driver passes the 32-bit addresses of
+    /// the bound descriptor heaps – (CBV/SRV/UAV heap, sampler heap) – for the program's SM 6.6
+    /// dynamic resources (`ResourceDescriptorHeap`: a descriptor loaded from the heap's address
+    /// plus 32 · index). They are the entries of kinds 5 and 6 of the resource table after the
+    /// code: its offset (from +0x10) at +0xE8, its entries at +0xF8, 5 dwords each – the kind
+    /// first, the user data register last (kind 0, root constants, and kind 3, a descriptor in
+    /// a table, have their root parameter in bits 8..15 there). A retail pack has a CBV/SRV/UAV
+    /// heap register in 1,649 of its 2,678 CS, 10,137 of 12,051 PS and 8,614 of 8,765 MS
+    /// programs, nearly always the one right after the root arguments.
+    pub fn heap_registers(&self) -> (Option<u32>, Option<u32>) {
+        let mut out = (None, None);
+        let (Some(table), Some(n)) = (rd64(&self.data, 0xE8), rd32(&self.data, 0xF8)) else { return out };
+        // (an FSSM without the table has the 0xDEADBEEF filler there)
+        let Some(start) = usize::try_from(table).ok().and_then(|t| t.checked_add(0x10)) else { return out };
+        if self.version != 0x101 || n > 4096 {
+            return out;
+        }
+        for k in 0..n as usize {
+            let at = start + 20 * k;
+            let (Some(kind), Some(reg)) = (rd32(&self.data, at), rd32(&self.data, at + 16)) else { break };
+            match kind {
+                5 if reg < 32 => out.0 = out.0.or(Some(reg)),
+                6 if reg < 32 => out.1 = out.1.or(Some(reg)),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// `heap_registers` as the program's SGPRs (`recomp::Options::heap_sgprs`): user data k is
+    /// s(k) in a CS, VS or PS and s(8 + k) in an NGG program (an MS: the merged stage's own
+    /// eight come first – its root parameter 0, user data 8, is s16); other stages: none.
+    pub fn heap_sgprs(&self) -> [Option<u32>; 2] {
+        let base = match self.stages.first().map(|s| s.hw) {
+            Some(4..=6) => 0,
+            Some(7) => 8,
+            _ => return [None; 2],
+        };
+        let (views, samplers) = self.heap_registers();
+        [views.map(|r| r + base), samplers.map(|r| r + base)]
     }
 }
 
@@ -824,6 +868,33 @@ pub(crate) mod tests {
         assert_eq!(wave64(0x1F | 0x40), (false, true));
         assert_eq!(wave64(0), (false, true));
         assert_eq!(wave64(0xDEAD_BEEF), (false, true));
+    }
+
+    /// The resource table after the code names the user data registers in which the console
+    /// passes the descriptor heaps' addresses (kinds 5 and 6) – SGPRs from s0, in an NGG program
+    /// from s8. Without the table (the 0xDEADBEEF filler) or those kinds there are none.
+    #[test]
+    fn the_resource_table_names_the_registers_of_the_descriptor_heaps() {
+        let shader = |hw: u8, kind: u32, entries: &[[u32; 5]]| {
+            let mut f = fssm(&CODE, &[(hw, 3)]);
+            let table = f.len();
+            f.extend(entries.iter().flatten().flat_map(|w| w.to_le_bytes()));
+            f[0xE8..0xF0].copy_from_slice(&((table - 0x10) as u64).to_le_bytes());
+            f[0xF8..0xFC].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+            parse(&sample(kind, &[f])).unwrap().fssm.remove(0)
+        };
+        // a retail meshlet culling CS: a UAV of the table in user data 4, root constants (b501,
+        // two) in 5, the view heap in 7
+        let cs = shader(6, 5, &[[3, 0x20, 1, 8, 4], [0, 0, 2, 0x1F5, 0x105], [5, 0, 1, 0, 7]]);
+        assert_eq!((cs.heap_registers(), cs.heap_sgprs()), ((Some(7), None), [Some(7), None]));
+        // a retail MS: root constants in user data 13, the heaps in 15 and 16 – its s23 and s24
+        let ms = shader(7, 13, &[[0, 0, 2, 0x1F4, 0x40D], [5, 0, 1, 0, 0xF], [6, 0, 1, 0, 0x10]]);
+        assert_eq!((ms.heap_registers(), ms.heap_sgprs()), ((Some(15), Some(16)), [Some(23), Some(24)]));
+        assert_eq!(shader(6, 5, &[[0, 0, 1, 0x1F4, 0x105]]).heap_sgprs(), [None; 2], "no heap");
+        assert_eq!(shader(3, 2, &[[5, 0, 1, 0, 7]]).heap_sgprs(), [None; 2], "a legacy GS: its registers are not known");
+        let mut filler = fssm(&CODE, &[(6, 3)]);
+        filler[0xE8..0xFC].copy_from_slice(&[0xEF, 0xBE, 0xAD, 0xDE].repeat(5));
+        assert_eq!(parse(&sample(5, &[filler])).unwrap().fssm[0].heap_registers(), (None, None));
     }
 
     #[test]

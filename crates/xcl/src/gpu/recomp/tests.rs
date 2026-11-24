@@ -5055,6 +5055,58 @@ fn gpu_compute_mode_dispatch_abi() {
     }
 }
 
+/// SM 6.6 dynamic resources, the way a retail title's meshlet culling loads its batch buffer:
+/// the console's driver passes the CBV/SRV/UAV heap's address in the SGPR the program's
+/// resource table names (`xbox::Fssm::heap_registers`) – here s7, after the root arguments
+/// s4…s6 – and the program loads its V#s from heap + 32 · index. XCL lays out root arguments
+/// only, so the program takes that SGPR from io slot IO_VIEW_HEAP (`Options::heap_sgprs`),
+/// where the runtime puts the heap the list bound. Before, s7 was what the root arguments left
+/// there (0): the V#s came from 3 · 32, empty, and nothing was copied.
+#[test]
+fn gpu_descriptor_heap_sgpr_is_read_from_its_io_slot() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{dxc, CsInterface, IO_VIEW_HEAP};
+    let cs = CsInterface { threads: [64, 1, 1], user_sgprs: 8, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+    // out[lane] = in[lane] + 7, the V# of `in` heap[s6] and that of `out` heap[s6 + 1]
+    let p = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 32), ("SSRC0", 7)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 33), ("SSRC0", 128)], None),
+        ("S_LSHL_B32", "ENC_SOP2", &[("SDST", 6), ("SSRC0", 6), ("SSRC1", 133)], None),
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 16), ("SOFFSET", 6), ("OFFSET", 0)], None),
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 16), ("SBASE", 16), ("SOFFSET", 6), ("OFFSET", 32)], None),
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 135), ("VSRC1", 1)], None),
+        ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 4), ("SOFFSET", 128), ("IDXEN", 1)], None),
+    ]);
+    // the heap at 0x200, slot 3 → 64 dwords at 0x400, slot 4 → 64 dwords at 0x600
+    let (heap, input, output) = (0x200usize, 0x400usize, 0x600usize);
+    let mut mem = vec![0u32; (output + 256) / 4];
+    let vsharp = |at: usize| [at as u32, 4 << 16, 64, 0];
+    mem[(heap + 3 * 32) / 4..][..4].copy_from_slice(&vsharp(input));
+    mem[(heap + 4 * 32) / 4..][..4].copy_from_slice(&vsharp(output));
+    for l in 0..64 {
+        mem[input / 4 + l] = 1000 + l as u32;
+    }
+    let mut io = vec![0u32; 128];
+    io[6] = 3;
+    io[IO_VIEW_HEAP] = heap as u32;
+    let run = |heap_sgprs: [Option<u32>; 2]| {
+        let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs.clone()), heap_sgprs, ..Default::default() })).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+        (t.hlsl, runner::dispatch(&dxil, [1, 1, 1], &io, &mem).unwrap()[output / 4..][..64].to_vec())
+    };
+    let (hlsl, out) = run([Some(7), None]);
+    assert_eq!(out, (0..64).map(|l| 1007 + l).collect::<Vec<u32>>(), "copied through the heap's V#s");
+    assert!(hlsl.contains(&format!("uint s7 = io.Load({}u);", IO_VIEW_HEAP * 4)), "s7 from the heap's slot");
+    // the same program without its heap SGPR: s7 from its own slot, as the root arguments left it
+    let (hlsl, out) = run([None; 2]);
+    assert!(hlsl.contains("uint s7 = io.Load(28u);"));
+    assert_eq!(out, vec![0; 64], "the V#s read past the heap are empty: nothing written");
+}
+
 /// A wave32 program in a 64-lane hardware wave (what VS / PS may get from the driver): the
 /// two halves behave as separate waves – ballots, lane counts, readlane and mbcnt per half.
 #[test]

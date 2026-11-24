@@ -601,7 +601,7 @@ fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u3
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, heap_sgprs: f.heap_sgprs(), ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -647,7 +647,8 @@ pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Resul
     let record = ms.clone();
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    finish_two_pass(super::translate_mesh(code, ms.clone(), super::fssm_wave64(f, code), split_wave64, mem_windows())?, record, ps)
+    let opt = Options { mode: Mode::Mesh(ms.clone()), wave64: super::fssm_wave64(f, code), split_wave64, mem_windows: mem_windows(), heap_sgprs: f.heap_sgprs(), ..Default::default() };
+    finish_two_pass(translate(code, &opt)?, record, ps)
 }
 
 /// Whether the adapter runs only 32-lane waves (its wave range lacks 64): wave64 compute,

@@ -4428,12 +4428,19 @@ impl Em {
         }
         let mut sg: BTreeSet<u64> = self.sgprs.clone();
         sg.extend([106, 107, 124, 126, 127]);
+        // the descriptor heaps' addresses come from their own io slots (`Options::heap_sgprs`)
+        let heaps = self.opt.heap_sgprs;
         let load_sgprs = |h: &mut String| {
             if windows > 1 {
                 let _ = writeln!(h, "    xcl_w = 0u;\n    xcl_uma_base = io.Load({}u);", super::IO_UMA_BASE_HI * 4);
             }
             for &c in &sg {
-                let _ = writeln!(h, "    uint {} = io.Load({}u);", sname(c).unwrap(), c * 4);
+                let slot = match heaps {
+                    [Some(v), _] if v as u64 == c => super::IO_VIEW_HEAP as u64,
+                    [_, Some(s)] if s as u64 == c => super::IO_SAMPLER_HEAP as u64,
+                    _ => c,
+                };
+                let _ = writeln!(h, "    uint {} = io.Load({}u);", sname(c).unwrap(), slot * 4);
             }
         };
         match &self.opt.mode {

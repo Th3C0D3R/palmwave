@@ -194,6 +194,10 @@ pub const GS_PRIMS_PER_GROUP: u32 = 21;
 pub const IO_GS_PRIMS: usize = 110;
 pub const IO_GS_VERTICES: usize = 111;
 pub const IO_UMA_BASE_HI: usize = 112;
+/// io slots (trap-temp range) with the 32-bit console addresses of the CBV/SRV/UAV and the
+/// sampler descriptor heap the list bound: what a program reads in its `Options::heap_sgprs`.
+pub const IO_VIEW_HEAP: usize = 118;
+pub const IO_SAMPLER_HEAP: usize = 119;
 
 impl GsInterface {
     /// bytes of one ES vertex in LDS (ESGS item: 16 per ES output register)
@@ -592,6 +596,12 @@ pub struct Options {
     /// gets the forms that make less DXIL; every other program keeps its HLSL byte for byte
     /// (the DXIL cache is keyed by the HLSL and the driver's by the DXIL)
     pub giant_from: usize,
+    /// the SGPRs in which the console's driver passes the address of the CBV/SRV/UAV and of
+    /// the sampler descriptor heap (`xbox::Fssm::heap_registers`): the program takes them from
+    /// io slots `IO_VIEW_HEAP` / `IO_SAMPLER_HEAP`, where the runtime puts the heaps the list
+    /// bound, not from the root arguments' slots. None: the program has none (its HLSL is as
+    /// it always was)
+    pub heap_sgprs: [Option<u32>; 2],
 }
 
 /// `Options::giant_from`. In the gap of a retail pack's 26 084 programs: all have 31 086
@@ -601,7 +611,7 @@ pub const GIANT_INSTRUCTIONS: usize = 40_000;
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true, loop_budget: 0, image_atomics64: true, giant_from: GIANT_INSTRUCTIONS }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true, loop_budget: 0, image_atomics64: true, giant_from: GIANT_INSTRUCTIONS, heap_sgprs: [None; 2] }
     }
 }
 
