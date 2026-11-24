@@ -2597,8 +2597,10 @@ mod tests {
                 queue_retrieve_error_record(q, rec.as_mut_ptr());
                 (u32::from_le_bytes(rec[0..4].try_into().unwrap()), i32::from_le_bytes(rec[8..12].try_into().unwrap()))
             };
-            let bc1 = |dst: *mut u8, n: usize| request(SOURCE_MEMORY_BIT | 1 << BCPACK_SHIFT, dst as u64, n as u32, packed.as_ptr() as u64, 0, packed.len() as u32);
-            // a BC1 destination of 0x404 bytes (a part block at the end), then guard bytes
+            // BC7, a mode that is refused at enqueue
+            let bc7 = |dst: *mut u8, n: usize| request(SOURCE_MEMORY_BIT | 7 << BCPACK_SHIFT, dst as u64, n as u32, packed.as_ptr() as u64, 0, packed.len() as u32);
+            let (grey, magenta) = (bcpack_neutral_block(7).unwrap(), bcpack_fill_block(7).unwrap());
+            // a BC7 destination of 0x404 bytes (a part block at the end), then guard bytes
             let n = 0x404usize;
             let mut dst = vec![0xCDu8; n + 64];
             assert!(!queue(q).bcpack_neutral.load(Ordering::Relaxed), "off unless XCL_DSTORAGE_BCPACK_FILL=neutral");
@@ -2607,8 +2609,8 @@ mod tests {
             // its status entry, the fence after it signalled, no error record, no error event
             queue(q).bcpack_fill.store(true, Ordering::Relaxed);
             queue(q).bcpack_neutral.store(true, Ordering::Relaxed);
-            assert_eq!(run(bc1(dst.as_mut_ptr(), n), 0), S_OK);
-            assert!(dst[..n].chunks(8).all(|c| c == &BC1_GREY[..c.len()]), "neutral BC1 blocks up to the destination size");
+            assert_eq!(run(bc7(dst.as_mut_ptr(), n), 0), S_OK);
+            assert!(dst[..n].chunks(16).all(|c| c == &grey[..c.len()]), "neutral BC7 blocks up to the destination size");
             assert!(dst[n..].iter().all(|&b| b == 0xCD), "nothing past the destination size");
             assert_eq!(WaitForSingleObject(ev, 0), WAIT_TIMEOUT, "no error event");
             assert_eq!(record(), (0, 0), "no error record");
@@ -2631,7 +2633,6 @@ mod tests {
                 std::ptr::write_volatile(&mut table[0], pages[0]);
                 assert_eq!(finish(1), S_OK);
                 let got = std::slice::from_raw_parts((reserved as *const u8).add(0x40), 0x100);
-                let grey = bcpack_neutral_block(7).unwrap();
                 assert!(got.chunks(16).all(|c| c == &grey[..]), "neutral BC7 blocks in the page");
                 assert_eq!(record(), (0, 0));
                 MapTitlePhysicalPages(reserved, 1, 0, 4, std::ptr::null_mut());
@@ -2640,20 +2641,20 @@ mod tests {
             }
 
             // a destination it cannot write: the refusal stands
-            assert_eq!(run(bc1(0x10 as *mut u8, 8), 2), E_DECOMPRESSION);
+            assert_eq!(run(bc7(0x10 as *mut u8, 8), 2), E_DECOMPRESSION);
             assert_eq!(record(), (1, E_DECOMPRESSION));
 
             // `1`: magenta blocks, and the request still fails
             queue(q).bcpack_neutral.store(false, Ordering::Relaxed);
             dst.fill(0xCD);
-            assert_eq!(run(bc1(dst.as_mut_ptr(), n), 3), E_DECOMPRESSION);
-            assert!(dst[..n].chunks(8).all(|c| c == &BC1_MAGENTA[..c.len()]), "magenta BC1 blocks");
+            assert_eq!(run(bc7(dst.as_mut_ptr(), n), 3), E_DECOMPRESSION);
+            assert!(dst[..n].chunks(16).all(|c| c == &magenta[..c.len()]), "magenta BC7 blocks");
             assert_eq!(record(), (1, E_DECOMPRESSION));
 
             // unset: the request fails and its destination stays as it was
             queue(q).bcpack_fill.store(false, Ordering::Relaxed);
             dst.fill(0xCD);
-            assert_eq!(run(bc1(dst.as_mut_ptr(), n), 4), E_DECOMPRESSION);
+            assert_eq!(run(bc7(dst.as_mut_ptr(), n), 4), E_DECOMPRESSION);
             assert!(dst.iter().all(|&b| b == 0xCD), "without the switch the destination is left as it was");
             assert_eq!(record(), (1, E_DECOMPRESSION));
 
