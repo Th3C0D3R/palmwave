@@ -49,8 +49,8 @@ enum Source {
     /// all of them at this address: `va`, or – for a texture in a GPU view of the title's CPU
     /// memory with nothing mapped there – the same offset in the CPU view (`kernelx::mirrors`)
     At(usize),
-    /// a texture in a GPU view whose pages the queue's page-mapping method mapped
-    /// (`kernelx::mirrors::mapped_source`): runs of its bytes, `(offset, length, address)`,
+    /// a texture in a GPU view whose pages have different backing:
+    /// runs of its bytes, `(offset, length, address)`,
     /// read from that address – 0: an unmapped page, zeros
     Pages(Arc<[(usize, usize, usize)]>),
 }
@@ -542,26 +542,23 @@ pub(super) unsafe fn copy_gpu_view(va: usize, dst: *mut u8, len: usize) -> bool 
     true
 }
 
-/// Where the `len` bytes of a texture at `va` are read from: page by page when the queue's
-/// page-mapping method mapped any of its pages (a retail title's streamed textures: each page
-/// shows a physical page, kept where the title mapped it last – often not the CPU view's same
-/// offset), else `mirror_source`. A page the method never mapped reads `mirror_source`; the
-/// method's mapping goes before a physical page mapped at the GPU-view address itself.
+/// Where the `len` bytes of a texture at `va` are read from: GPU views choose each page's
+/// backing separately. The queue's page-mapping method goes before a direct physical mapping
+/// at the GPU-view address, then the CPU view supplies pages with neither mapping.
 fn source_of(va: usize, len: usize) -> Source {
-    use crate::hle::kernelx::mirrors::{self, mapped_source, PAGE};
-    let end = va.saturating_add(len);
-    if mirrors::source(va).is_none() || !(va & !(PAGE - 1)..end).step_by(PAGE).any(|p| mapped_source(p).is_some()) {
+    if crate::hle::kernelx::mirrors::source(va).is_none() {
+        return Source::At(va);
+    }
+    if len == 0 {
         return Source::At(mirror_source(va));
     }
+    let end = va.saturating_add(len);
     let mut runs: Vec<(usize, usize, usize)> = Vec::new();
     let mut at = va;
     while at < end {
-        let n = (PAGE - (at & (PAGE - 1))).min(end - at);
-        let from = match mapped_source(at) {
-            Some(Some(a)) => a,
-            Some(None) => 0,
-            None => mirror_source(at),
-        };
+        let cpu = crate::hle::kernelx::mirrors::source(at).unwrap_or(at);
+        let (from, span) = gpu_view_span(at, cpu);
+        let n = span.min(end - at);
         match runs.last_mut() {
             Some((_, len, a)) if (*a == 0 && from == 0) || (*a != 0 && from == *a + *len) => *len += n,
             _ => runs.push((at - va, n, from)),
@@ -1967,6 +1964,60 @@ mod tests {
         }
         mirrors::released(cpu);
         assert_eq!(source_of(gpu + 2 * PAGE, PAGE), Source::At(gpu + 2 * PAGE), "the view is gone");
+    }
+
+    /// Direct physical mappings may cover only part of a texture in a GPU view. Each page
+    /// chooses its own backing even when CopyPageMappingsBatchX never mapped the texture.
+    #[test]
+    fn a_partly_physical_gpu_view_texture_reads_each_pages_backing() {
+        use crate::hle::kernelx;
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const PAGE: usize = kernelx::PHYS_PAGE_SIZE;
+        const VIEW: usize = 0x129 * PAGE;
+        if crate::gpu::uma::get().is_none() {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        struct Reservation(usize);
+        impl Drop for Reservation {
+            fn drop(&mut self) {
+                kernelx::mirrors::released(self.0);
+                unsafe { VirtualFree(self.0 as *mut c_void, 0, MEM_RELEASE); }
+            }
+        }
+        struct PhysicalPage { id: usize, at: usize }
+        impl Drop for PhysicalPage {
+            fn drop(&mut self) {
+                unsafe {
+                    kernelx::MapTitlePhysicalPages(self.at as *mut c_void, 1, 0, 4, std::ptr::null_mut());
+                    kernelx::FreeTitlePhysicalPages(std::ptr::null_mut(), 1, &mut self.id);
+                }
+            }
+        }
+        unsafe {
+            let cpu = Reservation(VirtualAlloc(std::ptr::null(), VIEW, MEM_RESERVE, PAGE_READWRITE) as usize);
+            let gpu = Reservation(VirtualAlloc(std::ptr::null(), VIEW + PAGE, MEM_RESERVE, PAGE_READWRITE) as usize);
+            assert_ne!(cpu.0, 0);
+            assert_ne!(gpu.0, 0);
+            assert_eq!(VirtualAlloc(cpu.0 as *const c_void, 3 * PAGE, MEM_COMMIT, PAGE_READWRITE) as usize, cpu.0);
+            std::ptr::write_bytes(cpu.0 as *mut u8, 0x31, 3 * PAGE);
+            kernelx::mirrors::reserved(cpu.0, VIEW, 0x2040_2000, PAGE_READWRITE);
+            kernelx::mirrors::reserved(gpu.0, VIEW, 0x2040_2000, 0x801);
+            let (mut count, mut id) = (1usize, 0usize);
+            assert_eq!(kernelx::AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, &mut id), 1);
+            let mut physical = PhysicalPage { id, at: gpu.0 + PAGE };
+            assert_eq!(kernelx::MapTitlePhysicalPages(physical.at as *mut c_void, 1, 0, 4, &mut physical.id) as usize, physical.at);
+            let src = source_of(gpu.0, 3 * PAGE);
+            assert_eq!(src, Source::Pages(vec![(0, PAGE, cpu.0), (PAGE, PAGE, physical.at), (2 * PAGE, PAGE, cpu.0 + 2 * PAGE)].into()), "a lazy physical page overrides only its own CPU-view page");
+            assert!(kernelx::write_physical_pages(&[id], 0, &vec![0x72; PAGE]), "the DirectStorage write primitive");
+            let bytes = source_of(gpu.0 + 0x100, 3 * PAGE - 0x200).with_bytes(0, 3 * PAGE - 0x200, |b| b.to_vec());
+            assert!(bytes[..PAGE - 0x100].iter().all(|&b| b == 0x31));
+            assert!(bytes[PAGE - 0x100..2 * PAGE - 0x100].iter().all(|&b| b == 0x72));
+            assert!(bytes[2 * PAGE - 0x100..].iter().all(|&b| b == 0x31));
+            assert!(src.written(3 * PAGE, &[physical.at], 0x1000), "writes to the physical backing are watched");
+            assert!(!src.written(3 * PAGE, &[cpu.0 + PAGE], 0x1000), "the hidden CPU-view page is not a source");
+            assert_eq!(source_of(gpu.0 + VIEW - PAGE, 2 * PAGE), Source::Pages(vec![(0, PAGE, cpu.0 + VIEW - PAGE), (PAGE, PAGE, gpu.0 + VIEW)].into()), "the CPU mirror ends at its registered reservation");
+        }
     }
 
     /// A physical page mapped into a GPU view but not used yet (reserved until its first
