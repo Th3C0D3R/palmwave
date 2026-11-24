@@ -54,7 +54,7 @@ Road to a playable 30 fps, most urgent first:
 3. **Video memory.** 15–17 GB on a 16 GB card. The title's render targets, kept on 64 KiB pages of video memory, take 9.8 GB of it.
 4. **BCPack textures.** BC1, BC3, BC4, BC5, BC6H and BC7 streams are decoded; the title's BC1, BC5, BC6H and BC7 requests unpack in its runs. BC2 is refused. With `XCL_DSTORAGE_BCPACK_FILL=neutral`, a request that is refused or whose stream the decoder does not take completes with neutral grey blocks instead of failing.
 
-Sampled textures in a GPU view read each page from its own backing, including textures with only some pages mapped directly. This is covered by a synthetic regression; its effect on the retail title's flat materials is not measured yet.
+Sampled textures in a GPU view read each page from its own backing, including textures with only some pages mapped directly. A view by address can also reactivate a cached texture after an overlapping placement, remapping and uploading its tiles again. Synthetic regressions cover both paths; their effect on the retail title's flat materials is not measured yet.
 
 Tools used for these measurements:
 - `XCL_GPU_PROFILE=1` times each draw and dispatch on the GPU.
