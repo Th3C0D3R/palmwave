@@ -394,9 +394,16 @@ pub mod mirrors {
 
     /// The CPU-view address behind `va` when `va` lies in a GPU view.
     pub fn source(va: usize) -> Option<usize> {
+        source_range(va, 1)
+    }
+
+    /// The corresponding CPU address when the whole nonempty range lies in one GPU view.
+    pub fn source_range(va: usize, len: usize) -> Option<usize> {
         let s = STATE.lock().unwrap();
         let (&gpu, &(size, cpu)) = s.gpu.range(..=va).next_back()?;
-        (va < gpu + size).then(|| cpu + (va - gpu))
+        let offset = va - gpu;
+        if len == 0 || offset.checked_add(len)? > size { return None; }
+        cpu.checked_add(offset)
     }
 }
 
