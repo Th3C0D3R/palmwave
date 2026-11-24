@@ -1091,6 +1091,11 @@ impl SyncGraph {
 
 static SYNC_GRAPH: Mutex<Option<SyncGraph>> = Mutex::new(None);
 static ARMED_GPU_WAITS: AtomicUsize = AtomicUsize::new(0);
+/// Set once a cell's fence was signalled from the CPU (cycle break, watchdog). The waits it
+/// released are no longer armed, but a queue may not have reached its `Wait` yet, and a
+/// `queue.Signal` of a lower value still in flight on another queue sets the fence back when it
+/// retires: from then on the watchdog keeps restoring `cpu_signaled_max`, armed waits or not.
+static CPU_RELEASED: AtomicBool = AtomicBool::new(false);
 static SYNC_WATCHDOG_WAKE: OnceLock<(Mutex<()>, Condvar)> = OnceLock::new();
 static QUEUE_IDS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
@@ -1349,6 +1354,9 @@ pub(super) unsafe fn break_cycles_before_title_signal(sig_q: usize, title_fence:
         }
         out
     };
+    if !to_release.is_empty() {
+        note_cpu_release();
+    }
     for (va, val, fence) in to_release {
         let _ = fence.Signal(val);
         static MIXED_WARN: AtomicU64 = AtomicU64::new(0);
@@ -1361,13 +1369,20 @@ pub(super) unsafe fn break_cycles_before_title_signal(sig_q: usize, title_fence:
     }
 }
 
+/// A cell's fence was signalled from the CPU: the watchdog guards it against rewinds from now on
+/// (`CPU_RELEASED`), also when this release disarmed the last GPU wait.
+fn note_cpu_release() {
+    CPU_RELEASED.store(true, Ordering::Release);
+    wake_sync_watchdog();
+}
+
 fn wake_sync_watchdog() {
     let pair = SYNC_WATCHDOG_WAKE.get_or_init(|| {
         let pair = (Mutex::new(()), Condvar::new());
         let _ = std::thread::Builder::new().name("xcl-sync-watchdog".into()).spawn(|| loop {
             let (lock, cv) = SYNC_WATCHDOG_WAKE.get().unwrap();
             let guard = lock.lock().unwrap();
-            if ARMED_GPU_WAITS.load(Ordering::Acquire) == 0 {
+            if ARMED_GPU_WAITS.load(Ordering::Acquire) == 0 && !CPU_RELEASED.load(Ordering::Acquire) {
                 let _g = cv.wait(guard).unwrap();
                 continue;
             }
@@ -1415,6 +1430,7 @@ fn wake_sync_watchdog() {
                             ARMED_GPU_WAITS.fetch_sub(removed, Ordering::AcqRel);
                         }
                         if max_exp > 0 {
+                            CPU_RELEASED.store(true, Ordering::Release);
                             cell.cpu_signaled_max = cell.cpu_signaled_max.max(max_exp);
                             cell.submitted_signals.retain(|s| s.val > max_exp);
                             if let Some(ref f) = cell.fence {
@@ -1656,6 +1672,7 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
             }
             SignalAction::CpuCycleBreak(waiters) => {
                 let _ = fence.Signal(val);
+                note_cpu_release();
                 static BREAK_WARN: AtomicU64 = AtomicU64::new(0);
                 if once(&BREAK_WARN, 32) {
                     let sq = queue_id(sig_q);
@@ -5762,6 +5779,84 @@ mod tests {
 
             crate::gpu::fence::wait(&done1, 1, &dev, None, 2000).expect("q1 must complete after watchdog CPU signal");
             crate::gpu::fence::wait(&done2, 1, &dev, None, 2000).expect("q2 must complete after watchdog CPU signal");
+        }
+    }
+
+    /// A cycle break signals a cell's fence on the CPU and disarms the last GPU wait; a
+    /// `queue.Signal` of a lower value still in flight then sets the fence back when it retires.
+    /// The watchdog restores the released value although no wait is armed any more (asleep, a
+    /// queue that reached its released `Wait` after the rewind stayed there for good).
+    #[test]
+    fn cpu_released_fence_is_restored_after_a_late_lower_signal_with_no_wait_armed() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                }
+            }
+            let dev = dev.unwrap();
+            let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let (_, dev_raw, _) = queue_device_and_type(q.as_raw()).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let va = 0x7C0F_FEE0_0040u64;
+
+            // the queue waits for the cell to reach 10 – the only armed wait
+            q.Wait(&fence, 10).unwrap();
+            {
+                let mut g = SYNC_GRAPH.lock().unwrap();
+                let graph = g.get_or_insert_with(SyncGraph::default);
+                let wait_seq = graph.next_seq(q.as_raw() as usize);
+                graph.cells.insert(
+                    va,
+                    SyncCell {
+                        fence: Some(fence.clone()),
+                        device: dev_raw,
+                        recorded_max: 10,
+                        armed_waits: vec![ArmedGpuWait {
+                            val: 10,
+                            waiting_queue: q.as_raw() as usize,
+                            waiting_queue_ty: D3D12_COMMAND_LIST_TYPE_DIRECT.0,
+                            wait_seq,
+                            armed_at: Instant::now(),
+                            after_write64: false,
+                        }],
+                        ..Default::default()
+                    },
+                );
+                ARMED_GPU_WAITS.fetch_add(1, Ordering::AcqRel);
+            }
+            // its own signal of 10 would sit behind that wait: broken on the CPU, the wait disarmed
+            signal_write64_pairs(q.as_raw(), &[(va, 10)]);
+            assert_eq!(fence.GetCompletedValue(), 10, "the cycle break signals on the CPU");
+            assert!(SYNC_GRAPH.lock().unwrap().as_ref().unwrap().cells[&va].armed_waits.is_empty());
+
+            // a signal of the value before retires late and sets the fence back
+            q.Signal(&fence, 9).unwrap();
+            q.Signal(&done, 1).unwrap();
+            crate::gpu::fence::wait(&done, 1, &dev, None, 2000).expect("the queue passes its released wait");
+            let t = Instant::now();
+            while fence.GetCompletedValue() != 10 && t.elapsed() < Duration::from_secs(2) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let restored = fence.GetCompletedValue();
+            if let Some(gr) = SYNC_GRAPH.lock().unwrap().as_mut() {
+                gr.cells.remove(&va);
+            }
+            assert_eq!(restored, 10, "the fence stayed rewound with no wait armed");
         }
     }
 
