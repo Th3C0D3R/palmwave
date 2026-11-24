@@ -73,10 +73,42 @@ pub fn pc_queue_desc(d: [u32; 4]) -> [u32; 4] {
     [pc_list_type(d[0]), priority, d[2] & 1, if d[3] == 0 { 0 } else { 1 }]
 }
 
+/// `XCL_GPU_TIMEOUT=1`: the title's queues keep Windows' GPU timeout (a reset of the device when
+/// one submission runs for about 2 s). Without it they are made with DISABLE_GPU_TIMEOUT: while
+/// XCL runs a retail title's world frames slowly, whole submissions take longer than that and the
+/// reset removed the device (DXGI_ERROR_DEVICE_HUNG in runs P34, P40).
+fn no_gpu_timeout() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_GPU_TIMEOUT").map_or(true, |v| v.trim() != "1"))
+}
+
+/// The PC queue description with DISABLE_GPU_TIMEOUT (1) added when `on`.
+fn with_no_gpu_timeout(d: [u32; 4], on: bool) -> [u32; 4] {
+    if on {
+        [d[0], d[1], d[2] | 1, d[3]]
+    } else {
+        d
+    }
+}
+
 /// device #8 CreateCommandQueue / #48 CreateCommandQueueX(desc, riid, queue)
 pub(super) unsafe extern "system" fn create_command_queue_x(this: *mut c_void, desc: *const [u32; 4], riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let d = if desc.is_null() { [0; 4] } else { pc_queue_desc(desc.read_unaligned()) };
-    let hr = real::dev_create_command_queue(this, d.as_ptr() as usize, riid, ppv);
+    let asked = with_no_gpu_timeout(d, no_gpu_timeout());
+    let mut hr = real::dev_create_command_queue(this, asked.as_ptr() as usize, riid, ppv);
+    if hr < 0 && asked != d {
+        // a driver that does not allow the flag on this queue type: the queue as the title asked
+        static REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !REFUSED.swap(true, Ordering::Relaxed) {
+            crate::xlog_info!("D3D12.X: a command queue of type {} without the GPU timeout was refused ({hr:#x}) – made with it", d[0]);
+        }
+        hr = real::dev_create_command_queue(this, d.as_ptr() as usize, riid, ppv);
+    } else if hr >= 0 && asked != d {
+        static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !ONCE.swap(true, Ordering::Relaxed) {
+            crate::xlog_info!("D3D12.X: the title's command queues are made without the GPU timeout (XCL_GPU_TIMEOUT=1 keeps it)");
+        }
+    }
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         super::list_x::on_queue_create(*ppv as usize, this as usize, D3D12_COMMAND_LIST_TYPE(d[0] as i32));
     }
@@ -1153,6 +1185,10 @@ mod tests {
         assert_eq!(pc_list_type(2), 2);
         assert_eq!(pc_queue_desc([XBOX_TYPE_DMA, 1, 0, 0x10]), [3, 100, 0, 1]);
         assert_eq!(pc_queue_desc([0, 10000, 1, 0]), [0, 10000, 1, 0]);
+        // DISABLE_GPU_TIMEOUT is added only when asked for, and the rest is kept
+        assert_eq!(with_no_gpu_timeout([2, 100, 0, 1], true), [2, 100, 1, 1]);
+        assert_eq!(with_no_gpu_timeout([2, 100, 0, 1], false), [2, 100, 0, 1]);
+        assert_eq!(with_no_gpu_timeout([0, 0, 1, 0], true), [0, 0, 1, 0]);
         let mut x = [0u8; 0x38];
         x[0] = 1; // buffer
         x[8] = 0x40; // alignment
