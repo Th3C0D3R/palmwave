@@ -746,13 +746,22 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
 /// `XCL_FRAME_DUMP=1`: every 120th shown frame is written to the logs folder (`XCL_FRAME_DUMP=n`,
 /// n > 1: every n-th; a title loading at a few frames a second shows few)
 /// (`frame_<n>.bmp`, a quarter of each side; `XCL_FRAME_DUMP_FULL=1`: full size) – what the title presented, before the window.
+/// `XCL_FRAME_DUMP_FROM=n`: every shown frame from the n-th on is written too – a retail title's
+/// first world frames came tens of seconds apart, and every 30th frame missed them.
 fn frame_dump_due() -> bool {
     static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static FROM: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let every = *EVERY.get_or_init(|| match std::env::var("XCL_FRAME_DUMP") {
         Ok(v) => v.parse().ok().filter(|&n| n > 1).unwrap_or(120),
         Err(_) => 0,
     });
-    every > 0 && PRESENTS.load(Ordering::Relaxed) % every == 20.min(every - 1)
+    let from = *FROM.get_or_init(|| std::env::var("XCL_FRAME_DUMP_FROM").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(u64::MAX));
+    dump_due(PRESENTS.load(Ordering::Relaxed), every, from)
+}
+
+/// Frame `n` is dumped: every `every`-th (0: none), and every one from `from` on.
+fn dump_due(n: u64, every: u64, from: u64) -> bool {
+    n >= from || (every > 0 && n % every == 20.min(every - 1))
 }
 
 /// Frames shown so far.
@@ -972,6 +981,15 @@ impl Drop for Presenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frames_are_dumped_every_nth_and_all_from_xcl_frame_dump_from() {
+        // every 30th (the 20th of each 30), none from a start never reached
+        assert!(dump_due(50, 30, u64::MAX) && !dump_due(51, 30, u64::MAX));
+        // all from 1825 on, whatever `every` says
+        assert!(!dump_due(1824, 30, 1825) && dump_due(1825, 30, 1825) && dump_due(1838, 30, 1825));
+        assert!(dump_due(1838, 0, 1825) && !dump_due(1000, 0, 1825));
+    }
 
     // XCL_WINDOW_POS is process-global; one test covers all modes in sequence.
     #[test]
