@@ -18,22 +18,22 @@ Palmwave runs Xbox Series X|S games on Windows. It is made with **Moon AI**, the
 
 ### A retail Xbox Series game: it reaches world loading, not playable yet
 
-Measured with Palmwave `fd44a92` on an RTX 5080 (driver 621.14), a Ryzen 9 9950X3D and 61 GB of RAM, offline, with A pressed every 10 s from 30 s to pass the menus.
+Measured with Palmwave `0e0bbef` on an RTX 5080 (driver 621.14), a Ryzen 9 9950X3D and 61 GB of RAM, offline, with A pressed every 10 s from 30 s to pass the menus and `XCL_DSTORAGE_BCPACK_FILL=neutral`.
 
 | Time | What happens |
 |---|---|
 | 0–4 s | The title boots and presents its own frames after about 4 s. |
-| 5–30 s | Its first screens, at up to 30 fps. |
-| 32–56 s | The intro video, at about 19 fps. It ran at 3.5 fps while its video planes were copied a texel at a time; they are now copied a row at a time. |
-| from 65 s | The world loads behind its loading screens, at 0–2 fps. Process commit grows by about 200 MB/s. On the test machine, with about 40 GB of commit free, a watchdog stopped the run at 140 s and 33 GB, before the system ran out of memory. |
+| 5–30 s | Its first screens, at 30 fps. |
+| 32–58 s | The intro video, at 30 fps. It ran at 3.5 fps while its video planes were copied a texel at a time and each texture upload waited on the CPU. |
+| 60–80 s | The world loads behind its loading screens, at 5–30 fps. Process commit levels off at about 29 GB. A per-texture layout table took 9 GB more before. DirectStorage requests no longer fail. |
+| from 82 s | The title stops presenting: its render jobs wait for pipelines that are still compiling. After 30 s without a frame, the title's own watchdog ends it, at about 110 s. |
 
 What still separates it from playable, most urgent first:
 
-1. **Memory while the world loads.** Commit and video memory keep growing until the system runs out. Being measured next.
-2. **Frame rate while the world loads.** Each of the title's submits waits on the CPU for its texture uploads. Uploads without that wait are being integrated and measured.
-3. **BCPack textures.** DirectStorage requests in BC1, BC5, BC6H and BC7 fail with `E_DECOMPRESSION`, 768 per 300 s run. No BCPack mode is decoded yet.
+1. **Pipeline waits while the world loads.** The title's render jobs wait for graphics and compute pipelines still being compiled. A draw now waits at most 4 s. Next: one budget for all of a frame's pipeline waits, and the title's compute shaders compiled ahead of time.
+2. **Video memory.** About 15 GB of video memory on a 16 GB card, in page pools that never shrink. Next: a video-memory budget that spills to system memory.
+3. **BCPack textures.** No BCPack mode is decoded yet. With `XCL_DSTORAGE_BCPACK_FILL=neutral`, the 768 such requests of a run complete with neutral grey blocks instead of failing.
 4. **Mesh pipelines.** 25,479 pipeline creations per run put the console's mesh shader in the amplification-shader slot and are refused, so whatever the title draws with them is missing.
-5. **The intro video** runs at about 19 fps, not yet 30.
 
 Sound: the title's Opus sound is now decoded. It has not been checked by ear on the test machine yet.
 
