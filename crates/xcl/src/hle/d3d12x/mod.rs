@@ -22,7 +22,7 @@ mod fence_x;
 pub mod frame;
 mod frame_census;
 mod gpu_profile;
-mod gpu_view_buffers;
+pub mod gpu_view_buffers;
 pub mod guard;
 mod late_release;
 mod mesh_dump;

@@ -19,9 +19,19 @@
 //! watch of the title's submits). The mirror's address goes into the V#; it stays the same for
 //! as long as the GPU view lives, like the console's.
 //!
-//! What the GPU writes into a mirror (a UAV) does not go back to the title's pages.
+//! What the GPU writes into a mirror goes back to the title's pages. A mirror an unordered
+//! access view or a memory write names is *GPU-written* (`mark_written`): after each of the
+//! title's submissions its pages are copied back from video memory (`written_ranges`, by
+//! `sparse::readback_after_execute`, which also holds the title's fence signals back until the
+//! copy has landed), and what the GPU changed is written to where the page's bytes are
+//! (`landed`). Both directions go by 64-byte chunks against the page's last common content
+//! (`Written::base`), so a copy one way never carries the other side's stale bytes: a chunk
+//! the CPU wrote goes to the mirror, a chunk the GPU wrote goes to the title's page, and where
+//! both wrote the CPU's stays (it wrote after the submission).
+//!
 //! `XCL_GPU_VIEW_BUFFERS=0` turns the mirrors off; `XCL_GPU_VIEW_BUFFERS_MB=n` is the address
-//! space they may take (4096).
+//! space they may take (4096). `XCL_GPU_VIEW_WRITEBACK=0` turns the copies back off;
+//! `XCL_GPU_VIEW_WRITEBACK_MB=n` is the most a submission copies back (64).
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -37,6 +47,36 @@ const PAGE: usize = 0x1_0000;
 const ROOT_RANGE: usize = 1 << 20;
 /// The largest mirror that may come from a committed window when no sparse window has room.
 const COMMITTED_MOST: usize = 4 << 20;
+/// What the two directions of a GPU-written page are compared by (`sparse` sends the CPU's
+/// writes to video memory by the same chunks).
+const CHUNK: usize = 64;
+
+/// A live page of a GPU-written mirror.
+struct Written {
+    /// what the mirror's page and the title's page both held last
+    base: Box<[u8]>,
+    /// per chunk: `SEQ` when the CPU's bytes went to the mirror last
+    cpu_seq: Box<[u64]>,
+    /// `LOOK` when the page was filled: until a submit's look at the CPU's writes that began
+    /// after it is done (`in_video_memory`), video memory does not hold these bytes, and what
+    /// comes back from there is not the GPU's writing
+    since: u64,
+}
+
+impl Written {
+    unsafe fn of(here: usize) -> Written {
+        Written {
+            base: std::slice::from_raw_parts(here as *const u8, PAGE).into(),
+            cpu_seq: vec![SEQ.load(Ordering::Acquire); PAGE / CHUNK].into(),
+            since: LOOK[0].load(Ordering::Acquire),
+        }
+    }
+
+    /// Whether the page as it was filled has gone to video memory.
+    fn in_video_memory(&self) -> bool {
+        LOOK[1].load(Ordering::Acquire) > self.since
+    }
+}
 
 struct Mirror {
     /// bytes (a multiple of `PAGE`)
@@ -49,6 +89,8 @@ struct Mirror {
     sources: Vec<usize>,
     /// per page: committed here – its source held something
     live: Vec<bool>,
+    /// the GPU may write it (`mark_written`): per live page, what is needed to copy back
+    gpu: Option<Vec<Option<Written>>>,
 }
 
 #[derive(Default)]
@@ -58,6 +100,8 @@ struct State {
     /// where a source page starts → the mirror pages copied from it: (mirror's GPU-view
     /// address, page index)
     by_source: BTreeMap<usize, Vec<(usize, u32)>>,
+    /// a mirror's address in unified memory → its GPU-view address
+    by_at: BTreeMap<usize, usize>,
     /// address space the mirrors take
     bytes: usize,
     /// pages committed
@@ -74,6 +118,16 @@ static REFRESHED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// pages copied from memory no write watch covers: what the CPU writes there later is not seen
 /// until the page is mapped again
 static UNWATCHED: AtomicU64 = AtomicU64::new(0);
+/// number of GPU-written mirrors (0: nothing is copied back)
+static GPU_MIRRORS: AtomicU64 = AtomicU64::new(0);
+/// counts the copies back from video memory (`next_seq`): which of a chunk's two sides is newer
+static SEQ: AtomicU64 = AtomicU64::new(0);
+/// the looks of the title's submits at the CPU's writes (`title_textures::refresh_once`): how
+/// many began, and the number of the latest one that is done
+static LOOK: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// copies back: pages landed, chunks written to the title's pages, chunks where the CPU's
+/// bytes stayed, pages with nowhere to write
+static BACK: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 /// Whether CPU writes at `source` are seen (`title_textures::cached_watch_ranges`: the
 /// unified-memory windows and the title's watched reservations).
@@ -90,6 +144,34 @@ fn enabled() -> bool {
 fn budget() -> usize {
     static MB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MB.get_or_init(|| std::env::var("XCL_GPU_VIEW_BUFFERS_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4096)) << 20
+}
+
+fn writeback() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_GPU_VIEW_WRITEBACK").map_or(true, |v| v.trim() != "0"))
+}
+
+/// the most one submission copies back (`XCL_GPU_VIEW_WRITEBACK_MB`)
+fn writeback_most() -> usize {
+    static MB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| std::env::var("XCL_GPU_VIEW_WRITEBACK_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(64)) << 20
+}
+
+/// A submit of the title's begins its look at what the CPU wrote: its number.
+pub fn look_begins() -> u64 {
+    LOOK[0].fetch_add(1, Ordering::AcqRel) + 1
+}
+
+/// The look `number` is done: what the mirrors held when it began is on its way to video
+/// memory, ahead of the submit.
+pub fn look_done(number: u64) {
+    LOOK[1].fetch_max(number, Ordering::AcqRel);
+}
+
+/// The number of a copy back from video memory that is about to be submitted
+/// (`sparse::readback_after_execute`): `landed` gets it with the copy.
+pub(super) fn next_seq() -> u64 {
+    SEQ.fetch_add(1, Ordering::AcqRel) + 1
 }
 
 /// Generation of the mirrors' source pages: `source_ranges` changed.
@@ -135,7 +217,30 @@ impl State {
                 super::sparse::committed(here, PAGE);
             }
             live = true;
-            super::title_textures::copy_gpu_view(page_va, here as *mut u8, PAGE);
+            // (another page under it, or the first copy: all of it; else, for a page the GPU
+            // writes, only what the CPU changed – the rest of the mirror may be the GPU's)
+            let merge = was && old == key;
+            match m.gpu.as_mut().map(|g| &mut g[index]) {
+                Some(Some(w)) if merge => {
+                    let mut now = vec![0u8; PAGE];
+                    super::title_textures::copy_gpu_view(page_va, now.as_mut_ptr(), PAGE);
+                    let seq = SEQ.load(Ordering::Acquire);
+                    for (c, (new, base)) in now.chunks_exact(CHUNK).zip(w.base.chunks_exact_mut(CHUNK)).enumerate() {
+                        if new != base {
+                            std::ptr::copy_nonoverlapping(new.as_ptr(), (here + c * CHUNK) as *mut u8, CHUNK);
+                            base.copy_from_slice(new);
+                            w.cpu_seq[c] = seq;
+                        }
+                    }
+                }
+                Some(slot) => {
+                    super::title_textures::copy_gpu_view(page_va, here as *mut u8, PAGE);
+                    *slot = Some(Written::of(here));
+                }
+                None => {
+                    super::title_textures::copy_gpu_view(page_va, here as *mut u8, PAGE);
+                }
+            }
             if !watched(source) {
                 UNWATCHED.fetch_add(1, Ordering::Relaxed);
             }
@@ -149,6 +254,9 @@ impl State {
                 std::ptr::write_bytes(here as *mut u8, 0, PAGE);
             }
             live = false;
+            if let Some(g) = m.gpu.as_mut() {
+                g[index] = None;
+            }
         }
         m.live[index] = live;
         if live != was {
@@ -185,6 +293,10 @@ impl State {
         }
         self.live -= m.live.iter().filter(|&&l| l).count();
         self.bytes -= m.len;
+        self.by_at.remove(&m.at);
+        if m.gpu.is_some() {
+            GPU_MIRRORS.fetch_sub(1, Ordering::Release);
+        }
         if m.sparse {
             super::sparse::free(m.at);
         } else if let Some(u) = crate::gpu::uma::get() {
@@ -197,7 +309,7 @@ impl State {
 /// Where translated shaders read `[va, va + bytes)` when the whole range lies in a GPU view of
 /// the title's CPU memory: its place in a mirror, made (and filled) the first time. `None`: not
 /// in a GPU view, switched off, or no room.
-pub(super) unsafe fn address(va: usize, bytes: usize, what: &str) -> Option<usize> {
+pub unsafe fn address(va: usize, bytes: usize, what: &str) -> Option<usize> {
     if bytes == 0 || !crate::hle::kernelx::mirrors::in_some_view(va) || !enabled() {
         return None;
     }
@@ -227,7 +339,8 @@ pub(super) unsafe fn address(va: usize, bytes: usize, what: &str) -> Option<usiz
         }
     };
     let pages = len / PAGE;
-    s.mirrors.insert(start, Mirror { len, at, sparse, sources: vec![0; pages], live: vec![false; pages] });
+    s.mirrors.insert(start, Mirror { len, at, sparse, sources: vec![0; pages], live: vec![false; pages], gpu: None });
+    s.by_at.insert(at, start);
     s.bytes += len;
     let n = MIRRORS.fetch_add(1, Ordering::Release) + 1;
     let before = s.live;
@@ -249,6 +362,157 @@ pub(super) unsafe fn address(va: usize, bytes: usize, what: &str) -> Option<usiz
     Some(at + (va - start))
 }
 
+/// The GPU may write `[addr, addr + bytes)` – an unordered access view of it was made, or a
+/// memory write names it: when it is in a mirror (`addr`: its GPU-view address or the mirror's
+/// own), the mirror's pages are copied back to the title's pages after each submission.
+pub unsafe fn mark_written(addr: usize, bytes: usize, what: &str) {
+    if MIRRORS.load(Ordering::Acquire) == 0 || bytes == 0 || !writeback() {
+        return;
+    }
+    let mut g = STATE.lock().unwrap();
+    let Some(s) = g.as_mut() else { return };
+    let gva = if crate::hle::kernelx::mirrors::in_some_view(addr) {
+        s.holding(addr, bytes)
+    } else {
+        s.by_at.range(..=addr).next_back().map(|(_, &gva)| gva).filter(|gva| s.mirrors.get(gva).is_some_and(|m| addr + bytes <= m.at + m.len))
+    };
+    let Some(gva) = gva else { return };
+    let Some(m) = s.mirrors.get_mut(&gva).filter(|m| m.gpu.is_none()) else { return };
+    m.gpu = Some((0..m.len / PAGE).map(|i| m.live[i].then(|| Written::of(m.at + i * PAGE))).collect());
+    let n = GPU_MIRRORS.fetch_add(1, Ordering::AcqRel) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        let pages: usize = s.mirrors.values().filter_map(|m| m.gpu.as_ref()).map(|g| g.iter().flatten().count()).sum();
+        crate::xlog_info!(
+            "D3D12.X: {what} at {addr:#x} ({bytes} bytes) lets the GPU write a buffer in a GPU view ({gva:#x}): its pages are copied back to the title's after each submission ({n} such ranges, {} KB of pages so far)",
+            pages * PAGE >> 10
+        );
+    }
+}
+
+/// The pages of GPU-written mirrors, `(address, bytes)` each: what a submission of the title's
+/// may have written (`sparse::readback_after_execute` copies them back and calls `landed`).
+pub fn written_ranges() -> Vec<(usize, usize)> {
+    if GPU_MIRRORS.load(Ordering::Acquire) == 0 {
+        return Vec::new();
+    }
+    let g = STATE.lock().unwrap();
+    let Some(s) = g.as_ref() else { return Vec::new() };
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let most = writeback_most() / PAGE;
+    for m in s.mirrors.values() {
+        let Some(gpu) = m.gpu.as_ref() else { continue };
+        for (i, _) in gpu.iter().enumerate().filter(|(_, w)| w.as_ref().is_some_and(Written::in_video_memory)) {
+            if out.len() >= most {
+                static OVER: std::sync::Once = std::sync::Once::new();
+                OVER.call_once(|| crate::xlog_warn!("D3D12.X: more than {} MB of buffers in GPU views that the GPU may write – a submission copies back only that much (XCL_GPU_VIEW_WRITEBACK_MB)", most * PAGE >> 20));
+                return out;
+            }
+            out.push((m.at + i * PAGE, PAGE));
+        }
+    }
+    out
+}
+
+/// `len` bytes at `at` written if the memory takes them (a page the title decommits meanwhile
+/// fails the call instead of faulting here).
+unsafe fn write_title(at: usize, bytes: &[u8]) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut done = 0usize;
+    WriteProcessMemory(GetCurrentProcess(), at as *const c_void, bytes.as_ptr() as *const c_void, bytes.len(), &mut done) != 0 && done == bytes.len()
+}
+
+/// A copy back from video memory has landed in the CPU's view of `parts` (address, offset in
+/// the copy, bytes); it was submitted as number `seq` (`next_seq`). For the pages of GPU-written
+/// mirrors among them, chunk by chunk: what the GPU changed goes to where the title's page is,
+/// unless the CPU wrote that chunk after the copy was submitted or has written it at the
+/// source since – then the CPU's bytes stay (and are in the mirror again, for video memory).
+pub(super) unsafe fn landed(parts: &[(usize, usize, usize)], seq: u64) {
+    if GPU_MIRRORS.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let mut g = STATE.lock().unwrap();
+    let Some(s) = g.as_mut() else { return };
+    let mut pages: Vec<(usize, usize)> = Vec::new();
+    for &(va, _, len) in parts {
+        let Some((&at, &gva)) = s.by_at.range(..=va).next_back() else { continue };
+        let Some(m) = s.mirrors.get(&gva).filter(|m| m.gpu.is_some() && va < at + m.len) else { continue };
+        pages.extend(((va - at) / PAGE..(va + len - at).div_ceil(PAGE).min(m.len / PAGE)).map(|i| (gva, i)));
+    }
+    pages.sort_unstable();
+    pages.dedup();
+    let (mut back, mut kept, mut nowhere) = (0u64, 0u64, 0u64);
+    let mut now = vec![0u8; PAGE];
+    for &(gva, i) in &pages {
+        let Some(m) = s.mirrors.get_mut(&gva) else { continue };
+        let (page_va, here) = (gva + i * PAGE, m.at + i * PAGE);
+        if !m.live[i] {
+            continue;
+        }
+        let Some(Some(w)) = m.gpu.as_mut().map(|g| &mut g[i]) else { continue };
+        // video memory did not hold the page yet: what came back is not it. From the source
+        // again, as when it was filled.
+        if !w.in_video_memory() {
+            super::title_textures::copy_gpu_view(page_va, here as *mut u8, PAGE);
+            *w = Written::of(here);
+            continue;
+        }
+        // where the title's page is now, and what it holds
+        let source = super::title_textures::gpu_view_source(page_va).filter(|&a| a != 0 && a == m.sources[i]);
+        if source.is_some() {
+            super::title_textures::copy_gpu_view(page_va, now.as_mut_ptr(), PAGE);
+        }
+        let mirror = std::slice::from_raw_parts_mut(here as *mut u8, PAGE);
+        let cur = SEQ.load(Ordering::Acquire);
+        let mut unwritten = false;
+        for c in 0..PAGE / CHUNK {
+            let r = c * CHUNK..(c + 1) * CHUNK;
+            let base = &mut w.base[r.clone()];
+            if w.cpu_seq[c] >= seq {
+                // the CPU's bytes went to the mirror after this copy was taken: they stay
+                if mirror[r.clone()] != *base {
+                    mirror[r].copy_from_slice(base);
+                    kept += 1;
+                }
+                continue;
+            }
+            if mirror[r.clone()] == *base {
+                continue;
+            }
+            match source {
+                // the CPU wrote the chunk at the source since: its bytes, here too
+                Some(_) if now[r.clone()] != *base => {
+                    base.copy_from_slice(&now[r.clone()]);
+                    mirror[r].copy_from_slice(base);
+                    w.cpu_seq[c] = cur;
+                    kept += 1;
+                }
+                Some(a) => {
+                    if write_title(a + r.start, &mirror[r.clone()]) {
+                        back += 1;
+                    } else {
+                        unwritten = true;
+                    }
+                    base.copy_from_slice(&mirror[r]);
+                }
+                None => {
+                    unwritten = true;
+                    base.copy_from_slice(&mirror[r]);
+                }
+            }
+        }
+        nowhere += unwritten as u64;
+    }
+    let before = BACK[0].fetch_add(pages.len() as u64, Ordering::Relaxed);
+    let b = BACK[1].fetch_add(back, Ordering::Relaxed) + back;
+    let k = BACK[2].fetch_add(kept, Ordering::Relaxed) + kept;
+    let n = BACK[3].fetch_add(nowhere, Ordering::Relaxed) + nowhere;
+    let after = before + pages.len() as u64;
+    if !pages.is_empty() && (before == 0 || after.leading_zeros() != before.leading_zeros()) {
+        crate::xlog_info!("D3D12.X: buffers in GPU views the GPU may write: {after} pages copied back from video memory so far; {b} chunks of 64 bytes written to the title's pages, {k} kept as the CPU wrote them, {n} pages had nowhere to go");
+    }
+}
+
 /// `address` for a root descriptor (an address without a size): the address itself when it is
 /// not in a GPU view.
 pub(super) unsafe fn root_address(va: u64) -> u64 {
@@ -264,7 +528,15 @@ pub(super) unsafe fn root_address(va: u64) -> u64 {
     let held = STATE.lock().unwrap().as_ref().and_then(|s| s.holding(a, 1).map(|g| s.mirrors[&g].at + (a - g)));
     match held.or_else(|| address(a, bytes, "a root descriptor")) {
         Some(p) => p as u64,
-        None => va,
+        // (null rather than its own address, which is another window's memory to the shader)
+        None => {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                crate::xlog_warn!("D3D12.X: a root descriptor at {va:#x} in a GPU view has no mirror – bound as null ({n} so far)");
+            }
+            0
+        }
     }
 }
 
@@ -458,6 +730,78 @@ mod tests {
             views_changed();
             assert!(!source_ranges().iter().any(|&(a, _)| a >= p && a < p + 4 * PAGE));
             assert_eq!(address(va, bytes, "a test buffer"), None, "no GPU view any more");
+            assert_eq!(root_address(va as u64), va as u64, "no view: the address as it is");
+        }
+    }
+
+    /// What the GPU writes into a buffer in a GPU view goes back to the title's page, chunk by
+    /// chunk – and neither direction carries the other's stale bytes: a chunk the CPU wrote
+    /// after the copy back was taken, or has written at the source since, keeps the CPU's
+    /// bytes; a copy of the CPU's writes into the mirror leaves the GPU's chunks alone.
+    /// (`landed` is given the mirror as `sparse::copy_back` leaves it.)
+    #[test]
+    fn what_the_gpu_writes_into_a_gpu_view_buffer_goes_back_to_the_titles_page() {
+        if crate::gpu::uma::get().is_none() {
+            return;
+        }
+        let (cpu, gpu, size) = (0x71C0_0000_0000usize, 0x71C6_0000_0000usize, 0x12F * PAGE);
+        mirrors::reserved(cpu, size, 0x2040_2000, 0x04);
+        mirrors::reserved(gpu, size, 0x2040_2000, 0x801);
+        let mut pool: Vec<u8> = (0..3 * PAGE).map(|i| (i % 251 + 1) as u8).collect();
+        let p = pool.as_ptr() as usize;
+        unsafe {
+            // pool page 1 under the view's page 2, and a buffer on it
+            let r = [[0, 1, 1]];
+            assert!(apply_batches(1, [page_batch(gpu + 2 * PAGE, &r)].as_ptr() as usize, p, 3).is_some());
+            let at = address(gpu + 2 * PAGE, PAGE, "a test buffer").expect("a mirror");
+            assert!(!written_ranges().contains(&(at, PAGE)), "read only so far: nothing to copy back");
+            mark_written(at, PAGE, "a test view");
+            assert!(!written_ranges().contains(&(at, PAGE)), "not before video memory holds the page");
+            look_done(look_begins());
+            assert!(written_ranges().contains(&(at, PAGE)));
+            let mirror = |off: usize, n: usize| std::slice::from_raw_parts((at + off) as *const u8, n).to_vec();
+            // what the GPU's copy back puts into the mirror's CPU memory
+            let gpu_wrote = |off: usize, value: u8| std::ptr::write_bytes((at + off) as *mut u8, value, CHUNK);
+            let before = pool.clone();
+
+            // 1. the GPU writes a chunk: it reaches the pool page, and only it
+            let seq = next_seq();
+            gpu_wrote(0x100, 0xAB);
+            landed(&[(at, 0, PAGE)], seq);
+            assert_eq!(&pool[PAGE + 0x100..PAGE + 0x140], &[0xAB; CHUNK], "the GPU's chunk is in the title's page");
+            assert!(pool[..PAGE + 0x100] == before[..PAGE + 0x100] && pool[PAGE + 0x140..] == before[PAGE + 0x140..], "nothing else changed");
+
+            // 2. the CPU's later write must not be clobbered: a copy back is taken, then the CPU
+            // writes a chunk and it goes to the mirror, then the copy lands with the old bytes
+            let seq = next_seq();
+            let stale = mirror(0x200, CHUNK);
+            pool[PAGE + 0x200..PAGE + 0x240].fill(0x11);
+            let mut out = Vec::new();
+            written(&[(p + PAGE + 0x200) & !0xFFF], 0x1000, &mut out);
+            assert_eq!(mirror(0x200, CHUNK), [0x11; CHUNK]);
+            assert_eq!(mirror(0x100, CHUNK), [0xAB; CHUNK], "the copy of the CPU's write leaves the GPU's chunk");
+            std::ptr::copy_nonoverlapping(stale.as_ptr(), (at + 0x200) as *mut u8, CHUNK);
+            landed(&[(at, 0, PAGE)], seq);
+            assert_eq!(&pool[PAGE + 0x200..PAGE + 0x240], &[0x11; CHUNK], "the CPU's later write stays in the title's page");
+            assert_eq!(mirror(0x200, CHUNK), [0x11; CHUNK], "and is in the mirror again");
+
+            // 3. the CPU wrote the source and no submit has looked yet: its bytes stay too
+            let seq = next_seq();
+            pool[PAGE + 0x300..PAGE + 0x340].fill(0x22);
+            gpu_wrote(0x300, 0x77);
+            gpu_wrote(0x400, 0x55);
+            landed(&[(at + 0x300, 0, 0x200)], seq);
+            assert_eq!(&pool[PAGE + 0x300..PAGE + 0x340], &[0x22; CHUNK]);
+            assert_eq!(mirror(0x300, CHUNK), [0x22; CHUNK]);
+            assert_eq!(&pool[PAGE + 0x400..PAGE + 0x440], &[0x55; CHUNK], "the chunk only the GPU wrote goes back");
+
+            // 4. the page is unmapped: nothing is copied back for it any more
+            let r = [[2, 0, 1]];
+            assert!(apply_batches(1, [page_batch(gpu + 2 * PAGE, &r)].as_ptr() as usize, p, 3).is_some());
+            pages_changed(&[(gpu + 2 * PAGE, gpu + 3 * PAGE)]);
+            assert!(!written_ranges().contains(&(at, PAGE)));
+            mirrors::released(cpu);
+            views_changed();
         }
     }
 }

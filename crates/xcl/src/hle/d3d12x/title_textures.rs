@@ -886,6 +886,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
         return;
     }
     recheck_gpu_view_sources();
+    let look = super::gpu_view_buffers::look_begins();
     let watch_t0 = std::time::Instant::now();
     let mut page = 0x1000u32;
     let ranges = cached_watch_ranges(u);
@@ -946,6 +947,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
             super::sparse::before_execute(q, &dirty, page as usize);
             super::vram::before_execute(q);
         });
+        super::gpu_view_buffers::look_done(look);
     }
     if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {
         return;

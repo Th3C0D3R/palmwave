@@ -1107,7 +1107,7 @@ impl State {
         }
         list.Close().ok()?;
         let l: ID3D12CommandList = list.cast().ok()?;
-        Some((CopyBack { buf, parts, _list: (alloc, list) }, l))
+        Some((CopyBack { buf, parts, seq: 0, _list: (alloc, list) }, l))
     }
 
     /// Copy `ranges` (address, bytes) from sparse VRAM back into the CPU view and refresh
@@ -1324,6 +1324,14 @@ pub fn queue() -> Option<ID3D12CommandQueue> {
 /// a later submit can end (`needs_later_submit`: the wait here would never end). The title's
 /// signals on that queue then come after the copy has landed (`title_signal`).
 pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usize, usize)]) {
+    readback_after(queue, ranges, true);
+}
+
+/// `readback_after_execute`; without `wait` the title's call does not wait for the copy to
+/// land (its signals on the queue still come after it): for what only has to be in the CPU's
+/// view by the time the title can know the GPU is done – the buffers in GPU views that shaders
+/// may have written (`gpu_view_buffers`), copied back after every submission.
+pub unsafe fn readback_after(queue: &ID3D12CommandQueue, ranges: &[(usize, usize)], wait: bool) {
     // (not for the copy back's own list, submitted below)
     if ranges.is_empty() || super::title_textures::is_own_work() {
         return;
@@ -1351,9 +1359,11 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
         }
         s.readback_on(queue, &merged)
     };
-    let Some((copy, list)) = copy else { return };
+    let Some((mut copy, list)) = copy else { return };
     // the fence before anything is submitted: from then on what the GPU uses stays alive
     let Some((fence, value)) = order.next(queue) else { return };
+    // (what the CPU writes into a GPU-view buffer from here on is newer than this copy)
+    copy.seq = super::gpu_view_buffers::next_seq();
     // The submit is the title queue's own ExecuteCommandLists, with all XCL does around one
     // (`present::note_execute` → `late_release::drain_known` → `queue()`, a release that comes
     // back to `forget_buffer`): not under the sparse lock, which this thread would then wait
@@ -1367,6 +1377,9 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     let done = std::sync::Arc::new((Mutex::new(false), std::sync::Condvar::new()));
     push_job(Job { queue: q, fence, value, what: What::Land(copy), done: Some(done.clone()) });
     drop(order);
+    if !wait {
+        return;
+    }
     // Waited for here, so the bytes are there when the title's call returns – unless the queue
     // cannot get there before a later submit. (Not for ever either: 5 s, as before.)
     let start = std::time::Instant::now();
@@ -1533,6 +1546,8 @@ struct CopyBack {
     buf: ID3D12Resource,
     /// (address, offset in `buf`, bytes)
     parts: Vec<(usize, usize, usize)>,
+    /// its number among the copies back (`gpu_view_buffers::next_seq`), given when submitted
+    seq: u64,
     /// kept until the GPU is done with them
     _list: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
 }
@@ -1568,6 +1583,9 @@ impl Job {
                         s.copy_back(p as *const u8, &c.parts);
                     }
                     c.buf.Unmap(0, None);
+                    // buffers in GPU views: what the GPU wrote goes on to the title's pages,
+                    // before the title's signals that wait behind this copy
+                    super::gpu_view_buffers::landed(&c.parts, c.seq);
                 }
             }
             What::Signal(fence, value) => {

@@ -1972,25 +1972,29 @@ unsafe fn wait_all_on(queue: *mut c_void, waits: &[PendingWait], list_writes: &[
 /// Copy any GPU memory writes into sparse VRAM windows recorded by `lists` back into their
 /// CPU view after `queue.ExecuteCommandLists` so CPU reads and `Wait32/64BitValueX` see them.
 pub(super) unsafe fn readback_sparse_writes(queue: *mut c_void, lists: &[*mut c_void]) {
-    if SPARSE_WRITE_LISTS.load(Ordering::Acquire) == 0 || queue.is_null() || lists.is_empty() {
+    if queue.is_null() || lists.is_empty() {
         return;
     }
-    let ranges: Vec<(usize, usize)> = {
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    if SPARSE_WRITE_LISTS.load(Ordering::Acquire) != 0 {
         let g = LISTS.lock().unwrap();
-        let Some(m) = g.as_ref() else { return };
-        let mut out = Vec::new();
-        for &l in lists {
-            if let Some(s) = m.get(&(l as usize)) {
-                out.extend_from_slice(&s.sparse_writes);
+        if let Some(m) = g.as_ref() {
+            for &l in lists {
+                if let Some(s) = m.get(&(l as usize)) {
+                    ranges.extend_from_slice(&s.sparse_writes);
+                }
             }
         }
-        out
-    };
+    }
+    // buffers in GPU views that the GPU may write: back to the title's pages (not waited for
+    // here: the title learns that the GPU is done from a signal, which comes after the copy)
+    let wait = !ranges.is_empty();
+    ranges.extend(super::gpu_view_buffers::written_ranges());
     if ranges.is_empty() {
         return;
     }
     if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
-        super::sparse::readback_after_execute(q, &ranges);
+        super::sparse::readback_after(q, &ranges, wait);
     }
 }
 
@@ -2109,6 +2113,15 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
     if size == 0 || !size.is_multiple_of(4) {
         return warn(&N, W, format_args!("size {size:#x} is not a non-zero multiple of 4"));
     }
+    // a destination in a GPU view of the title's CPU memory: where shaders read it, and from
+    // there back to the title's pages after the submission
+    let dst = match super::gpu_view_buffers::address(dst as usize, size as usize, "a CopyMemoryToMemoryX destination") {
+        Some(p) => {
+            super::gpu_view_buffers::mark_written(p, size as usize, "CopyMemoryToMemoryX");
+            p as u64
+        }
+        None => dst,
+    };
     let Some((d, doff)) = real::uma_window_buffer(dst as usize, size as usize) else {
         note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
         return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) is not in unified memory"));
@@ -2983,9 +2996,12 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     // what ran is in the textures' states; the list records anew after its Reset below
     super::title_textures::submitted(&one);
     super::title_textures::list_reset(this as usize);
+    let wait = !sparse_writes.is_empty();
+    let mut sparse_writes = sparse_writes;
+    sparse_writes.extend(super::gpu_view_buffers::written_ranges());
     if !sparse_writes.is_empty() {
         if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&q_raw) {
-            super::sparse::readback_after_execute(q, &sparse_writes);
+            super::sparse::readback_after(q, &sparse_writes, wait);
         }
     }
     super::cpu_writes::after(q_raw, cpu_writes);
