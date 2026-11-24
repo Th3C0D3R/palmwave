@@ -272,10 +272,23 @@ mod used {
 /// at a time, so they send DXC no more compiles at once than there are of them; their big
 /// driver compiles have slots of their own (`real::admit_big`). When a title thread waits for a
 /// pipeline one of them builds, that build goes on at normal priority and without waiting for a
-/// slot (`Pending::title_waits`).
+/// slot (`Pending::title_waits`). How many there are: `preload_threads_from`.
 struct Preload {
     list: Mutex<std::collections::VecDeque<Arc<Pending>>>,
     cv: Condvar,
+    threads: usize,
+}
+
+/// Threads that build ahead: none with `XCL_PSO_PRELOAD=0` (off), else `XCL_PSO_PRELOAD_THREADS`
+/// (0 – 16) or, not set, a quarter of the compile threads, 2 – 4.
+fn preload_threads_from(preload: Option<&str>, threads: Option<&str>) -> usize {
+    if preload.is_some_and(|v| v.trim() == "0") {
+        return 0;
+    }
+    match threads.and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(n) => n.min(16),
+        None => (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4),
+    }
 }
 
 thread_local! {
@@ -299,15 +312,16 @@ fn preload() -> Option<&'static Preload> {
     static STARTED: std::sync::Once = std::sync::Once::new();
     let q = Q
         .get_or_init(|| {
-            if std::env::var("XCL_PSO_PRELOAD").is_ok_and(|v| v.trim() == "0") {
+            let threads = preload_threads_from(std::env::var("XCL_PSO_PRELOAD").ok().as_deref(), std::env::var("XCL_PSO_PRELOAD_THREADS").ok().as_deref());
+            if threads == 0 {
                 return None;
             }
-            Some(Preload { list: Mutex::new(Default::default()), cv: Condvar::new() })
+            Some(Preload { list: Mutex::new(Default::default()), cv: Condvar::new(), threads })
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let n = (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4);
-        for k in 0..n {
+        crate::xlog_info!("D3D12.X: {} threads build the pipelines an earlier run used ahead of their first use (XCL_PSO_PRELOAD_THREADS; XCL_PSO_PRELOAD=0: off)", q.threads);
+        for k in 0..q.threads {
             let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(64 << 20).spawn(move || {
                 use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, OpenThread, SetThreadPriority, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL, THREAD_SET_LIMITED_INFORMATION};
                 // (what a title thread waiting for a pipeline this one builds raises it by; never closed)
@@ -393,6 +407,19 @@ mod used_tests {
         assert!(used::noted(unknown_key) && used::noted(known_key), "a first use is kept for the next run");
         released(known);
         released(unknown);
+    }
+
+    /// `XCL_PSO_PRELOAD` keeps its meaning (0: off, anything else: on); how many threads build
+    /// ahead is `XCL_PSO_PRELOAD_THREADS`'s.
+    #[test]
+    fn xcl_pso_preload_threads_sets_how_many_threads_build_ahead() {
+        assert_eq!(preload_threads_from(Some("0"), Some("3")), 0, "off");
+        assert_eq!(preload_threads_from(None, Some(" 3 ")), 3);
+        assert_eq!(preload_threads_from(Some("1"), Some("99")), 16);
+        assert_eq!(preload_threads_from(None, Some("0")), 0);
+        for (preload, threads) in [(None, None), (Some("1"), None), (Some("graphics"), None), (None, Some("all"))] {
+            assert!((2..=4).contains(&preload_threads_from(preload, threads)), "{preload:?} {threads:?}");
+        }
     }
 
     /// A pipeline built ahead is built at the lowest priority until a title thread waits for it,
