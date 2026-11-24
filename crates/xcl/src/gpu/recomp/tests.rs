@@ -2306,6 +2306,18 @@ fn draw_console_views(
 /// u = v = pixel centre · 2^0.25 / 8 gives LOD 0.25; offset (+1, 0).
 #[test]
 fn gpu_ps_image_sample_offset_implicit_lod_between_mips() {
+    // S#: clamp u / v / w, point min / mag, MIP_FILTER linear (2), LOD 0..15.99, sampler 0
+    implicit_lod_between_mips([2 | 2 << 3 | 2 << 6, 0xFFF << 12, 2 << 26, 0]);
+}
+
+/// The same with an aniso point (2) min / mag filter and a 4× anisotropy ratio: a nearest filter
+/// with anisotropy on (what a driver writes for one), so the texels are the point filter's.
+#[test]
+fn gpu_ps_image_sample_with_an_aniso_point_filter_samples_points() {
+    implicit_lod_between_mips([2 | 2 << 3 | 2 << 6 | 2 << 9, 0xFFF << 12, 2 << 20 | 2 << 22 | 2 << 26, 0]);
+}
+
+fn implicit_lod_between_mips(s_sharp: [u32; 4]) {
     if !gpu_ready() {
         return;
     }
@@ -2346,8 +2358,6 @@ fn gpu_ps_image_sample_offset_implicit_lod_between_mips() {
     };
     srv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 4, ..Default::default() };
     let tex = runner::ViewTexture { res, srv, data, row_bytes: 8 * 16 };
-    // S#: clamp u / v / w, point min / mag, MIP_FILTER linear (2), LOD 0..15.99, sampler 0
-    let s_sharp = [2 | 2 << 3 | 2 << 6, 0xFFF << 12, 2 << 26, 0];
     let mut sgprs = vec![0u32; 32];
     sgprs[16..24].copy_from_slice(&tsharp(0, 77, 9));
     sgprs[24..28].copy_from_slice(&s_sharp);
