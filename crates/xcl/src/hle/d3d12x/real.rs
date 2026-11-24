@@ -1726,6 +1726,7 @@ fn forget_pso(pso: usize) {
         m.remove(&pso);
     }
     super::device_x::forget_base(pso);
+    super::gpu_profile::forget_pipeline(pso);
     // the compute pass goes with the last user of its entry (`Drop for TwoPassPso`)
     let gone = TWO_PASS.lock().unwrap().as_mut().and_then(|m| m.remove(&pso));
     drop(gone);
@@ -3746,6 +3747,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
     }
     note_translated_compute(hr, ppv);
+    super::gpu_profile::note_pipeline(*ppv as usize, || super::gpu_profile::Pipeline { stages: [("CS", crate::gpu::shader::fnv64(cs)), ("", 0), ("", 0)], dxil: dxil.len() });
     crate::xlog_info!(
         "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
         dxil.len(),
@@ -4128,6 +4130,10 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
     TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+    super::gpu_profile::note_pipeline(*ppv as usize, || super::gpu_profile::Pipeline {
+        stages: [("VS", crate::gpu::shader::fnv64(vs)), if ps_hash != 0 { ("PS", ps_hash) } else { ("", 0) }, ("", 0)],
+        dxil: vs_dxil.len() + ps_dxil.as_ref().map_or(0, |p| p.len()),
+    });
     note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
     if super::present::trace_frame() {
         let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
@@ -4692,6 +4698,20 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     hr
 }
 
+/// `XCL_GPU_PROFILE`: the console shaders of a two-pass pipeline being made, by stage (None: the
+/// profiler is off – nothing is hashed).
+fn two_pass_stages(first: (&'static str, &[u8]), second: Option<(&'static str, &[u8])>, ps: Option<&[u8]>) -> Option<[(&'static str, u64); 3]> {
+    let hashed = |s: Option<(&'static str, &[u8])>| s.map_or(("", 0), |(name, bytes)| (name, crate::gpu::shader::fnv64(bytes)));
+    super::gpu_profile::enabled().then(|| [hashed(Some(first)), hashed(second), hashed(ps.map(|p| ("PS", p)))])
+}
+
+/// … noted for the pipeline `finish_two_pass` made (`hr`, `*ppv`), with its bytes of DXIL.
+unsafe fn note_two_pass_stages(hr: HRESULT, ppv: *mut *mut c_void, stages: Option<[(&'static str, u64); 3]>, dxil: usize) {
+    if let (true, Some(stages)) = (hr >= 0 && !ppv.is_null(), stages) {
+        super::gpu_profile::note_pipeline(*ppv as usize, || super::gpu_profile::Pipeline { stages, dxil });
+    }
+}
+
 /// The mesh and amplification shaders of a stream, as XCL translates them: a console MS
 /// container in the AS slot with no MS subobject (a retail game's minimap pipelines) is the
 /// mesh shader it says it is. It used to be refused – translated, the title rendered nothing
@@ -4898,6 +4918,7 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
         }
     }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
+    let stages = two_pass_stages(("MS", ms), None, ps);
     let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps, graphics_wave32(this))) {
         (Ok(tp), Ok(ps)) => (tp, ps),
         (Err(e), _) => {
@@ -4934,12 +4955,16 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
             out.raw(*ty, payload, palign == 8);
         }
     }
-    Some(finish_two_pass(this, &out, tp, rs, "MS", riid, ppv))
+    let dxil = tp.cs.len() + tp.ms.len() + ps.as_ref().map_or(0, |p| p.len());
+    let hr = finish_two_pass(this, &out, tp, rs, "MS", riid, ppv);
+    note_two_pass_stages(hr, ppv, stages, dxil);
+    Some(hr)
 }
 
 /// A graphics PSO with a console VS + GS: the GS pipeline in two passes, as a mesh pipeline
 /// with the description's state.
 unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, vs: &[u8], gs: &[u8], riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let stages = two_pass_stages(("VS", vs), Some(("GS", gs)), shader_bytes(&d.PS));
     let (tp, (ps, ps_samplers)) = match (
         crate::gpu::recomp::pso::console_geometry(vs, gs, shader_bytes(&d.PS), wave32_only(this)),
         two_pass_ps(shader_bytes(&d.PS), graphics_wave32(this)),
@@ -5005,7 +5030,10 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     if d.Flags.0 != 0 {
         out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, &d.Flags);
     }
-    finish_two_pass(this, &out, tp, rs, "GS", riid, ppv)
+    let dxil = tp.cs.len() + tp.ms.len() + ps.as_ref().map_or(0, |p| p.len());
+    let hr = finish_two_pass(this, &out, tp, rs, "GS", riid, ppv);
+    note_two_pass_stages(hr, ppv, stages, dxil);
+    hr
 }
 
 /// A console MS container in the stream's AS subobject and no MS subobject (`mesh_shader_slots`).
@@ -5776,6 +5804,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         f(this, chunk.len() as u32, chunk.as_ptr());
+        super::gpu_profile::executed(this, chunk);
         super::alloc_pool::executed(this, chunk);
         super::list_x::signal_write64_fences(this, chunk);
         super::list_x::readback_sparse_writes(this, chunk);

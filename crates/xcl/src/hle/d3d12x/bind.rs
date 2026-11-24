@@ -17,6 +17,7 @@ use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 
 use super::console_list::{self, Layout, Param};
+use super::gpu_profile::{self, Kind};
 
 #[derive(Default)]
 struct State {
@@ -95,6 +96,7 @@ fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
 /// recording's memory is the previous allocator's until that one is reset, and pipeline
 /// and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
 pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
+    gpu_profile::discard(list);
     let (old, blocks, res_bufs) = with(list, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
@@ -150,6 +152,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
 
 /// The list is gone.
 pub(super) fn forget(list: *mut c_void) {
+    gpu_profile::discard(list);
     if let Some(mut s) = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize))) {
         console_list::hold_until_reset(s.allocator, s.uma);
         if let Some(b) = s.res_buf.take() {
@@ -500,7 +503,10 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
     list.SetComputeRoot32BitConstants(0, 4, consts.as_ptr() as *const c_void, 0);
     list.SetComputeRootShaderResourceView(1, src.GetGPUVirtualAddress() + src_off);
     list.SetComputeRootUnorderedAccessView(2, dst.GetGPUVirtualAddress());
-    list.Dispatch(max.div_ceil(64), 1, 1);
+    {
+        let _timed = gpu_profile::scope(this, Kind::MeshScaleArgs, [max.div_ceil(64), 1, 1], false, || 0);
+        list.Dispatch(max.div_ceil(64), 1, 1);
+    }
     emit_transition(list, &dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
     emit_transition(list, src, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
     let dev_key = dev.as_raw() as usize;
@@ -526,10 +532,17 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
         let run = (|| -> Result<(), String> {
             let (res_buf, res_va) = ensure_res_buffer(this, need)?;
             bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
-            list.Dispatch(groups, 1, 1);
+            {
+                let _timed = gpu_profile::scope(this, Kind::MeshCompute, [groups, 1, 1], false, || pso);
+                list.Dispatch(groups, 1, 1);
+            }
             emit_uav_barrier(list, Some(&res_buf));
             bind_two_pass_stage(this, list, pso, &tp, res_va, false)?;
-            pc_dm(this, groups.saturating_mul(tp.mesh_groups_per_record), 1, 1);
+            {
+                let mesh_groups = groups.saturating_mul(tp.mesh_groups_per_record);
+                let _timed = gpu_profile::scope(this, Kind::MeshDraw, [mesh_groups, 1, 1], false, || pso);
+                pc_dm(this, mesh_groups, 1, 1);
+            }
             emit_uav_barrier(list, Some(&res_buf));
             Ok(())
         })();
@@ -561,6 +574,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
         list.SetGraphicsRootSignature(r);
     }
     count(DRAWS_PC);
+    let _timed = gpu_profile::scope(this, Kind::DispatchMesh, [x, y, z], false, || pso);
     pc_dm(this, x, y, z);
 }
 
@@ -578,14 +592,19 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             let run = (|| -> Result<(), String> {
                 let (res_buf, res_va) = ensure_res_buffer(this, 32 << 20)?;
                 bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
-                pc(this, msig.companion_dispatch, max, args, args_off, count_buf, count_off);
+                {
+                    let _timed = gpu_profile::scope(this, Kind::MeshIndirectCompute, [max, 0, 0], count_buf != 0, || pso);
+                    pc(this, msig.companion_dispatch, max, args, args_off, count_buf, count_off);
+                }
                 emit_uav_barrier(list, Some(&res_buf));
                 if tp.mesh_groups_per_record > 1 && max > 0 && args != 0 {
                     let scaled = make_scaled_args_buffer(this, list, args, args_off, max, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record)?;
                     bind_two_pass_stage(this, list, pso, &tp, res_va, false)?;
+                    let _timed = gpu_profile::scope(this, Kind::MeshIndirectDraw, [max, 0, 0], count_buf != 0, || pso);
                     pc(this, sig, max, scaled.as_raw() as usize, 0, count_buf, count_off);
                 } else {
                     bind_two_pass_stage(this, list, pso, &tp, res_va, false)?;
+                    let _timed = gpu_profile::scope(this, Kind::MeshIndirectDraw, [max, 0, 0], count_buf != 0, || pso);
                     pc(this, sig, max, args, args_off, count_buf, count_off);
                 }
                 emit_uav_barrier(list, Some(&res_buf));
@@ -635,6 +654,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
             list.SetGraphicsRootSignature(r);
         }
+        let _timed = gpu_profile::scope(this, Kind::ExecuteIndirect, [max, 0, 0], count_buf != 0, || pso);
         return pc(this, sig, max, args, args_off, count_buf, count_off);
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
@@ -658,6 +678,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
             count(if gfx { DRAWS } else { DISPATCHES });
+            let _timed = gpu_profile::scope(this, Kind::ExecuteIndirect, [max, 0, 0], count_buf != 0, || pso);
             pc(this, sig, max, args, args_off, count_buf, count_off)
         }
         Err(e) => {
@@ -719,7 +740,10 @@ unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertic
     for (slot, v) in &views {
         list.IASetVertexBuffers(*slot, Some(&[*v]));
     }
-    list.DrawInstanced(rects as u32 * 6, instances, 0, first_instance);
+    {
+        let _timed = gpu_profile::scope(this, Kind::Draw, [rects as u32 * 6, instances, 0], false, || bound_pipeline(this));
+        list.DrawInstanced(rects as u32 * 6, instances, 0, first_instance);
+    }
     for &(slot, _, pc) in &vbs {
         if let Some(v) = pc {
             list.IASetVertexBuffers(slot, Some(&[v]));
@@ -747,6 +771,7 @@ pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices:
             return;
         }
         super::list_x::sync_title_buffers(this, None, first_vertex, vertices, if first_instance != 0 { instances.max(2) } else { instances });
+        let _timed = gpu_profile::scope(this, Kind::Draw, [vertices, instances, 0], false, || bound_pipeline(this));
         list.DrawInstanced(vertices, instances, first_vertex, first_instance);
     }
 }
@@ -785,7 +810,15 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
     base_vertex: i32,
     first_instance: u32,
 ) {
+    let this = list.as_raw();
+    let _timed = gpu_profile::scope(this, Kind::DrawIndexed, [indices, instances, 0], false, || bound_pipeline(this));
     list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
+}
+
+/// The pipeline state a draw on `this` runs with (a stand-in as its real pipeline) – for the
+/// GPU profile.
+fn bound_pipeline(this: *mut c_void) -> usize {
+    super::pso_async::resolve(with(this, |s| s.pso))
 }
 
 /// Before a draw: with a translated pipeline its ABI root signature and the kept graphics
@@ -1240,6 +1273,7 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
         trace_fullscreen(this, pso, [x, y, z]);
     }
     bind_abi(this, list, pso, false)?;
+    let _timed = gpu_profile::scope(this, Kind::Dispatch, [x, y, z], false, || pso);
     list.Dispatch(x, y, z);
     Ok(())
 }

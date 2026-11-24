@@ -2865,6 +2865,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         if !prior.is_empty() {
             execute_with_waits_on(q_raw, prior, |chunk| {
                 exec(q_raw, chunk.len() as u32, chunk.as_ptr());
+                super::gpu_profile::executed(q_raw, chunk);
                 super::alloc_pool::executed(q_raw, chunk);
                 signal_write64_fences(q_raw, chunk);
                 readback_sparse_writes(q_raw, chunk);
@@ -2883,6 +2884,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
 
     let one = [this];
     exec(q_raw, 1, one.as_ptr());
+    super::gpu_profile::executed(q_raw, &one);
     super::alloc_pool::executed(q_raw, &one);
     signal_write64_pairs(q_raw, &write64_signals);
     // what ran is in the textures' states; the list records anew after its Reset below
