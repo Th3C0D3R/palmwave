@@ -1245,11 +1245,17 @@ pub unsafe extern "system" fn XMemMapPhysicalPages(va: *mut c_void, n: usize, ar
 }
 
 /// `BOOL XMemMapPhysicalPagesScatter(void** addresses, SIZE_T count, ULONG64* pages)`: one 64 KiB
-/// page at each address (page 0: the address is unmapped)
+/// page at each address (page 0: the address is unmapped). No page array unmaps every address:
+/// a retail game unmaps that way while it streams its world and stops on its own `int3` when the
+/// call fails.
 pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(addresses: *const *mut c_void, n: usize, pages: *mut u64) -> BOOL {
-    if addresses.is_null() || pages.is_null() {
+    if addresses.is_null() {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return 0;
+    }
+    if pages.is_null() {
+        let mut zeros = vec![0u64; n];
+        return XMemMapPhysicalPagesScatter(addresses, n, zeros.as_mut_ptr());
     }
     if crate::gpu::uma::get().is_none() {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
@@ -2029,6 +2035,34 @@ mod tests {
             assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
             mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
             mem::VirtualFree(r0 as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// `XMemMapPhysicalPagesScatter` with no page array unmaps each address, as page 0 does (a
+    /// retail game unmaps so while it streams; refused, it stopped on its own `int3`).
+    #[test]
+    fn scatter_without_pages_unmaps() {
+        unsafe {
+            let Some(_) = crate::gpu::uma::get() else { return };
+            let mut n = 2;
+            let mut pages = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            let r = mem::VirtualAlloc(std::ptr::null(), 2 * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert!(r != 0);
+            let addrs = [r as *mut c_void, (r + PHYS_PAGE) as *mut c_void];
+            let mut ids = [pages[0] as u64, pages[1] as u64];
+            assert_eq!(XMemMapPhysicalPagesScatter(addrs.as_ptr(), 2, ids.as_mut_ptr()), 1);
+            (r as *mut u32).write_volatile(7);
+            ((r + PHYS_PAGE) as *mut u32).write_volatile(9);
+            assert_eq!(XMemMapPhysicalPagesScatter(addrs.as_ptr(), 2, std::ptr::null_mut()), 1, "no page array: unmapped, not refused");
+            for a in addrs {
+                assert!(!crate::gpu::shader::readable(a as usize, 4), "{a:p} still mapped");
+            }
+            // the pages kept what was written: mapped again, they read it
+            assert_eq!(XMemMapPhysicalPagesScatter(addrs.as_ptr(), 2, ids.as_mut_ptr()), 1);
+            assert_eq!(((r as *const u32).read_volatile(), ((r + PHYS_PAGE) as *const u32).read_volatile()), (7, 9));
+            assert_eq!(XMemMapPhysicalPagesScatter(addrs.as_ptr(), 2, std::ptr::null_mut()), 1);
+            mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
         }
     }
 
