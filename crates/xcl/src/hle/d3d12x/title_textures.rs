@@ -49,8 +49,8 @@ enum Source {
     /// all of them at this address: `va`, or – for a texture in a GPU view of the title's CPU
     /// memory with nothing mapped there – the same offset in the CPU view (`kernelx::mirrors`)
     At(usize),
-    /// a texture in a GPU view whose pages the queue's page-mapping method mapped
-    /// (`kernelx::mirrors::mapped_source`): runs of its bytes, `(offset, length, address)`,
+    /// a texture in a GPU view whose pages have different backing:
+    /// runs of its bytes, `(offset, length, address)`,
     /// read from that address – 0: an unmapped page, zeros
     Pages(Arc<[(usize, usize, usize)]>),
 }
@@ -287,6 +287,18 @@ impl Table {
         (pending_delta, to_unmap)
     }
 
+    /// A view by address explicitly reused a cached resource: its placement is current again.
+    fn reuse_cached(&mut self, res: usize) -> Option<(isize, Vec<usize>)> {
+        let mut e = self.shadowed.remove(&res)?;
+        self.shadowed_by_va.remove(&(e.va, res));
+        e.unmapped = false;
+        if !e.gpu_written {
+            e.pending = true;
+        }
+        let (delta, unmap) = self.insert(res, e);
+        Some((delta, unmap))
+    }
+
     /// Remove `res` on COM release, reactivating any shadowed older textures it uncovered (newest
     /// first). Returns `(was_present, pending_delta, unmapped_res_to_remap)`.
     fn remove(&mut self, res: usize) -> (bool, isize, Vec<usize>) {
@@ -483,6 +495,43 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
     Ok(())
 }
 
+/// A view by address found its cached resource after another placement superseded it. Only
+/// this explicit reuse makes it current again; old descriptors alone do not revive a placement.
+pub(super) unsafe fn reuse_cached(res: usize) {
+    if !TEXTURES.lock().unwrap().shadowed.contains_key(&res) {
+        return;
+    }
+    let _refresh = REFRESH.lock().unwrap();
+    let remap = TEXTURES.lock().unwrap().shadowed.get(&res).map(|e| e.unmapped);
+    let Some(remap) = remap else { return };
+    if remap {
+        let p = res as *mut c_void;
+        let Some(r) = ID3D12Resource::from_raw_borrowed(&p) else { return };
+        // Keep the old placement shadowed if allocation fails: a later cache hit can retry,
+        // and the overlapping texture stays mapped until this one has its replacement tiles.
+        if !super::vram::remap_if_unmapped(r) {
+            return;
+        }
+    }
+    let to_unmap = {
+        let mut t = TEXTURES.lock().unwrap();
+        let Some((delta, unmap)) = t.reuse_cached(res) else { return };
+        adjust_pending(delta);
+        TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
+        clone_resources(&unmap)
+    };
+    for r in &to_unmap {
+        super::vram::unmap_superseded(r);
+    }
+    forget_content(res);
+    TEXTURES_GEN.fetch_add(1, Ordering::Release);
+    static REUSED: AtomicU64 = AtomicU64::new(0);
+    let n = REUSED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: a cached texture reused by a view by address is active again ({n} so far)");
+    }
+}
+
 /// Where a texture at `va` is read from: the CPU view behind a GPU view (`kernelx::mirrors`)
 /// when nothing is mapped at `va` itself, else `va`. A physical page mapped at `va` counts
 /// before its first use too, while it is still reserved memory (`kernelx::physical_page_at`).
@@ -542,26 +591,23 @@ pub(super) unsafe fn copy_gpu_view(va: usize, dst: *mut u8, len: usize) -> bool 
     true
 }
 
-/// Where the `len` bytes of a texture at `va` are read from: page by page when the queue's
-/// page-mapping method mapped any of its pages (a retail title's streamed textures: each page
-/// shows a physical page, kept where the title mapped it last – often not the CPU view's same
-/// offset), else `mirror_source`. A page the method never mapped reads `mirror_source`; the
-/// method's mapping goes before a physical page mapped at the GPU-view address itself.
+/// Where the `len` bytes of a texture at `va` are read from: GPU views choose each page's
+/// backing separately. The queue's page-mapping method goes before a direct physical mapping
+/// at the GPU-view address, then the CPU view supplies pages with neither mapping.
 fn source_of(va: usize, len: usize) -> Source {
-    use crate::hle::kernelx::mirrors::{self, mapped_source, PAGE};
-    let end = va.saturating_add(len);
-    if mirrors::source(va).is_none() || !(va & !(PAGE - 1)..end).step_by(PAGE).any(|p| mapped_source(p).is_some()) {
+    if crate::hle::kernelx::mirrors::source(va).is_none() {
+        return Source::At(va);
+    }
+    if len == 0 {
         return Source::At(mirror_source(va));
     }
+    let end = va.saturating_add(len);
     let mut runs: Vec<(usize, usize, usize)> = Vec::new();
     let mut at = va;
     while at < end {
-        let n = (PAGE - (at & (PAGE - 1))).min(end - at);
-        let from = match mapped_source(at) {
-            Some(Some(a)) => a,
-            Some(None) => 0,
-            None => mirror_source(at),
-        };
+        let cpu = crate::hle::kernelx::mirrors::source(at).unwrap_or(at);
+        let (from, span) = gpu_view_span(at, cpu);
+        let n = span.min(end - at);
         match runs.last_mut() {
             Some((_, len, a)) if (*a == 0 && from == 0) || (*a != 0 && from == *a + *len) => *len += n,
             _ => runs.push((at - va, n, from)),
@@ -1969,6 +2015,60 @@ mod tests {
         assert_eq!(source_of(gpu + 2 * PAGE, PAGE), Source::At(gpu + 2 * PAGE), "the view is gone");
     }
 
+    /// Direct physical mappings may cover only part of a texture in a GPU view. Each page
+    /// chooses its own backing even when CopyPageMappingsBatchX never mapped the texture.
+    #[test]
+    fn a_partly_physical_gpu_view_texture_reads_each_pages_backing() {
+        use crate::hle::kernelx;
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const PAGE: usize = kernelx::PHYS_PAGE_SIZE;
+        const VIEW: usize = 0x129 * PAGE;
+        if crate::gpu::uma::get().is_none() {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        struct Reservation(usize);
+        impl Drop for Reservation {
+            fn drop(&mut self) {
+                kernelx::mirrors::released(self.0);
+                unsafe { VirtualFree(self.0 as *mut c_void, 0, MEM_RELEASE); }
+            }
+        }
+        struct PhysicalPage { id: usize, at: usize }
+        impl Drop for PhysicalPage {
+            fn drop(&mut self) {
+                unsafe {
+                    kernelx::MapTitlePhysicalPages(self.at as *mut c_void, 1, 0, 4, std::ptr::null_mut());
+                    kernelx::FreeTitlePhysicalPages(std::ptr::null_mut(), 1, &mut self.id);
+                }
+            }
+        }
+        unsafe {
+            let cpu = Reservation(VirtualAlloc(std::ptr::null(), VIEW, MEM_RESERVE, PAGE_READWRITE) as usize);
+            let gpu = Reservation(VirtualAlloc(std::ptr::null(), VIEW + PAGE, MEM_RESERVE, PAGE_READWRITE) as usize);
+            assert_ne!(cpu.0, 0);
+            assert_ne!(gpu.0, 0);
+            assert_eq!(VirtualAlloc(cpu.0 as *const c_void, 3 * PAGE, MEM_COMMIT, PAGE_READWRITE) as usize, cpu.0);
+            std::ptr::write_bytes(cpu.0 as *mut u8, 0x31, 3 * PAGE);
+            kernelx::mirrors::reserved(cpu.0, VIEW, 0x2040_2000, PAGE_READWRITE);
+            kernelx::mirrors::reserved(gpu.0, VIEW, 0x2040_2000, 0x801);
+            let (mut count, mut id) = (1usize, 0usize);
+            assert_eq!(kernelx::AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, &mut id), 1);
+            let mut physical = PhysicalPage { id, at: gpu.0 + PAGE };
+            assert_eq!(kernelx::MapTitlePhysicalPages(physical.at as *mut c_void, 1, 0, 4, &mut physical.id) as usize, physical.at);
+            let src = source_of(gpu.0, 3 * PAGE);
+            assert_eq!(src, Source::Pages(vec![(0, PAGE, cpu.0), (PAGE, PAGE, physical.at), (2 * PAGE, PAGE, cpu.0 + 2 * PAGE)].into()), "a lazy physical page overrides only its own CPU-view page");
+            assert!(kernelx::write_physical_pages(&[id], 0, &vec![0x72; PAGE]), "the DirectStorage write primitive");
+            let bytes = source_of(gpu.0 + 0x100, 3 * PAGE - 0x200).with_bytes(0, 3 * PAGE - 0x200, |b| b.to_vec());
+            assert!(bytes[..PAGE - 0x100].iter().all(|&b| b == 0x31));
+            assert!(bytes[PAGE - 0x100..2 * PAGE - 0x100].iter().all(|&b| b == 0x72));
+            assert!(bytes[2 * PAGE - 0x100..].iter().all(|&b| b == 0x31));
+            assert!(src.written(3 * PAGE, &[physical.at], 0x1000), "writes to the physical backing are watched");
+            assert!(!src.written(3 * PAGE, &[cpu.0 + PAGE], 0x1000), "the hidden CPU-view page is not a source");
+            assert_eq!(source_of(gpu.0 + VIEW - PAGE, 2 * PAGE), Source::Pages(vec![(0, PAGE, cpu.0 + VIEW - PAGE), (PAGE, PAGE, gpu.0 + VIEW)].into()), "the CPU mirror ends at its registered reservation");
+        }
+    }
+
     /// A physical page mapped into a GPU view but not used yet (reserved until its first
     /// access, `kernelx::lazy`) is that address's own source, not the CPU view behind it.
     /// (Test by Kalmarv, review of PR #283.)
@@ -2288,6 +2388,99 @@ mod tests {
         assert!(tbl.by_res.contains_key(&10) && tbl.by_res.contains_key(&11));
         assert_eq!(tbl.insert(12, entry(0x20_0000, &tex_64k, true, false)), (-1, vec![]));
         assert!(!tbl.by_res.contains_key(&10) && !tbl.by_res.contains_key(&11) && tbl.by_res.contains_key(&12));
+    }
+
+    #[test]
+    fn a_cached_placement_reused_after_an_overlap_becomes_current() {
+        let small = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 28, 0x105)).unwrap());
+        let large = Arc::new(xg::Texture::new(&console_desc(3, 128, 128, 1, 1, 28, 0x105)).unwrap());
+        let entry = |tex| Entry {
+            device: 0, va: 0x30_0000, src: Source::At(0x30_0000), in_gpu_view: false,
+            tex, states: vec![D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE], pending: false,
+            gpu_written: false, placed: true, unmapped: false, seq: 0,
+        };
+        let mut table = Table::new();
+        table.insert(1, entry(small));
+        assert_eq!(table.reuse_cached(1), None, "a current cache hit needs no upload");
+        assert_eq!(table.insert(2, entry(large)), (0, vec![1]));
+        assert!(table.shadowed[&1].unmapped);
+        assert_eq!(table.reuse_cached(1), Some((1, vec![2])));
+        assert!(table.by_res[&1].pending);
+        assert!(!table.by_res[&1].unmapped);
+        assert_eq!(table.by_res[&1].states, vec![D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE]);
+        assert!(table.shadowed[&2].unmapped);
+        assert_eq!(table.overlapping(0x30_0000, 0x1_0000), vec![(1, 0x30_0000)]);
+        assert_eq!(table.reuse_cached(1), None, "repeated views preserve the pending upload");
+    }
+
+    #[test]
+    fn a_reused_cached_texture_is_remapped_and_uploaded_again() {
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap();
+        if super::super::backend() != super::super::Backend::Real {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        unsafe {
+            let raw_device = super::super::real::device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw_device).unwrap();
+            let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut opts as *mut _ as *mut c_void, std::mem::size_of_val(&opts) as u32).is_err()
+                || opts.ResourceHeapTier.0 < 2 || opts.TiledResourcesTier.0 < D3D12_TILED_RESOURCES_TIER_2.0
+            {
+                crate::gpu::recomp::runner::skip_test("no tiled resources tier 2");
+                return;
+            }
+            let Some(uma) = crate::gpu::uma::get() else {
+                crate::gpu::recomp::runner::skip_test("no UMA");
+                return;
+            };
+            let Some(base) = uma.alloc(0x1_0000, 0x1_0000).map(|p| p as usize) else {
+                crate::gpu::recomp::runner::skip_test("no UMA allocation");
+                return;
+            };
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let place = |width| {
+                let desc = console_desc(3, width, width as u32, 1, 1, 61, 0x105);
+                let raw = super::super::real::resource_at(raw_device, desc.as_ptr(), base as u64);
+                assert!(!raw.is_null(), "the view's resource must be made");
+                // The cache owns its creation reference; the test holds a separate one.
+                ID3D12Resource::from_raw_borrowed(&raw).unwrap().clone()
+            };
+            std::ptr::write_bytes(base as *mut u8, 0x39, 0x1_0000);
+            let first = place(64);
+            assert!(super::super::vram::is_placed_texture(first.as_raw() as usize));
+            refresh(queue.as_raw());
+            assert_eq!(read_r8(dev, &queue, &first), vec![0x39; 64 * 64]);
+            let overlap = place(128);
+            std::ptr::write_bytes(base as *mut u8, 0x65, 0x1_0000);
+            refresh(queue.as_raw());
+            let key = first.as_raw() as usize;
+            assert!(TEXTURES.lock().unwrap().shadowed[&key].unmapped);
+            // The first texture's memory hashes as at its old upload, but its tiles were lost.
+            std::ptr::write_bytes(base as *mut u8, 0x39, 0x1_0000);
+            let reused = place(64);
+            assert_eq!(reused.as_raw(), first.as_raw(), "the view reuses the cached resource");
+            refresh(queue.as_raw());
+            assert_eq!(read_r8(dev, &queue, &first), vec![0x39; 64 * 64], "the cache hit revives and fills its tiles");
+            std::ptr::write_bytes(base as *mut u8, 0x9C, 0x1_0000);
+            refresh(queue.as_raw());
+            assert_eq!(read_r8(dev, &queue, &first), vec![0x9C; 64 * 64], "later CPU writes still reach the reused texture");
+            for width in [64, 128] {
+                super::super::real::forget_resource_at(&console_desc(3, width, width as u32, 1, 1, 61, 0x105), base as u64);
+            }
+            forget(overlap.as_raw() as usize);
+            forget(key);
+            super::super::vram::forget(overlap.as_raw() as usize);
+            // Do not leave an idle tile at an address the next test's UMA allocation can reuse.
+            super::super::vram::unmap_superseded(&first);
+            super::super::vram::forget(key);
+            ON_QUEUE.lock().unwrap().remove(&(queue.as_raw() as usize));
+            drop(reused);
+            drop(overlap);
+            drop(first);
+            uma.free(base);
+        }
     }
 
     /// Real GPU (#248): placed title textures share `vram::Pages` so streaming unreleased

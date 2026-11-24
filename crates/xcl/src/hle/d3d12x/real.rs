@@ -2216,18 +2216,22 @@ fn cube_as_cube_array(v: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> Option<D3D12_SHADE
     })
 }
 
+type AddressResourceKey = (u64, [u8; 0x38]);
+// The cache owns the reference returned by CreatePlacedResourceX.
+static ADDRESS_RESOURCES: Mutex<Option<HashMap<AddressResourceKey, usize>>> = Mutex::new(None);
+
 /// The texture a view by address describes: `desc` (a resource desc) placed at `va`, made once
 /// per address and desc – titles make views of the same memory again and again.
-unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_void {
-    type Key = (u64, [u8; 0x38]);
-    static MADE: Mutex<Option<HashMap<Key, usize>>> = Mutex::new(None);
+pub(super) unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_void {
     if desc.is_null() || va == 0 || !crate::gpu::shader::readable(desc as usize, 0x38) {
         return std::ptr::null_mut();
     }
     // the PC part of the desc; the flags (@0x30) are its last dword, padding follows
     let mut x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
     x[0x34..].fill(0);
-    if let Some(&r) = MADE.lock().unwrap().get_or_insert_with(HashMap::new).get(&(va, x)) {
+    let cached = ADDRESS_RESOURCES.lock().unwrap().get_or_insert_with(HashMap::new).get(&(va, x)).copied();
+    if let Some(r) = cached {
+        super::title_textures::reuse_cached(r);
         return r as *mut c_void;
     }
     let mut r = std::ptr::null_mut();
@@ -2239,8 +2243,18 @@ unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_voi
         }
         r = std::ptr::null_mut();
     }
-    MADE.lock().unwrap().get_or_insert_with(HashMap::new).insert((va, x), r as usize);
+    ADDRESS_RESOURCES.lock().unwrap().get_or_insert_with(HashMap::new).insert((va, x), r as usize);
     r
+}
+
+#[cfg(test)]
+pub(super) unsafe fn forget_resource_at(desc: &[u8; 0x38], va: u64) {
+    let mut x = *desc;
+    x[0x34..].fill(0);
+    let removed = ADDRESS_RESOURCES.lock().unwrap().as_mut().and_then(|m| m.remove(&(va, x)));
+    if let Some(r) = removed.filter(|&r| r != 0) {
+        drop(ID3D12Resource::from_raw(r as *mut c_void));
+    }
 }
 
 /// device #70 (a retail game): a shader resource view of memory, without a resource object:
