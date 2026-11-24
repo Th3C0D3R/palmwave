@@ -648,6 +648,23 @@ pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<
     rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?
 }
 
+/// The optimisation arguments a source of `len` bytes gets (none when `extra` has its own
+/// `-O`; see `compile_here`). At -O0 DXC keeps every source statement visible to a debugger
+/// with a no-op (`load @dx.nothing.a`): 787 000 of the 2.7 million instructions of a retail
+/// CS of 88 863 instructions. `-opt-disable debug-nops` leaves them out, and what they kept
+/// alive: that program's DXIL 15.3 → 10.8 MB, another's 7.1 → 5.5, in the same DXC time.
+fn size_args(len: usize, extra: &[&str]) -> &'static [&'static str] {
+    if extra.iter().any(|a| a.starts_with("-O")) {
+        &[]
+    } else if len > 8 * 1024 * 1024 {
+        &["-O0", "-opt-disable", "debug-nops"]
+    } else if len > 1024 * 1024 {
+        &["-O1"]
+    } else {
+        &[]
+    }
+}
+
 fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let c = compiler()?;
     let mut args: Vec<Vec<u16>> = ["-E", entry, "-T", profile, "-HV", "2021"].iter().map(|a| crate::util::wide(a)).collect();
@@ -658,13 +675,7 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
     // compile). -O0 only as a safety net for enormous sources.
     // -O1 from 1 MB on: the same DXIL size at a quarter less time (a retail game's 4.8 MB HLSL of
     // a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3; -O0 10.6 s, but twice the DXIL)
-    if !extra.iter().any(|a| a.starts_with("-O")) {
-        if src.len() > 8 * 1024 * 1024 {
-            args.push(crate::util::wide("-O0"));
-        } else if src.len() > 1024 * 1024 {
-            args.push(crate::util::wide("-O1"));
-        }
-    }
+    args.extend(size_args(src.len(), extra).iter().map(|a| crate::util::wide(a)));
     args.extend(extra.iter().map(|a| crate::util::wide(a)));
     let ptrs: Vec<PCWSTR> = args.iter().map(|a| PCWSTR(a.as_ptr())).collect();
     let buf = DxcBuffer { Ptr: src.as_ptr() as *const c_void, Size: src.len(), Encoding: DXC_CP_UTF8.0 };
@@ -684,6 +695,40 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
         }
         let blob: IDxcBlob = r.GetResult().map_err(|e| format!("{e}"))?;
         Ok(std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec())
+    }
+}
+
+#[cfg(test)]
+mod size_args_tests {
+    use super::*;
+
+    #[test]
+    fn enormous_sources_get_o0_without_debug_nops() {
+        assert_eq!(size_args(200 << 10, &[]), &[] as &[&str]);
+        assert_eq!(size_args((1 << 20) + 1, &[]), &["-O1"]);
+        assert_eq!(size_args(8 << 20, &[]), &["-O1"]);
+        assert_eq!(size_args((8 << 20) + 1, &[]), &["-O0", "-opt-disable", "debug-nops"]);
+        // the caller's own level stands
+        assert_eq!(size_args(30 << 20, &["-O3"]), &[] as &[&str]);
+    }
+
+    /// The loaded DXC takes the arguments, and its -O0 DXIL is smaller without the no-ops.
+    #[test]
+    fn o0_without_debug_nops_compiles_to_less_dxil() {
+        if location().is_err() {
+            crate::gpu::recomp::runner::skip_test("no DXC");
+            return;
+        }
+        let mut src = String::from("RWByteAddressBuffer io : register(u0);\n[numthreads(1, 1, 1)]\nvoid main()\n{\n    uint a = io.Load(0u);\n    uint b = io.Load(4u);\n");
+        for i in 0..64 {
+            src.push_str(&format!("    uint t{i} = a * {}u + b;\n    a = t{i} ^ (b >> 3u);\n    b = b + a;\n", i + 3));
+        }
+        src.push_str("    io.Store(8u, a ^ b);\n}\n");
+        let plain = compile(&src, "main", "cs_6_6", &["-O0"]).unwrap();
+        let args = size_args((8 << 20) + 1, &[]);
+        // `extra` with an -O of its own: exactly these arguments
+        let lean = compile(&src, "main", "cs_6_6", args).unwrap();
+        assert!(lean.len() < plain.len(), "{} bytes without the no-ops, {} with", lean.len(), plain.len());
     }
 }
 
