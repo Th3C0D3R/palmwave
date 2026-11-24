@@ -1316,6 +1316,13 @@ pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u3
     super::bind::dispatch(this, x, y, z);
 }
 
+/// command list #99 (#101 on the newer layout), name not known: a retail game calls it as
+/// (list, u32, u32) in pairs around its batched clears and does not read what it returns.
+/// Nothing to do on the PC list (S_OK, as the stub it was answered).
+pub(super) unsafe extern "system" fn clear_batch_marker_x(_this: *mut c_void, _a: u32, _b: u32) -> i32 {
+    0
+}
+
 /// command list #146 console compute/UAV barrier (used by `XboxBvhBuilder.dll` between BVH
 /// build passes): emits a global UAV barrier so UMA writes become visible to the next pass
 pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _barriers: *const c_void) {
