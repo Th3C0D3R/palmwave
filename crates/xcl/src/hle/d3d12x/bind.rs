@@ -229,6 +229,15 @@ pub(super) fn note_root_changing_signature(sig: usize) {
     ROOT_SIGNATURES.lock().unwrap().get_or_insert_with(Default::default).insert(sig);
 }
 
+/// Whether an ExecuteIndirect is skipped: `standin`, the pipeline its list has bound, came back
+/// from `resolve_for_draw` as `pso`, which is not a translated pipeline. Skipped while the
+/// stand-in's pipeline is still being built – and when the build ended between the two looks
+/// (`pso` is still the stand-in then, not what `resolve` gives now). A stand-in whose build
+/// failed and a pipeline of the PC's own are not.
+fn standin_indirect_skipped(standin: usize, pso: usize) -> bool {
+    super::pso_async::is_pending(standin) || super::pso_async::resolve(standin) != pso
+}
+
 /// #59 ExecuteIndirect(signature, max count, arguments, offset, count buffer, offset): with a
 /// translated pipeline, on XCL's ABI with the kept root arguments (signatures that change root
 /// arguments themselves cannot be – skipped, logged)
@@ -239,8 +248,21 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     if !gfx && !compute {
-        // a PC pipeline (also a stand-in whose build is not done within the limit or failed):
-        // the title's root signature first, as in `graphics_bound` (nothing else binds it)
+        // A pipeline still being built: its stand-in draws nothing, and the list may hold XCL's
+        // ABI root signature from a translated draw or dispatch before it – the PC call with
+        // that pair is invalid (debug layer 953, "the currently set Root Signature doesn't
+        // match the currently set Pipeline State Object"; a retail title's world then hung the
+        // GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
+        if standin_indirect_skipped(with(this, |s| s.pso), pso) {
+            count(DRAWS_SKIPPED);
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_warn!("D3D12.X: ExecuteIndirect with a pipeline that is still being built skipped");
+            }
+            return;
+        }
+        // a PC pipeline (also a stand-in whose build failed): the title's root signature
+        // first, as in `graphics_bound` (nothing else binds it)
         let rs = with(this, |s| s.rs_gfx) as *mut c_void;
         if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
             list.SetGraphicsRootSignature(r);
@@ -932,6 +954,33 @@ mod tests {
         assert!(cpu_rect_expansion(without) && cpu_rect_expansion(0));
         real::forget_pso_for_test(with_gs);
         assert!(cpu_rect_expansion(with_gs));
+    }
+
+    /// An ExecuteIndirect whose bound pipeline is still being built is skipped (its stand-in
+    /// with XCL's ABI root signature on the list is the debug layer's 953 and a hung GPU), also
+    /// when the build ends just after the call looked; a failed one and a PC pipeline go to
+    /// the PC call. The gate `execute_indirect` uses.
+    #[test]
+    fn execute_indirect_with_a_pipeline_still_building_is_skipped() {
+        let (building, built, failed, pc) = (0x7E57_6001usize, 0x7E57_6002usize, 0x7E57_6003usize, 0x7E57_6004usize);
+        // a lazy submit: no worker starts it, so it stays pending under the test's control
+        pso_async::submit_lazy(building, false, Box::new(|| 0x1234));
+        pso_async::submit_lazy(built, false, Box::new(|| 0x1235));
+        pso_async::submit_lazy(failed, false, Box::new(|| 0));
+        assert!(pso_async::is_pending(building));
+        assert!(standin_indirect_skipped(building, building), "still being built: skipped");
+        assert!(pso_async::is_pending(building), "the gate did not wait for it");
+        // the call saw the stand-in, then the build ended: the stand-in must not reach the PC call
+        assert_eq!(pso_async::resolve_wait(built), 0x1235);
+        assert!(standin_indirect_skipped(built, built));
+        assert!(!standin_indirect_skipped(built, 0x1235), "built in time: the real pipeline's call");
+        assert_eq!(pso_async::resolve_wait(failed), failed);
+        assert!(!standin_indirect_skipped(failed, failed), "a failed build: the PC call, as before");
+        assert!(!standin_indirect_skipped(pc, pc), "a PC pipeline");
+        for p in [building, built, failed] {
+            let _ = pso_async::released(p);
+        }
+        assert!(!pso_async::is_pending(building));
     }
 
     /// Minimal RTS0 v2 root signature blob with one 4-constant parameter.
