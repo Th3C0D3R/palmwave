@@ -24,6 +24,7 @@ mod frame_census;
 mod gpu_profile;
 pub mod guard;
 mod late_release;
+mod mesh_dump;
 pub mod layout;
 pub mod list_x;
 pub mod null;

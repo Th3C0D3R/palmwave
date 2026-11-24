@@ -310,7 +310,7 @@ unsafe fn emit_uav_barrier(list: &ID3D12GraphicsCommandList, res: Option<&ID3D12
     std::mem::ManuallyDrop::drop(&mut (*b.Anonymous.UAV).pResource);
 }
 
-unsafe fn emit_transition(list: &ID3D12GraphicsCommandList, res: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) {
+pub(super) unsafe fn emit_transition(list: &ID3D12GraphicsCommandList, res: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) {
     let mut b = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -386,7 +386,7 @@ unsafe fn bind_two_pass_stage(
     tp: &super::real::TwoPassPso,
     res_va: u64,
     compute_pass: bool,
-) -> Result<(), String> {
+) -> Result<Vec<u32>, String> {
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let windows = super::real::uma_window_vas();
     let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
@@ -435,7 +435,7 @@ unsafe fn bind_two_pass_stage(
         let pc = ID3D12PipelineState::from_raw_borrowed(&pso_raw).ok_or("two-pass mesh pipeline")?;
         list.SetPipelineState(pc);
     }
-    Ok(())
+    Ok(io)
 }
 
 unsafe fn scale_indirect_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
@@ -551,12 +551,16 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
         let need = (groups as u64).saturating_mul(tp.record.record_dwords() as u64).saturating_mul(4);
         let run = (|| -> Result<(), String> {
             let (res_buf, res_va) = ensure_res_buffer(this, need)?;
-            bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
+            let io = bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
             {
                 let _timed = gpu_profile::scope(this, Kind::MeshCompute, [groups, 1, 1], false, || pso);
                 list.Dispatch(groups, 1, 1);
             }
             emit_uav_barrier(list, Some(&res_buf));
+            if super::mesh_dump::due() {
+                let what = format!("DispatchMesh({x}, {y}, {z}), pipeline {pso:#x} ({}), {} mesh group(s) a record", tp.kind, tp.mesh_groups_per_record);
+                super::mesh_dump::capture(this, list, &res_buf, &tp.record, what, &io, None);
+            }
             bind_two_pass_stage(this, list, pso, &tp, res_va, false)?;
             {
                 let mesh_groups = groups.saturating_mul(tp.mesh_groups_per_record);
@@ -616,12 +620,16 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
             let run = (|| -> Result<(), String> {
                 let (res_buf, res_va) = ensure_res_buffer(this, 32 << 20)?;
-                bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
+                let io = bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
                 {
                     let _timed = gpu_profile::scope(this, Kind::MeshIndirectCompute, [max, 0, 0], count_buf != 0, || pso);
                     pc(this, msig.companion_dispatch, max, args, args_off, count_buf, count_off);
                 }
                 emit_uav_barrier(list, Some(&res_buf));
+                if super::mesh_dump::due() {
+                    let what = format!("ExecuteIndirect(DispatchMesh, {max} at most{}), pipeline {pso:#x} ({}), {} mesh group(s) a record", if count_buf != 0 { ", count buffer" } else { "" }, tp.kind, tp.mesh_groups_per_record);
+                    super::mesh_dump::capture(this, list, &res_buf, &tp.record, what, &io, (args != 0).then_some((args, args_off + msig.mesh_offset as u64)));
+                }
                 if tp.mesh_groups_per_record > 1 && max > 0 && args != 0 {
                     let scaled = make_scaled_args_buffer(this, list, args, args_off, max, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record)?;
                     bind_two_pass_stage(this, list, pso, &tp, res_va, false)?;
