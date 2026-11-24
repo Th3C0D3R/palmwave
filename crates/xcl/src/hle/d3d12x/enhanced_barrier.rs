@@ -499,6 +499,12 @@ pub unsafe fn record(list: *mut c_void, resource_barrier: ResourceBarrierFn, lis
         }
     }
     if !t.barriers.is_empty() {
+        // `XCL_RT_DUMP` copies each target from the state the title left it in
+        if super::rt_dump::enabled() {
+            for b in t.barriers.iter().filter(|b| b[0] == LEGACY_TRANSITION) {
+                super::rt_dump::note_transition(list as usize, (b[2] as u64 | (b[3] as u64) << 32) as usize, b[4], D3D12_RESOURCE_STATES(b[5] as i32), D3D12_RESOURCE_STATES(b[6] as i32), false);
+            }
+        }
         if super::title_textures::any() {
             let tt: Vec<(usize, u32, D3D12_RESOURCE_STATES)> = t
                 .barriers
