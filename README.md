@@ -16,7 +16,28 @@ Palmwave is an Xbox Series X|S compatibility project from **Moon AI**, the AI pl
 
 ## Compatibility
 
-At the pinned revision, XCL reports playable worlds in **Minecraft Preview** and playable **Unicorn Overlord**. For another Xbox Series executable, its maintainers report reaching the settings menu. Gameplay beyond those menus remains unverified. This migration did not include a Palmwave game run on the RTX 5080. [Upstream compatibility table](https://github.com/ivall/xcl/blob/db1ddb25f3ff0c1686eed8200d238ad35f895926/README.md#games)
+At the pinned revision, XCL reports playable worlds in **Minecraft Preview** and playable **Unicorn Overlord**. For another Xbox Series executable, its maintainers report reaching the settings menu. Gameplay beyond those menus remains unverified. Palmwave's own runs on an RTX 5080 are below. [Upstream compatibility table](https://github.com/ivall/xcl/blob/db1ddb25f3ff0c1686eed8200d238ad35f895926/README.md#games)
+
+### A retail Xbox Series game: it starts, not playable yet
+
+Measured with Palmwave `00a7ca7` (the runtime code of the pinned XCL revision) on an RTX 5080 (driver 621.14), a Ryzen 9 9950X3D and 61 GB of RAM: offline, no input, two 180 s runs (with a measurement-only patch) and one 300 s run.
+
+| Time | What happens |
+|---|---|
+| 0–4 s | The title boots and presents its own frames after about 4 s. |
+| 5–30 s | Its first screens, at up to 30 fps. |
+| 30–160 s | About 3 fps (6 or 7 frames every 2 s, 6 draws a frame). Upstream testers report the intro video here. |
+| from 160 s | The world loads: about 23,000 more pipeline creations and DirectStorage reads. In the 300 s run the title showed almost no frame after 200 s (0 to 3 every 2 s), while local video memory rose from 6.8 GB to 22.5 GB and process commit from 16 GB to 42 GB. Longer runs crash in this phase. |
+
+What still separates it from playable, most urgent first:
+
+1. **World streaming memory.** Every texture the title places gets its own PC copy that is never released, so memory grows until the crash ([upstream issue #248](https://github.com/ivall/xcl/issues/248)). Upstream fixed it in [PR #288](https://github.com/ivall/xcl/pull/288); Palmwave does not have that fix yet.
+2. **BCPack textures.** DirectStorage requests in some BCPack modes fail with `E_DECOMPRESSION`.
+3. **Mesh pipelines.** 25,479 pipeline creations per run put the console's mesh shader in the amplification-shader slot and are refused, so whatever the title draws with them is missing.
+4. **Frame rate.** The cause of the 3 fps phase is not known yet. It is not shader compilation: no pipeline is built during it.
+5. **Sound.** The title decodes its sound through the console's Opus decoder. Upstream reports the game silent without [PR #294](https://github.com/ivall/xcl/pull/294), which Palmwave does not have yet.
+
+Shader compilation does not block the start. The title creates 58,759 pipelines in 180 s and uses 12 or 13 of them, which are built at first use. On a second launch the DXIL cache cuts that build time from 2.9 s to 0.2 s. The window title's "pipelines queued" counts the pipelines that were created and never used.
 
 On a GPU with 32-lane waves, including the RTX 5080, the recompiler implements wave64 compute and mesh operations with two cooperating halves. Vertex and pixel shaders that read lanes 32–63 still have accuracy limits. [Wave64 implementation notes](docs/wave64-on-wave32.md)
 
