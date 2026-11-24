@@ -46,7 +46,7 @@ Road to a playable 30 fps, most urgent first:
 1. **GPU time of a world frame.**
    - The title's 4.4 GB of GPU heaps are in host memory, which the GPU reads across PCIe. One of its world compute passes takes 431 ms there, against 0.45 ms with the same memory in video memory.
    - `XCL_HEAPS_VRAM_MB=64` moves the heaps of 64 MB or more to video memory, but the title then needs about 20 GB of the 16 GB card.
-   - With that switch, the heap memory under the title's render targets takes no video memory of its own (`XCL_SPARSE_UNDER_TARGETS=0` turns this off, `=1` turns it on without the switch). What it saves on the title is not measured yet.
+   - With that switch, the heap memory under the title's render targets takes no video memory of its own (`XCL_SPARSE_UNDER_TARGETS=0` turns this off, `=1` turns it on without the switch). Its sampled textures of 32 KiB or less are packed in heaps of their own instead of taking a 64 KiB page each (`XCL_SMALL_TEXTURE_HEAPS`, same values). What the two save on the title is not measured yet.
    - GPU waits between the title's queues complete only when `XCL_GPU_WAIT_WATCHDOG_MS` releases them.
    - When GPU work runs too long, Windows resets the GPU and the title stops on "device removed".
 2. **Nothing of the world is visible.** The world's geometry is drawn with mesh shaders. Through XCL's two-pass mesh path, its depth buffer receives thin "needle" triangles, as if correct vertices were joined by wrong indices; with `XCL_MESH=0` it stays empty. Its colour targets keep their cleared values (`XCL_RT_DUMP=1` writes them as images).

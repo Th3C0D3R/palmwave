@@ -118,6 +118,10 @@ pub(super) fn is_placed_texture(resource: usize) -> bool {
 }
 
 pub(super) fn forget(resource: usize) {
+    if let Some(id) = SMALL_OF.lock().unwrap().as_mut().and_then(|m| m.remove(&resource)) {
+        SMALL.lock().unwrap().release(id, std::time::Instant::now());
+        return;
+    }
     let placed = PLACED_TEXTURES.lock().unwrap().as_mut().is_some_and(|textures| textures.remove(&resource));
     if placed {
         super::sparse::target_gone(resource);
@@ -155,6 +159,202 @@ unsafe fn arena_heap(dev: &ID3D12Device, va: usize, size: usize, align: usize) -
         crate::xlog_info!("D3D12.X: video-memory arena #{n} for title addresses {va:#x}..{:#x} ({made} bytes of arenas made so far)", va + size);
     }
     heap
+}
+
+/// bytes of a heap of small textures (`SmallHeaps`)
+const SMALL_HEAP: usize = 16 << 20;
+/// bytes of a slot of one: the alignment the PC allows a small texture
+const SMALL_SLOT: usize = 0x1000;
+const SMALL_SLOTS: u32 = (SMALL_HEAP / SMALL_SLOT) as u32;
+/// the most a texture in one takes, on the console and on the PC: half a page
+const SMALL_MAX: usize = PAGE / 2;
+
+/// A heap of small textures: which of its slots are taken.
+struct SmallHeap<H> {
+    heap: H,
+    /// bit i: slot i is taken or cooling
+    used: Vec<u64>,
+    free: u32,
+    /// no slot below this one is free
+    low: u32,
+}
+
+impl<H> SmallHeap<H> {
+    /// The first run of `n` free slots.
+    fn find(&self, n: u32) -> Option<u32> {
+        let mut run = 0;
+        for i in self.low..SMALL_SLOTS {
+            if self.used[(i / 64) as usize] >> (i % 64) & 1 != 0 {
+                run = 0;
+            } else {
+                run += 1;
+                if run == n {
+                    return Some(i + 1 - n);
+                }
+            }
+        }
+        None
+    }
+
+    fn set(&mut self, first: u32, n: u32, taken: bool) {
+        for i in first..first + n {
+            let (w, b) = ((i / 64) as usize, 1u64 << (i % 64));
+            if taken { self.used[w] |= b } else { self.used[w] &= !b }
+        }
+        if taken {
+            self.free -= n;
+            if first == self.low {
+                self.low = first + n;
+            }
+        } else {
+            self.free += n;
+            self.low = self.low.min(first);
+        }
+    }
+}
+
+/// Small sampled textures of the title, packed in heaps of video memory. On the pages a
+/// texture takes whole 64 KiB tiles, and a retail title places thousands of textures of a few
+/// KiB at addresses of their own (13,000 of 3.3 KiB on average when its world starts loading:
+/// 0.8 GB of pages for 43 MB of texels). Here each takes its PC size, in 4 KiB slots. They
+/// share no memory: a texture is kept in step with the title's memory on its own, like a
+/// committed one. Apart from D3D12 (`H`: the heap; numbers in the tests).
+struct SmallHeaps<H> {
+    heaps: Vec<Option<SmallHeap<H>>>,
+    /// placement id → (heap, first slot, slots)
+    places: std::collections::BTreeMap<u64, (usize, u32, u32)>,
+    /// slots of released textures, reusable after `COOL` (the GPU may still be at work on what
+    /// the title released)
+    cooling: std::collections::VecDeque<(usize, u32, u32, std::time::Instant)>,
+    next_id: u64,
+}
+
+impl<H: Clone> SmallHeaps<H> {
+    const fn new() -> Self {
+        SmallHeaps { heaps: Vec::new(), places: std::collections::BTreeMap::new(), cooling: std::collections::VecDeque::new(), next_id: 0 }
+    }
+
+    /// The slots released `COOL` ago are free again, and a heap with nothing in it goes (one
+    /// empty heap is kept for the next textures).
+    fn sweep(&mut self, now: std::time::Instant) {
+        while self.cooling.front().is_some_and(|c| now.saturating_duration_since(c.3) >= COOL) {
+            let Some((h, first, n, _)) = self.cooling.pop_front() else { break };
+            if let Some(heap) = self.heaps[h].as_mut() {
+                heap.set(first, n, false);
+            }
+        }
+        let mut kept = false;
+        for h in self.heaps.iter_mut() {
+            if h.as_ref().is_some_and(|x| x.free == SMALL_SLOTS) {
+                if kept {
+                    *h = None;
+                }
+                kept = true;
+            }
+        }
+    }
+
+    /// Slots for a texture of `bytes` (at most a heap's): in the first heap with room, else in
+    /// a new one, `make()`. (heap, offset in it, placement id); None: no heap.
+    fn take(&mut self, bytes: usize, now: std::time::Instant, make: impl FnOnce() -> Option<H>) -> Option<(H, usize, u64)> {
+        self.sweep(now);
+        let n = bytes.max(1).div_ceil(SMALL_SLOT) as u32;
+        if n > SMALL_SLOTS {
+            return None;
+        }
+        let found = self.heaps.iter().enumerate().find_map(|(h, x)| x.as_ref().filter(|x| x.free >= n).and_then(|x| x.find(n)).map(|first| (h, first)));
+        let (h, first) = match found {
+            Some(x) => x,
+            None => {
+                let heap = SmallHeap { heap: make()?, used: vec![0; SMALL_SLOTS as usize / 64], free: SMALL_SLOTS, low: 0 };
+                let h = match self.heaps.iter().position(|x| x.is_none()) {
+                    Some(h) => {
+                        self.heaps[h] = Some(heap);
+                        h
+                    }
+                    None => {
+                        self.heaps.push(Some(heap));
+                        self.heaps.len() - 1
+                    }
+                };
+                (h, 0)
+            }
+        };
+        let heap = self.heaps[h].as_mut()?;
+        heap.set(first, n, true);
+        self.next_id += 1;
+        self.places.insert(self.next_id, (h, first, n));
+        Some((heap.heap.clone(), first as usize * SMALL_SLOT, self.next_id))
+    }
+
+    /// The texture of placement `id` was released.
+    fn release(&mut self, id: u64, now: std::time::Instant) {
+        if let Some((h, first, n)) = self.places.remove(&id) {
+            self.cooling.push_back((h, first, n, now));
+        }
+    }
+
+    /// (textures, bytes of their slots, bytes of the heaps)
+    fn counts(&self) -> (usize, usize, usize) {
+        let slots: usize = self.places.values().map(|p| p.2 as usize).sum();
+        (self.places.len(), slots * SMALL_SLOT, self.heaps.iter().flatten().count() * SMALL_HEAP)
+    }
+}
+
+// D3D12 heaps are free-threaded
+unsafe impl Send for SmallHeaps<ID3D12Heap> {}
+
+static SMALL: Mutex<SmallHeaps<ID3D12Heap>> = Mutex::new(SmallHeaps::new());
+/// resource → its placement in `SMALL`
+static SMALL_OF: Mutex<Option<std::collections::HashMap<usize, u64>>> = Mutex::new(None);
+
+/// (small textures in heaps of their own, bytes of their slots, bytes of those heaps) – `XCL_ACTIVITY`
+pub fn small_counts() -> (usize, usize, usize) {
+    SMALL.lock().unwrap().counts()
+}
+
+/// Whether small sampled textures go to heaps of their own (`XCL_SMALL_TEXTURE_HEAPS`; without
+/// the switch, when the title's GPU heaps are in video memory: `sparse::saving`).
+fn small_heaps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| super::sparse::saving("XCL_SMALL_TEXTURE_HEAPS"))
+}
+
+/// A sampled texture of the title of at most `SMALL_MAX` bytes (`console_bytes` there, and as
+/// the PC places it with the alignment of small textures), placed in a heap of small textures.
+/// None: not such a texture, or the driver does not place it so.
+#[allow(clippy::too_many_arguments)]
+unsafe fn place_small(dev: &ID3D12Device, this: *mut c_void, desc: &D3D12_RESOURCE_DESC, state: u32, clear: *const c_void, console_bytes: Option<u64>, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+    if console_bytes? > SMALL_MAX as u64 || desc.SampleDesc.Count != 1 || gpu_owned(desc.Flags.0 as u32) {
+        return None;
+    }
+    let small = D3D12_RESOURCE_DESC { Alignment: SMALL_SLOT as u64, ..*desc };
+    let info = dev.GetResourceAllocationInfo(0, &[small]);
+    if info.SizeInBytes == 0 || info.SizeInBytes > SMALL_MAX as u64 || info.Alignment != SMALL_SLOT as u64 {
+        return None;
+    }
+    let now = std::time::Instant::now();
+    let make = || {
+        let desc = D3D12_HEAP_DESC {
+            SizeInBytes: SMALL_HEAP as u64,
+            Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+            Alignment: 0,
+            Flags: D3D12_HEAP_FLAG_DENY_BUFFERS | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES,
+        };
+        let mut heap: Option<ID3D12Heap> = None;
+        if let Err(e) = dev.CreateHeap(&desc, &mut heap) {
+            crate::xlog_warn!("D3D12.X: no video memory for a heap of small title textures ({e})");
+        }
+        heap
+    };
+    let (heap, offset, id) = SMALL.lock().unwrap().take(info.SizeInBytes as usize, now, make)?;
+    let hr = super::real::dev_create_placed_resource(this, heap.as_raw() as usize, offset, &small as *const _ as usize, state as usize, clear as usize, riid, ppv);
+    if hr < 0 || (*ppv).is_null() {
+        SMALL.lock().unwrap().release(id, now);
+        return None;
+    }
+    SMALL_OF.lock().unwrap().get_or_insert_with(std::collections::HashMap::new).insert(*ppv as usize, id);
+    Some(hr)
 }
 
 /// bytes of a page – of the title's addresses and of a tile
@@ -654,6 +854,11 @@ pub unsafe fn place_pages(
     if !tier2(dev) || std::env::var_os("XCL_VRAM_ARENAS").is_some() {
         return None;
     }
+    if small_heaps() {
+        if let Some(hr) = place_small(dev, this, desc, state, clear, console_bytes, riid, ppv) {
+            return Some(hr);
+        }
+    }
     place_on_pages(dev, this, va, desc, state, clear, console_bytes, false, riid, ppv)
 }
 
@@ -857,6 +1062,118 @@ mod tests {
         let early = *bytes[20..120].iter().max().unwrap();
         let late = *bytes[300..].iter().max().unwrap();
         assert!(late <= early, "arenas grow over time: {early} then {late} bytes");
+    }
+
+    /// Small textures take their size in 4 KiB slots of 16 MiB heaps; a released one's slots
+    /// are taken again 2 s later, not before; a heap with nothing in it goes, but one.
+    #[test]
+    fn small_textures_are_packed_in_heaps_and_their_slots_reused() {
+        let t0 = Instant::now();
+        let mut s: SmallHeaps<u32> = SmallHeaps::new();
+        let mut made = 0u32;
+        let mut take = |s: &mut SmallHeaps<u32>, bytes: usize, now: Instant| {
+            s.take(bytes, now, || {
+                made += 1;
+                Some(made)
+            })
+            .unwrap()
+        };
+        // 3.3 KiB, 4 KiB + 1 and 32 KiB: 1, 2 and 8 slots, back to back in the first heap
+        let a = take(&mut s, 3300, t0);
+        let b = take(&mut s, 4097, t0);
+        let c = take(&mut s, SMALL_MAX, t0);
+        assert_eq!([(a.0, a.1), (b.0, b.1), (c.0, c.1)], [(1, 0), (1, SMALL_SLOT), (1, 3 * SMALL_SLOT)]);
+        assert_eq!(s.counts(), (3, 11 * SMALL_SLOT, SMALL_HEAP));
+
+        // released: its slots cool for 2 s, the next texture goes after the others
+        s.release(b.2, t0);
+        let d = take(&mut s, 8000, t0 + Duration::from_secs(1));
+        assert_eq!((d.0, d.1), (1, 11 * SMALL_SLOT));
+        let e = take(&mut s, 8000, t0 + COOL);
+        assert_eq!((e.0, e.1), (1, SMALL_SLOT), "the released slots, the lowest free");
+        // a hole of one slot is not taken for two
+        s.release(a.2, t0);
+        let f = take(&mut s, 5000, t0 + COOL);
+        assert_eq!((f.0, f.1), (1, 13 * SMALL_SLOT));
+        assert_eq!(take(&mut s, 100, t0 + COOL).1, 0);
+
+        // 13,000 textures of 3.3 KiB: 4 heaps (64 MiB) where pages took 813 MiB
+        let mut s: SmallHeaps<u32> = SmallHeaps::new();
+        let ids: Vec<u64> = (0..13_000).map(|_| take(&mut s, 3300, t0).2).collect();
+        assert_eq!(s.counts(), (13_000, 13_000 * SMALL_SLOT, 4 * SMALL_HEAP));
+        assert!(s.take(SMALL_HEAP + 1, t0, || None).is_none(), "more than a heap holds");
+        assert!(s.take(SMALL_HEAP, t0, || None).is_none(), "no heap: the caller places it elsewhere");
+        // all released: after 2 s one empty heap is left, and the next texture is in it
+        for id in ids {
+            s.release(id, t0);
+        }
+        s.sweep(t0 + Duration::from_secs(1));
+        assert_eq!(s.counts(), (0, 0, 4 * SMALL_HEAP));
+        s.sweep(t0 + COOL);
+        assert_eq!(s.counts(), (0, 0, SMALL_HEAP));
+        let g = take(&mut s, 3300, t0 + COOL);
+        assert_eq!((g.1, s.counts()), (0, (1, SMALL_SLOT, SMALL_HEAP)));
+    }
+
+    /// On the GPU: 256 small sampled textures (block-compressed with mips, and one-channel)
+    /// go to one heap of small textures, far under the 64 KiB each takes on the pages; one over
+    /// half a page and a render target do not go there; released, their slots are counted out.
+    /// Needs a hardware adapter (skips on WARP).
+    #[test]
+    fn small_title_textures_share_heaps_of_video_memory() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap();
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                return;
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev.filter(|d| tier2(d)) else { return };
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let sample = DXGI_SAMPLE_DESC { Count: 1, Quality: 0 };
+            let tex = |w: u64, h: u32, mips: u16, format: DXGI_FORMAT| D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: w, Height: h, DepthOrArraySize: 1, MipLevels: mips, Format: format, SampleDesc: sample, ..Default::default() };
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let place_at = |d: &D3D12_RESOURCE_DESC, console_bytes: u64| -> Option<ID3D12Resource> {
+                let mut p = std::ptr::null_mut();
+                let hr = place_small(&dev, dev.as_raw(), d, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32, std::ptr::null(), Some(console_bytes), riid, &mut p)?;
+                assert!(hr >= 0 && !p.is_null());
+                Some(ID3D12Resource::from_raw(p))
+            };
+            let (n0, slots0, heaps0) = small_counts();
+            let kinds = [tex(64, 64, 7, DXGI_FORMAT_BC7_UNORM), tex(32, 32, 6, DXGI_FORMAT_BC1_UNORM), tex(128, 64, 1, DXGI_FORMAT_BC3_UNORM), tex(64, 64, 1, DXGI_FORMAT_R8_UNORM)];
+            let mut textures = Vec::new();
+            for k in 0..256 {
+                let d = &kinds[k % kinds.len()];
+                let Some(r) = place_at(d, 3300) else {
+                    println!("SKIPPED small_title_textures_share_heaps_of_video_memory: the driver places no {}x{} format {} texture at 4 KiB", d.Width, d.Height, d.Format.0);
+                    crate::gpu::recomp::runner::skip_test("no small texture placement");
+                    return;
+                };
+                let got = r.GetDesc();
+                assert_eq!((got.Width, got.Height, got.MipLevels, got.Format), (d.Width, d.Height, d.MipLevels, d.Format));
+                textures.push(r);
+            }
+            let (n, slots, heaps) = small_counts();
+            println!("256 small textures: {} bytes of slots, {} bytes of heaps", slots - slots0, heaps - heaps0);
+            assert_eq!(n - n0, 256);
+            assert!(slots - slots0 <= 256 * SMALL_MAX && heaps - heaps0 <= SMALL_HEAP, "{} bytes of slots, {} of heaps", slots - slots0, heaps - heaps0);
+            assert!(slots - slots0 < 256 * PAGE / 2, "under half of what the pages take");
+            // too large on the console, too large on the PC, a render target: not here
+            assert!(place_at(&kinds[0], SMALL_MAX as u64 + 1).is_none());
+            assert!(place_at(&tex(512, 512, 1, DXGI_FORMAT_R8G8B8A8_UNORM), 3300).is_none());
+            assert!(place_at(&D3D12_RESOURCE_DESC { Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, ..tex(64, 64, 1, DXGI_FORMAT_R8_UNORM) }, 3300).is_none());
+            // released (as the Release hook does): counted out
+            for r in textures {
+                forget(r.as_raw() as usize);
+            }
+            assert_eq!(small_counts().0, n0);
+        }
     }
 
     /// On the GPU: D32S8 targets 256 MiB apart take their own size of video memory, not an arena
