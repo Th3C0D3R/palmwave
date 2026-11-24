@@ -505,14 +505,36 @@ fn mirror_source_span(va: usize, cpu: usize) -> (usize, usize) {
     (if m.State == MEM_COMMIT { va } else { cpu }, remaining.min(span))
 }
 
+/// Where the bytes at `va` of a GPU view are, and how far that holds. The queue's page-mapping
+/// method goes first (`kernelx::mirrors::mapped_source`: the physical page where XCL keeps it;
+/// 0 – a page it left unmapped, zeros), as for textures (`source_of`); a page it never mapped
+/// is `mirror_source_span`'s (`cpu`: the CPU view's address behind `va`).
+fn gpu_view_span(va: usize, cpu: usize) -> (usize, usize) {
+    use crate::hle::kernelx::mirrors::{mapped_source, PAGE};
+    match mapped_source(va) {
+        Some(to) => (to.unwrap_or(0), PAGE - va % PAGE),
+        None => mirror_source_span(va, cpu),
+    }
+}
+
+/// Where the bytes at `va` are read from when `va` lies in a GPU view (0: an unmapped page).
+pub(super) fn gpu_view_source(va: usize) -> Option<usize> {
+    crate::hle::kernelx::mirrors::source(va).map(|cpu| gpu_view_span(va, cpu).0)
+}
+
 /// Fill a copy upload from a registered GPU view. Page mappings may have changed since recording.
 pub(super) unsafe fn copy_gpu_view(va: usize, dst: *mut u8, len: usize) -> bool {
     let Some(cpu) = crate::hle::kernelx::mirrors::source_range(va, len) else { return false };
     let mut offset = 0;
     while offset < len {
-        let (src, span) = mirror_source_span(va + offset, cpu + offset);
+        let (src, span) = gpu_view_span(va + offset, cpu + offset);
         let bytes = span.min(len - offset);
-        read_committed_into(src, std::slice::from_raw_parts_mut(dst.add(offset), bytes));
+        let out = std::slice::from_raw_parts_mut(dst.add(offset), bytes);
+        if src == 0 {
+            out.fill(0);
+        } else {
+            read_committed_into(src, out);
+        }
         offset += bytes;
     }
     true
@@ -2427,6 +2449,35 @@ mod tests {
             assert!(!copy_gpu_view(gpu.0 + 3 * PAGE - 4, bytes.as_mut_ptr(), bytes.len()));
             assert_eq!(bytes, [0x22, 0x22, 0x22, 0x22, 0, 0, 0, 0]);
         }
+    }
+
+    /// A copy out of a GPU view reads each page where the queue's page-mapping method put it:
+    /// a pool page, zeros for an unmapped page, the CPU view for a page the method never
+    /// mapped. (Without it the copy read the CPU view's same offset for all three.)
+    #[test]
+    fn copy_gpu_view_reads_the_pages_the_page_mapping_method_mapped() {
+        use crate::hle::kernelx::mirrors::{self, apply_batches, PAGE};
+        // (addresses far above anything Windows hands out, and a size no other test uses)
+        let (cpu, gpu, size) = (0x7190_0000_0000usize, 0x7196_0000_0000usize, 0x129 * PAGE);
+        mirrors::reserved(cpu, size, 0x2040_2000, 0x04);
+        mirrors::reserved(gpu, size, 0x2040_2000, 0x801);
+        let pool: Vec<u8> = (0..4 * PAGE).map(|i| (i / PAGE * 0x40 + i % 7 + 1) as u8).collect();
+        let p = pool.as_ptr() as usize;
+        unsafe {
+            // pool pages 1 and 2 at pages 2 and 3, page 4 unmapped, page 5 left alone
+            let r = [[0, 1, 2], [2, 0, 1]];
+            assert!(apply_batches(1, [page_batch(gpu + 2 * PAGE, &r)].as_ptr() as usize, p, 4).is_some());
+            assert_eq!(gpu_view_source(gpu + 2 * PAGE + 8), Some(p + PAGE + 8));
+            assert_eq!(gpu_view_source(gpu + 4 * PAGE), Some(0), "unmapped");
+            assert_eq!(gpu_view_source(gpu + 5 * PAGE), Some(cpu + 5 * PAGE), "never mapped: the CPU view");
+            assert_eq!(gpu_view_source(cpu), None, "not a GPU view");
+            // from the middle of page 2 to the middle of page 5
+            let mut out = vec![0xEEu8; 3 * PAGE];
+            assert!(copy_gpu_view(gpu + 2 * PAGE + PAGE / 2, out.as_mut_ptr(), out.len()));
+            assert_eq!(&out[..PAGE + PAGE / 2], &pool[PAGE + PAGE / 2..3 * PAGE], "the pool pages");
+            assert!(out[PAGE + PAGE / 2..].iter().all(|&b| b == 0), "the unmapped page and the empty CPU view read as zeros");
+        }
+        mirrors::released(cpu);
     }
 
     /// `read_committed` copies committed pages and leaves uncommitted gaps zeroed, including

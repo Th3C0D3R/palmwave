@@ -2083,7 +2083,20 @@ struct PendingUpload {
 impl PendingUpload {
     unsafe fn fill(&self) {
         let dst = self.mapped as *mut u8;
-        if !super::title_textures::copy_gpu_view(self.src, dst, self.size) && crate::gpu::shader::readable(self.src, self.size) {
+        if super::title_textures::copy_gpu_view(self.src, dst, self.size) {
+            // what the copies out of GPU views carry: a copy of zeros is a page nothing was
+            // mapped under (or one XCL does not find)
+            static COPIES: AtomicU64 = AtomicU64::new(0);
+            static BYTES: AtomicU64 = AtomicU64::new(0);
+            static ZERO: AtomicU64 = AtomicU64::new(0);
+            let zero = self.size <= 1 << 20 && std::slice::from_raw_parts(dst, self.size).iter().all(|&b| b == 0);
+            let (n, bytes) = (COPIES.fetch_add(1, Ordering::Relaxed) + 1, BYTES.fetch_add(self.size as u64, Ordering::Relaxed) + self.size as u64);
+            let z = ZERO.fetch_add(zero as u64, Ordering::Relaxed) + zero as u64;
+            if n.is_power_of_two() {
+                let from = super::title_textures::gpu_view_source(self.src).unwrap_or(0);
+                crate::xlog_info!("D3D12.X: CopyMemoryToMemoryX out of a GPU view: {n} copies ({} KB) so far, {z} of them all zeros (latest {:#x}, {:#x} bytes, read at {from:#x})", bytes >> 10, self.src, self.size);
+            }
+        } else if crate::gpu::shader::readable(self.src, self.size) {
             std::ptr::copy_nonoverlapping(self.src as *const u8, dst, self.size);
         }
     }
