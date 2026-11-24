@@ -10,10 +10,12 @@
 //! buffer (`sync`). The twin is the depth buffer's private data, so it goes when the depth
 //! buffer does.
 //!
-//! XCL applies none of the title's enhanced barriers (#146): on the PC such a depth buffer stays
-//! in the state it was made in, which `note_created` keeps for the copies' transitions (not
-//! known: DEPTH_WRITE, what a depth buffer placed for unordered access is made in). Depth and
-//! stencil formats (two planes) have no twin: the PC has no UAV format for them.
+//! The title's enhanced barriers (#146) are applied (`enhanced_barrier`), except those into
+//! UNORDERED_ACCESS for such a depth buffer, which stays where it is: the copies' transitions
+//! start from the state its barriers left it in (`enhanced_barrier::tracked_state`), else the
+//! one it was made in (`note_created`; not known: DEPTH_WRITE, what a depth buffer placed for
+//! unordered access is made in). Depth and stencil formats (two planes) have no twin: the PC
+//! has no UAV format for them.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -45,9 +47,32 @@ pub fn note_created(res: usize, state: u32) {
     }
 }
 
+/// `res` is gone (`real::res_release`): a later resource at its address was not made in its state.
+pub fn forget(res: usize) {
+    if let Some(m) = MADE_IN.lock().unwrap().as_mut() {
+        m.remove(&res);
+    }
+}
+
+/// The PC state `res` is in: where the title's barriers left it, else where it was made
+/// (UNORDERED_ACCESS is never it: the PC has the depth buffer without unordered access).
 fn state_of(res: usize) -> D3D12_RESOURCE_STATES {
-    let s = MADE_IN.lock().unwrap().as_ref().and_then(|m| m.get(&res).copied());
+    let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0;
+    let tracked = super::enhanced_barrier::tracked_state(res).map(|s| s as i32).filter(|&s| s != uav);
+    let s = tracked.or_else(|| MADE_IN.lock().unwrap().as_ref().and_then(|m| m.get(&res).copied()));
     D3D12_RESOURCE_STATES(s.unwrap_or(D3D12_RESOURCE_STATE_DEPTH_WRITE.0))
+}
+
+/// The view a UAV of twin `d` is when the title gives no description: the twin is typeless, and
+/// the PC wants the view's format then (R16_UNORM / R32_FLOAT), all of its slices.
+pub fn default_uav_desc(d: &D3D12_RESOURCE_DESC) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    let format = DXGI_FORMAT(super::device_x::pc_shader_view_format(d.Format.0 as u32, 0) as i32);
+    if d.DepthOrArraySize > 1 {
+        let slices = D3D12_TEX2D_ARRAY_UAV { MipSlice: 0, FirstArraySlice: 0, ArraySize: d.DepthOrArraySize as u32, PlaneSlice: 0 };
+        D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: format, ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DARRAY, Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Texture2DArray: slices } }
+    } else {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: format, ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D, ..Default::default() }
+    }
 }
 
 /// The twin's description for a depth buffer's (None: no twin for it – a format of two planes,
@@ -135,13 +160,22 @@ pub unsafe fn sync(res: usize, into_uav: bool, barrier: &dyn Fn(&[D3D12_RESOURCE
     let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     let (src, dst) = (D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     let (depth_copy, twin_copy) = if into_uav { (src, dst) } else { (dst, src) };
-    barrier(&[transition(depth, made, depth_copy), transition(&twin, uav, twin_copy)]);
+    // (a depth buffer already in the copy's state gets no transition: the PC refuses one from a
+    // state to itself)
+    let moves = made != depth_copy;
+    let mut before = vec![transition(&twin, uav, twin_copy)];
+    let mut after = vec![transition(&twin, twin_copy, uav)];
+    if moves {
+        before.insert(0, transition(depth, made, depth_copy));
+        after.insert(0, transition(depth, depth_copy, made));
+    }
+    barrier(&before);
     if into_uav {
         copy(&twin, depth);
     } else {
         copy(depth, &twin);
     }
-    barrier(&[transition(depth, depth_copy, made), transition(&twin, twin_copy, uav)]);
+    barrier(&after);
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 4 || n.is_power_of_two() {
@@ -186,6 +220,80 @@ mod tests {
         let mut msaa = depth_desc(DXGI_FORMAT_R32_TYPELESS, ds);
         msaa.SampleDesc.Count = 4;
         assert!(twin_desc(&msaa).is_none());
+    }
+
+    /// A UAV made without a description is a view of the twin in its format's readable type.
+    #[test]
+    fn a_twins_uav_without_a_description_has_the_twins_format() {
+        let ds = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        let shadows = twin_desc(&depth_desc(DXGI_FORMAT_R16_TYPELESS, ds)).unwrap();
+        let v = default_uav_desc(&shadows);
+        assert_eq!((v.Format, v.ViewDimension), (DXGI_FORMAT_R16_UNORM, D3D12_UAV_DIMENSION_TEXTURE2DARRAY));
+        let a = unsafe { v.Anonymous.Texture2DArray };
+        assert_eq!((a.MipSlice, a.FirstArraySlice, a.ArraySize, a.PlaneSlice), (0, 0, 6, 0));
+        let mut one = twin_desc(&depth_desc(DXGI_FORMAT_R32_TYPELESS, ds)).unwrap();
+        one.DepthOrArraySize = 1;
+        let v = default_uav_desc(&one);
+        assert_eq!((v.Format, v.ViewDimension), (DXGI_FORMAT_R32_FLOAT, D3D12_UAV_DIMENSION_TEXTURE2D));
+    }
+
+    /// The copies' transitions start from the state the depth buffer is in: where the title's
+    /// barriers left it, else where it was made – and one already in the copy's state gets no
+    /// transition from that state to itself. A released depth buffer's state is forgotten.
+    #[test]
+    fn gpu_the_copies_start_from_the_state_the_depth_buffer_is_in() {
+        use std::cell::RefCell;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            let mut d = depth_desc(DXGI_FORMAT_R16_TYPELESS, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+            (d.Width, d.Height, d.DepthOrArraySize, d.Alignment) = (64, 32, 1, 0);
+            let default = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let mut depth: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&default, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COPY_SOURCE, None, &mut depth).unwrap();
+            let depth = depth.unwrap();
+            let res = depth.as_raw() as usize;
+            let twin = make_twin(&depth).expect("a twin");
+            // (resource, before, after) of each transition `sync` asks for; nothing is recorded on a list
+            let seen: RefCell<Vec<(usize, i32, i32)>> = RefCell::new(Vec::new());
+            let barrier = |b: &[D3D12_RESOURCE_BARRIER]| {
+                for b in b {
+                    let t = &b.Anonymous.Transition;
+                    seen.borrow_mut().push((std::mem::transmute_copy::<_, usize>(&t.pResource), t.StateBefore.0, t.StateAfter.0));
+                }
+            };
+            let copy = |_: &ID3D12Resource, _: &ID3D12Resource| {};
+            let (src, dst, uav) = (D3D12_RESOURCE_STATE_COPY_SOURCE.0, D3D12_RESOURCE_STATE_COPY_DEST.0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0);
+            let t = twin.as_raw() as usize;
+
+            super::super::enhanced_barrier::forget(res);
+            // made in COPY_SOURCE, copied to the twin: only the twin moves
+            MADE_IN.lock().unwrap().get_or_insert_with(HashMap::new).insert(res, src);
+            assert!(sync(res, true, &barrier, &copy));
+            assert_eq!(seen.take(), vec![(t, uav, dst), (t, dst, uav)]);
+            // the twin copied back: the depth buffer moves to COPY_DEST and back
+            assert!(sync(res, false, &barrier, &copy));
+            assert_eq!(seen.take(), vec![(res, src, dst), (t, uav, src), (res, dst, src), (t, src, uav)]);
+
+            // the title's barriers moved it since: from where they left it
+            let srv = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE.0;
+            super::super::enhanced_barrier::note_state(res, srv as u32);
+            assert!(sync(res, true, &barrier, &copy));
+            assert_eq!(seen.take(), vec![(res, srv, src), (t, uav, dst), (res, src, srv), (t, dst, uav)]);
+            // (a state it cannot be in on the PC is not taken)
+            super::super::enhanced_barrier::note_state(res, uav as u32);
+            assert_eq!(state_of(res).0, src);
+            super::super::enhanced_barrier::forget(res);
+
+            // released: a later resource at this address is not taken for one made in COPY_SOURCE
+            forget(res);
+            assert_eq!(state_of(res), D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        }
     }
 
     /// The round trip of a D16 depth buffer that shaders write: its clear reaches the twin at the

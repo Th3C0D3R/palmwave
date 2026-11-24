@@ -1613,6 +1613,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         super::vram::forget(this as usize);
         super::title_textures::forget(this as usize);
         super::enhanced_barrier::forget(this as usize);
+        super::depth_twin::forget(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
@@ -2227,7 +2228,9 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     let pc_uav = |at: u64| {
         // with `XCL_DEPTH_UAV_TWINS=1` a depth buffer's UAV is a view of its twin (#970)
         if let Some(twin) = no_uav.then(|| ID3D12Resource::from_raw_borrowed(&res).and_then(|r| super::depth_twin::twin_for_uav(r))).flatten() {
-            return f(this, twin.as_raw(), std::ptr::null_mut(), desc, at);
+            // (no description: the typeless twin's view needs its format – the PC refuses a null one)
+            let own = super::depth_twin::default_uav_desc(&twin.GetDesc());
+            return f(this, twin.as_raw(), std::ptr::null_mut(), if desc.is_null() { &own } else { desc }, at);
         }
         if no_uav {
             static N: AtomicU64 = AtomicU64::new(0);
