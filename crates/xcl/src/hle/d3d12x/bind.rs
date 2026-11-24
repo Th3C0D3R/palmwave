@@ -391,6 +391,17 @@ unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D1
     Ok((buf, va))
 }
 
+/// The console addresses of the descriptor heaps the list bound, in the io slots where
+/// translated programs read their heap SGPRs (`recomp::Options::heap_sgprs`): the console's
+/// driver passes them to every program with SM 6.6 dynamic resources, which load descriptors
+/// from heap + 32 · index (a retail title's meshlet culling, the visible-meshlet lists of its
+/// mesh programs, the material textures of its pixel shaders).
+fn set_heap_bases(this: *mut c_void, io: &mut [u32]) {
+    let [views, samplers] = super::list_x::heap_bases(this);
+    io[crate::gpu::recomp::IO_VIEW_HEAP] = views;
+    io[crate::gpu::recomp::IO_SAMPLER_HEAP] = samplers;
+}
+
 unsafe fn bind_two_pass_stage(
     this: *mut c_void,
     list: &ID3D12GraphicsCommandList,
@@ -429,6 +440,7 @@ unsafe fn bind_two_pass_stage(
     // (the programs check their memory windows against it: without it every address but a
     // 32-bit one is outside them and reads zeros)
     io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
+    set_heap_bases(this, &mut io);
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
     let rs_raw = if compute_pass { tp.compute_rs } else { tp.mesh_rs } as *mut c_void;
@@ -1399,6 +1411,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     };
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
     io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
+    set_heap_bases(this, &mut io);
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
     let res_at = copy(&[0u8; 256])?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);

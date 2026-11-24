@@ -729,6 +729,8 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     let mut pso: Option<*const ConsolePso> = None;
     // heap windows (`pso::heap_windows`): a dispatch needs the shared heap even when the list set none
     let mut heaps_set = false;
+    // the console addresses of the heaps the list bound (`console_heap::bound_bases`)
+    let mut heap_bases = [0u32; 2];
     let chunks: Vec<Vec<u32>> = st.chunks.iter().map(|(c, used)| c[..*used].chunks(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect()).collect();
     'chunks: for words in &chunks {
         let mut at = 0usize;
@@ -746,6 +748,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
             } else if w0 == HEAPS_MARKER {
                 let n = get(1) as usize;
                 let named: Vec<usize> = (0..n).map(|k| get(2 + 2 * k) as usize | (get(3 + 2 * k) as usize) << 32).collect();
+                heap_bases = super::console_heap::bound_bases(&named);
                 let heaps = super::list_x::pc_heaps(n as u32, named.as_ptr());
                 if super::present::trace_frame() {
                     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -884,6 +887,8 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         };
                         io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
                         io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
+                        io[crate::gpu::recomp::IO_VIEW_HEAP] = heap_bases[0];
+                        io[crate::gpu::recomp::IO_SAMPLER_HEAP] = heap_bases[1];
                         let io_at = uma_copy(st, bytemuck_u32(&io)).ok_or("UMA: io")?;
                         let res_at = uma_copy(st, &[0u8; 256]).ok_or("UMA: res")?;
                         // the pipeline's own root signature when it has static samplers
