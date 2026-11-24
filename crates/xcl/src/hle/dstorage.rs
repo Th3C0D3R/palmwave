@@ -205,13 +205,14 @@ pub fn stats() -> DStorageStats {
 
 /// Log a refused BCPack request: one warning per mode and zlib stage, then a running count on
 /// the first 16 refusals and every power of two.
-fn log_bcpack_refusal(r: &Request, k: u64) {
+fn log_bcpack_refusal(r: &Request, k: u64, neutral: bool) {
     let bc = r.bcpack();
     let key = format!("BCPack {}{}", bcpack_name(bc), if r.zlib() { " after zlib" } else { "" });
+    let outcome = if neutral { "its destination gets neutral blocks and the request completes" } else { "the request fails with E_DECOMPRESSION" };
     warn_once(
         &key,
         format_args!(
-            "mode {bc} unsupported (src={}, intermediate={}, dst={}, swizzle={}); the request fails with E_DECOMPRESSION",
+            "mode {bc} unsupported (src={}, intermediate={}, dst={}, swizzle={}); {outcome}",
             r.source_size,
             r.intermediate_size,
             r.destination_size,
@@ -226,8 +227,16 @@ fn log_bcpack_refusal(r: &Request, k: u64) {
 /// `XCL_DSTORAGE_BCPACK_FILL=1`: a refused BCPack destination gets solid blocks of its BCn
 /// format (magenta; red for BC4/BC5) instead of staying as it was, so the title's textures
 /// that wait on BCPack show where they are. The request still fails.
-fn bcpack_fill_from_env() -> bool {
-    std::env::var("XCL_DSTORAGE_BCPACK_FILL").is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0")
+/// `XCL_DSTORAGE_BCPACK_FILL=neutral`: the blocks are neutral ones (`bcpack_neutral_block`) and a
+/// request whose destination got them completes as if it had been decoded, for a title that stops
+/// streaming after failed requests. Unset, empty or `0`: neither. Returns (fill, neutral).
+fn bcpack_fill_switch(v: Option<&str>) -> (bool, bool) {
+    let v = v.map_or("", str::trim);
+    (!v.is_empty() && v != "0", v.eq_ignore_ascii_case("neutral"))
+}
+
+fn bcpack_fill_from_env() -> (bool, bool) {
+    bcpack_fill_switch(std::env::var("XCL_DSTORAGE_BCPACK_FILL").ok().as_deref())
 }
 
 /// BC1 colour block: both endpoints magenta (565 `0xF81F`), every index 0.
@@ -256,6 +265,31 @@ fn bcpack_fill_block(mode: u8) -> Option<Vec<u8>> {
     })
 }
 
+/// BC1 colour block: both endpoints mid grey (565 `0x8410`: 132, 130, 132), every index 0.
+const BC1_GREY: [u8; 8] = [0x10, 0x84, 0x10, 0x84, 0, 0, 0, 0];
+/// BC4 block: both endpoints 0x80 (0.5 as UNORM), every index 0.
+const BC4_HALF: [u8; 8] = [0x80, 0x80, 0, 0, 0, 0, 0, 0];
+
+/// One block of `mode`'s BCn format that reads as neutral: opaque mid grey, and for BC5 a flat
+/// normal map (both channels 0.5 as UNORM).
+fn bcpack_neutral_block(mode: u8) -> Option<Vec<u8>> {
+    let cat = |a: &[u8], b: &[u8]| [a, b].concat();
+    Some(match mode {
+        1 => BC1_GREY.to_vec(),
+        2 => cat(&[0xFF; 8], &BC1_GREY),
+        3 => cat(&BC4_FULL, &BC1_GREY),
+        4 => BC4_HALF.to_vec(),
+        5 => cat(&BC4_HALF, &BC4_HALF),
+        // mode 11 (5 bits 00011): one region, 10-bit endpoints r/g/b = 462 (half 0x3801, 0.5005, in UF16), indices 0
+        6 => (3u128 | 462 << 5 | 462 << 15 | 462 << 25 | 462 << 35 | 462 << 45 | 462 << 55).to_le_bytes().to_vec(),
+        // mode 6 (bit 6): 7-bit endpoints r/g/b/a = 64/64/64/127, both p-bits 1 (129, 129, 129, 255), indices 0
+        7 => (1u128 << 6 | 64 << 7 | 64 << 14 | 64 << 21 | 64 << 28 | 64 << 35 | 64 << 42 | 127 << 49 | 127 << 56 | 1 << 63 | 1 << 64)
+            .to_le_bytes()
+            .to_vec(),
+        _ => return None,
+    })
+}
+
 /// Where a refused BCPack request's fill goes: its virtual destination, or the physical pages
 /// it named (snapshot at enqueue, as for a request that runs).
 enum FillTarget {
@@ -263,13 +297,19 @@ enum FillTarget {
     Pages(Vec<usize>),
 }
 
-/// Fill the title's destination of `r` (exactly `destination_size` bytes) with solid blocks.
-unsafe fn bcpack_fill(r: &Request, target: &FillTarget) -> bool {
-    let Some(block) = bcpack_fill_block(r.bcpack()) else { return false };
+/// Fill the title's destination of `r` (exactly `destination_size` bytes) with solid blocks,
+/// neutral ones if `neutral`: the request then completes, so its pages are the ones at its turn,
+/// as for a request that runs (the magenta fill keeps the snapshot).
+unsafe fn bcpack_fill(r: &Request, target: &FillTarget, neutral: bool) -> bool {
+    let block = if neutral { bcpack_neutral_block(r.bcpack()) } else { bcpack_fill_block(r.bcpack()) };
+    let Some(block) = block else { return false };
     let n = r.destination_size as usize;
     let bytes: Vec<u8> = block.iter().copied().cycle().take(n).collect();
     let ok = match target {
-        FillTarget::Pages(pages) => crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &bytes),
+        FillTarget::Pages(pages) => {
+            let pages = if neutral { pages_at_turn(r, pages) } else { pages[..].into() };
+            crate::hle::kernelx::write_physical_pages(&pages, r.destination_page_offset as usize, &bytes)
+        }
         FillTarget::Virtual => {
             if !writable(r.destination as usize, n) {
                 return false;
@@ -788,6 +828,19 @@ pub fn counters() -> (u64, u64, u64) {
     (REQUESTS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed))
 }
 
+/// The destination pages of `r` at its turn. A page number of 0 in the snapshot taken at enqueue
+/// (no page has it): the entry is read again now. A retail title keeps its page arrays in its own
+/// tables and fills an entry after EnqueueRequest – its streaming requests were refused by the
+/// thousand with page 0. An array that had its pages at enqueue stays as it was snapshotted
+/// (titles also pass arrays on the stack).
+unsafe fn pages_at_turn<'a>(r: &Request, pages: &'a [usize]) -> std::borrow::Cow<'a, [usize]> {
+    if pages.contains(&0) && crate::gpu::shader::readable(r.destination as usize, std::mem::size_of_val(pages)) {
+        (0..pages.len()).map(|k| if pages[k] != 0 { pages[k] } else { (r.destination as *const usize).add(k).read_unaligned() }).collect::<Vec<_>>().into()
+    } else {
+        pages.into()
+    }
+}
+
 /// Run a request; the destination gets the bytes or nothing.
 unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
     let n = r.destination_size as usize;
@@ -859,20 +912,8 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     };
 
     if r.dest_physical_pages() {
-        let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
-        // A page number of 0 in the snapshot taken at enqueue (no page has it): the entry is
-        // read again now. A retail title keeps its page arrays in its own tables and fills an
-        // entry after EnqueueRequest – its streaming requests were refused by the thousand
-        // with page 0. An array that had its pages at enqueue stays as it was snapshotted
-        // (titles also pass arrays on the stack).
-        let late: Vec<usize>;
-        let pages = if pages.contains(&0) && crate::gpu::shader::readable(r.destination as usize, std::mem::size_of_val(pages)) {
-            late = (0..pages.len()).map(|k| if pages[k] != 0 { pages[k] } else { (r.destination as *const usize).add(k).read_unaligned() }).collect();
-            &late[..]
-        } else {
-            pages
-        };
-        if !crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &payload[..n]) {
+        let pages = pages_at_turn(r, dest_pages.ok_or(E_ACCESS_VIOLATION)?);
+        if !crate::hle::kernelx::write_physical_pages(&pages, r.destination_page_offset as usize, &payload[..n]) {
             return Err(E_ACCESS_VIOLATION);
         }
     } else if n > 0 {
@@ -962,6 +1003,9 @@ struct QueueInner {
     errors: Mutex<(u32, Option<FirstError>)>,
     /// `XCL_DSTORAGE_BCPACK_FILL` when the queue was made
     bcpack_fill: AtomicBool,
+    /// `XCL_DSTORAGE_BCPACK_FILL=neutral` when the queue was made: the fill is neutral and the
+    /// request completes
+    bcpack_neutral: AtomicBool,
 }
 
 impl QueueInner {
@@ -1051,9 +1095,12 @@ impl QueueInner {
                         }
                     }
                     Entry::Refused { hr, req, file, fill } => {
-                        if let Some(t) = &fill {
-                            // the destination gets solid blocks; the request still fails
-                            unsafe { bcpack_fill(&req, t) };
+                        // the destination gets solid blocks and the request still fails, unless
+                        // they are neutral ones: then it completes, as a request that ran
+                        let neutral = self.bcpack_neutral.load(Ordering::Relaxed);
+                        let filled = fill.as_ref().is_some_and(|t| unsafe { bcpack_fill(&req, t, neutral) });
+                        if filled && neutral {
+                            continue;
                         }
                         self.fail(hr, req, file.as_deref());
                         if since_status >= 0 {
@@ -1170,6 +1217,7 @@ unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8,
     if ev.is_null() {
         return E_ABORT;
     }
+    let (fill, neutral) = bcpack_fill_from_env();
     let inner = Arc::new(QueueInner {
         desc: raw,
         source_memory: source == 1,
@@ -1181,7 +1229,8 @@ unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8,
         closed: AtomicBool::new(false),
         error_event: ev as usize,
         errors: Mutex::new((0, None)),
-        bcpack_fill: AtomicBool::new(bcpack_fill_from_env()),
+        bcpack_fill: AtomicBool::new(fill),
+        bcpack_neutral: AtomicBool::new(neutral),
     });
     let o = new_object(queue_vtbl(), inner);
     let hr = queue_qi(o, riid, out);
@@ -1227,7 +1276,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
         warn_once("EnqueueRequest", format_args!("refused ({hr:#x}): {r:x?}"));
         let mut fill = None;
         if hr == E_DECOMPRESSION && r.bcpack() != 0 {
-            log_bcpack_refusal(&r, BCPACK.note(&r));
+            log_bcpack_refusal(&r, BCPACK.note(&r), q.bcpack_neutral.load(Ordering::Relaxed));
             if q.bcpack_fill.load(Ordering::Relaxed) {
                 fill = if !r.dest_physical_pages() {
                     Some(FillTarget::Virtual)
@@ -2310,6 +2359,154 @@ mod tests {
             assert!(dst[..n].chunks(16).all(|c| c == &block[..c.len()]), "solid BC7 blocks up to the destination size");
             assert!(dst[n..].iter().all(|&b| b == 0xCD), "nothing past the destination size");
             assert!(BCPACK.filled_bytes[7].load(Ordering::Relaxed) >= before + n as u64);
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+        }
+    }
+
+    #[test]
+    fn bcpack_neutral_blocks_are_opaque_mid_grey() {
+        let b = |m| bcpack_neutral_block(m).unwrap();
+        // BC1: 565 0x8410 is r 16/31, g 32/63, b 16/31
+        const GREY: [u8; 4] = [132, 130, 132, 255];
+        assert_eq!(b(1), [0x10, 0x84, 0x10, 0x84, 0, 0, 0, 0]);
+        assert!(bc1_texels(&b(1), false).iter().all(|t| *t == GREY), "BC1");
+        assert_eq!(b(2), [[0xFF; 8], BC1_GREY].concat(), "BC2: explicit alpha 15, then the BC1 grey");
+        assert!(bc1_texels(&b(2)[8..], true).iter().all(|t| *t == GREY), "BC2 colour");
+        assert!(bc4_values(&b(3)[..8]).iter().all(|&a| a == 255), "BC3 alpha");
+        assert!(bc1_texels(&b(3)[8..], true).iter().all(|t| *t == GREY), "BC3 colour");
+        assert_eq!(b(4), [0x80, 0x80, 0, 0, 0, 0, 0, 0]);
+        assert!(bc4_values(&b(4)).iter().all(|&r| r == 128), "BC4");
+        assert!(bc4_values(&b(5)[..8]).iter().chain(&bc4_values(&b(5)[8..])).all(|&v| v == 128), "BC5: a flat normal");
+        // BC6H mode 11 by hand: bits 0-4 the mode (3), then six 10-bit endpoints of 462 (0x1CE)
+        // from bit 5 to 64 (the 60-bit run 0x0739CE739CE739CE shifted left by 5), indices 0. In
+        // UF16, 462 unquantizes to ((462 << 16) + 0x8000) >> 10 = 29600 and ends as
+        // (29600 * 31) >> 6 = 0x3801: the half 0.5 + 2^-11.
+        assert_eq!(b(6), [0xC3, 0x39, 0xE7, 0x9C, 0x73, 0xCE, 0x39, 0xE7, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(bc6h_mode11_texels(&b(6)).iter().all(|t| *t == [0x3801; 3]), "BC6H");
+        // BC7 mode 6 by hand: bit 6 the mode; the 7-bit endpoints r0 r1 g0 g1 b0 b1 are 64, only
+        // their top bit set (bits 13, 20, 27, 34, 41, 48); a0 a1 are 127 (bits 49-62); p-bits 63
+        // and 64; indices 0. Each endpoint is (e << 1) | p: grey 129, alpha 255.
+        assert_eq!(b(7), [0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0xFF, 0xFF, 0x01, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(bc7_mode6_texels(&b(7)).iter().all(|t| *t == [129, 129, 129, 255]), "BC7");
+        assert_eq!((bcpack_neutral_block(0), bcpack_neutral_block(8)), (None, None), "not a BCn mode");
+    }
+
+    #[test]
+    fn the_bcpack_fill_switch_is_off_magenta_or_neutral() {
+        // (fill, neutral)
+        for off in [None, Some(""), Some(" 0 ")] {
+            assert_eq!(bcpack_fill_switch(off), (false, false), "{off:?}");
+        }
+        assert_eq!(bcpack_fill_switch(Some("1")), (true, false), "magenta, the request still fails");
+        assert_eq!(bcpack_fill_switch(Some(" Neutral ")), (true, true));
+    }
+
+    #[test]
+    fn a_refused_bcpack_request_completes_only_under_neutral() {
+        use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&8u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 5, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+            let fence = MockFence { vtbl: mock_fence_vtbl().as_ptr(), refs: AtomicU32::new(1), signalled: AtomicU64::new(0) };
+            let fence_ptr = &fence as *const MockFence as *mut c_void;
+            let ev = queue_get_error_event(q);
+            let packed = [0x5Au8; 64];
+            // a status entry and a fence signal after what was enqueued, then Submit; the status
+            let finish = |index: u32| {
+                queue_enqueue_status(q, s, index);
+                queue_enqueue_signal(q, fence_ptr, index as u64 + 1);
+                queue_submit(q);
+                let t = std::time::Instant::now();
+                while fence.signalled.load(Ordering::Acquire) != index as u64 + 1 && t.elapsed().as_secs() < 5 {
+                    std::thread::yield_now();
+                }
+                status_get_hresult(s, index)
+            };
+            let run = |r: [u8; REQUEST_BYTES], index: u32| {
+                queue_enqueue_request(q, r.as_ptr());
+                finish(index)
+            };
+            // the error record: (failures, first failure)
+            let record = || {
+                let mut rec = [0u8; ERROR_RECORD_BYTES];
+                queue_retrieve_error_record(q, rec.as_mut_ptr());
+                (u32::from_le_bytes(rec[0..4].try_into().unwrap()), i32::from_le_bytes(rec[8..12].try_into().unwrap()))
+            };
+            let bc1 = |dst: *mut u8, n: usize| request(SOURCE_MEMORY_BIT | 1 << BCPACK_SHIFT, dst as u64, n as u32, packed.as_ptr() as u64, 0, packed.len() as u32);
+            // a BC1 destination of 0x404 bytes (a part block at the end), then guard bytes
+            let n = 0x404usize;
+            let mut dst = vec![0xCDu8; n + 64];
+            assert!(!queue(q).bcpack_neutral.load(Ordering::Relaxed), "off unless XCL_DSTORAGE_BCPACK_FILL=neutral");
+
+            // neutral: grey blocks up to the destination size, and the request completes: S_OK in
+            // its status entry, the fence after it signalled, no error record, no error event
+            queue(q).bcpack_fill.store(true, Ordering::Relaxed);
+            queue(q).bcpack_neutral.store(true, Ordering::Relaxed);
+            assert_eq!(run(bc1(dst.as_mut_ptr(), n), 0), S_OK);
+            assert!(dst[..n].chunks(8).all(|c| c == &BC1_GREY[..c.len()]), "neutral BC1 blocks up to the destination size");
+            assert!(dst[n..].iter().all(|&b| b == 0xCD), "nothing past the destination size");
+            assert_eq!(WaitForSingleObject(ev, 0), WAIT_TIMEOUT, "no error event");
+            assert_eq!(record(), (0, 0), "no error record");
+
+            // the same into a physical page (with the test's unified memory) that the title puts in
+            // its page array after EnqueueRequest, as a retail title does: BC7 into a page mapped in
+            // a reservation, read back there
+            if crate::gpu::uma::get().is_some() {
+                use crate::hle::kernelx::{AllocateTitlePhysicalPages, FreeTitlePhysicalPages, MapTitlePhysicalPages, PHYS_PAGE_SIZE};
+                use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+                let mut count = 1usize;
+                let mut pages = [0usize; 1];
+                assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, pages.as_mut_ptr()), 1);
+                let reserved = VirtualAlloc(std::ptr::null(), PHYS_PAGE_SIZE, MEM_RESERVE, PAGE_READWRITE);
+                assert!(!reserved.is_null());
+                assert_eq!(MapTitlePhysicalPages(reserved, 1, 0, 4, pages.as_mut_ptr()), reserved);
+                let mut table = Box::new([0usize]);
+                let options = SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT | 7 << BCPACK_SHIFT;
+                queue_enqueue_request(q, request_ex(options, table.as_ptr() as u64, 0x40, 0x100, packed.as_ptr() as u64, 0, packed.len() as u32, 0, 0).as_ptr());
+                std::ptr::write_volatile(&mut table[0], pages[0]);
+                assert_eq!(finish(1), S_OK);
+                let got = std::slice::from_raw_parts((reserved as *const u8).add(0x40), 0x100);
+                let grey = bcpack_neutral_block(7).unwrap();
+                assert!(got.chunks(16).all(|c| c == &grey[..]), "neutral BC7 blocks in the page");
+                assert_eq!(record(), (0, 0));
+                MapTitlePhysicalPages(reserved, 1, 0, 4, std::ptr::null_mut());
+                VirtualFree(reserved, 0, MEM_RELEASE);
+                assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, pages.as_mut_ptr()), 1);
+            }
+
+            // a destination it cannot write: the refusal stands
+            assert_eq!(run(bc1(0x10 as *mut u8, 8), 2), E_DECOMPRESSION);
+            assert_eq!(record(), (1, E_DECOMPRESSION));
+
+            // `1`: magenta blocks, and the request still fails
+            queue(q).bcpack_neutral.store(false, Ordering::Relaxed);
+            dst.fill(0xCD);
+            assert_eq!(run(bc1(dst.as_mut_ptr(), n), 3), E_DECOMPRESSION);
+            assert!(dst[..n].chunks(8).all(|c| c == &BC1_MAGENTA[..c.len()]), "magenta BC1 blocks");
+            assert_eq!(record(), (1, E_DECOMPRESSION));
+
+            // unset: the request fails and its destination stays as it was
+            queue(q).bcpack_fill.store(false, Ordering::Relaxed);
+            dst.fill(0xCD);
+            assert_eq!(run(bc1(dst.as_mut_ptr(), n), 4), E_DECOMPRESSION);
+            assert!(dst.iter().all(|&b| b == 0xCD), "without the switch the destination is left as it was");
+            assert_eq!(record(), (1, E_DECOMPRESSION));
+
+            CloseHandle(ev);
             queue_close(q);
             queue_release(q);
             status_release(s);
