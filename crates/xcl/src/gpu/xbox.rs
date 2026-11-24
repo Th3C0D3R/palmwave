@@ -18,6 +18,7 @@
 //!            +0x18 zlib stream → FSSM
 //! FSSM       +0 "FSSM"  +4 u32 version (0x101)  +8 u32 size of everything after the 16-B header
 //!            +0xC0 u64 code offset, +0xC8 u64 code size (offsets relative to +0x10)
+//!            +0xD4 u32 flags: bit 5 = the code is for 32-lane waves (wave32)
 //!            +0x100 hardware-stage descriptor u64 0x000000C0_0002_AAHH
 //!                   (HH = PAL hardware stage, AA = API stage; one more every 0x88 B,
 //!                   e.g. GS + its VS copy shader); unused fields are 0xDEADBEEF.
@@ -141,6 +142,13 @@ impl Fssm {
             Some((o, l)) => &self.data[o..o + l],
             None => &[],
         }
+    }
+
+    /// The header says the code is for 32-lane waves: bit 5 of the flags word at +0xD4
+    /// (measured on a retail pack: set for every program with 32-bit EXEC writes, clear for
+    /// every one with 64-bit ones). An unused field (0xDEADBEEF) says nothing.
+    pub fn wave32(&self) -> bool {
+        self.version == 0x101 && rd32(&self.data, 0xD4).is_some_and(|w| w != 0xDEAD_BEEF && w & 0x20 != 0)
     }
 
     pub fn stage_label(&self) -> String {
@@ -797,6 +805,25 @@ pub(crate) mod tests {
         let f = &sh.fssm[0];
         assert!(!f.code_from_header);
         assert!(f.programs.iter().any(|p| p.offset == 0x308), "{:?}", f.programs);
+    }
+
+    /// A wave32 program without an EXEC write (nothing in its code tells the wave size) is
+    /// wave32 by its header; a clear flag or an unused field leaves it to the code.
+    #[test]
+    fn wave_size_comes_from_the_header_flag() {
+        let wave64 = |flags: u32| {
+            let mut f = fssm(&CODE, &[(6, 5)]);
+            f[0xD4..0xD8].copy_from_slice(&flags.to_le_bytes());
+            let sh = parse(&sample(5, &[f])).unwrap();
+            let f = &sh.fssm[0];
+            let p = &f.programs[0];
+            (f.wave32(), crate::gpu::recomp::fssm_wave64(f, &f.data[p.offset..p.offset + p.len]))
+        };
+        assert!(crate::gpu::recomp::detect_wave64(&CODE), "the code alone reads as wave64");
+        assert_eq!(wave64(0x20), (true, false));
+        assert_eq!(wave64(0x1F | 0x40), (false, true));
+        assert_eq!(wave64(0), (false, true));
+        assert_eq!(wave64(0xDEAD_BEEF), (false, true));
     }
 
     #[test]
