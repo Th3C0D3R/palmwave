@@ -1205,10 +1205,20 @@ fn resource_dim_to_view(r: &D3D12_RESOURCE_DESC) -> i32 {
 
 static NON_UMA_BUFFER_VIEWS: AtomicU64 = AtomicU64::new(0);
 
+/// A buffer the title placed in a GPU view of its CPU memory (`kernelx::mirrors`): where
+/// shaders read it (`gpu_view_buffers`) and its bytes.
+fn gpu_view_buffer(res: usize) -> Option<(usize, usize)> {
+    let va = title_address(res).filter(|&va| crate::hle::kernelx::mirrors::in_some_view(va))?;
+    let p = res as *mut c_void;
+    let bytes = unsafe { ID3D12Resource::from_raw_borrowed(&p) }.map(|r| unsafe { r.GetDesc() }).filter(|d| d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)?.Width as usize;
+    unsafe { super::gpu_view_buffers::address(va, bytes, "a placed buffer") }.map(|at| (at, bytes))
+}
+
 /// V# of a buffer view (raw: 4-byte elements, num_records in bytes; structured / typed:
-/// stride = element size, num_records in elements); empty when the buffer is not in UMA.
+/// stride = element size, num_records in elements); empty when the buffer is not in UMA and
+/// not in a GPU view of the title's memory either.
 fn buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool) -> [u32; 4] {
-    let Some((at, bytes)) = console_buffer(res) else {
+    let Some((at, bytes)) = console_buffer(res).or_else(|| gpu_view_buffer(res)) else {
         note_buffer_view();
         return [0; 4];
     };
@@ -1422,6 +1432,10 @@ unsafe fn place_console_buffer(this: *mut c_void, props: usize, desc: usize, sta
 /// title's allocation stays the title's.
 pub(super) unsafe fn place_at_title_address(this: *mut c_void, va: usize, desc: &[u8; 0x38], state: u32, clear: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
     let u = crate::gpu::uma::get()?;
+    // a buffer in a GPU view of the title's CPU memory: placed over the memory shaders read it
+    // at (`gpu_view_buffers`), which holds the pages the title maps under the view
+    let width = std::ptr::read_unaligned(desc.as_ptr() as *const D3D12_RESOURCE_DESC).Width as usize;
+    let va = super::gpu_view_buffers::address(va, width, "a placed buffer").unwrap_or(va);
     let k = u.window_of(va)?;
     let (base, size) = u.window(k);
     let mut d: D3D12_RESOURCE_DESC = std::ptr::read_unaligned(desc.as_ptr() as *const D3D12_RESOURCE_DESC);
@@ -1804,8 +1818,25 @@ unsafe fn texture_memory(res: *mut c_void) -> Option<usize> {
 }
 
 fn note_buffer_view() {
-    if NON_UMA_BUFFER_VIEWS.fetch_add(1, Ordering::Relaxed) == 0 {
-        crate::xlog_warn!("buffer view in the console heap: the buffer is not in UMA – the shader gets an empty V# (num_records 0)");
+    let n = NON_UMA_BUFFER_VIEWS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        crate::xlog_warn!("buffer view in the console heap: the buffer is not in UMA – the shader gets an empty V# (num_records 0) ({n} so far)");
+    }
+}
+
+/// A buffer view of memory (no resource) that is neither unified memory nor in a GPU view:
+/// its V# carries the address as it is, and `mem` reads whatever window its bits 32 and 33
+/// name. Counted, with the CPU views of GPU views apart (the title's streaming memory).
+fn note_stray_view(va: u64) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    static CPU_VIEW: AtomicU64 = AtomicU64::new(0);
+    if va == 0 || crate::gpu::uma::get().is_none_or(|u| u.contains(va as usize)) {
+        return;
+    }
+    let cpu = crate::hle::kernelx::mirrors::in_cpu_view(va as usize);
+    let (n, c) = (N.fetch_add(1, Ordering::Relaxed) + 1, CPU_VIEW.fetch_add(cpu as u64, Ordering::Relaxed) + cpu as u64);
+    if n.is_power_of_two() {
+        crate::xlog_warn!("D3D12.X: a buffer view of memory at {va:#x} is neither in unified memory nor in a GPU view – shaders read another window's bytes there ({n} so far, {c} of them in the CPU view of a GPU view)");
     }
 }
 
@@ -1818,6 +1849,8 @@ unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12
         return f(this, desc, cpu);
     };
     let (va, size) = desc.as_ref().map_or((0, 0), |d| (d.BufferLocation, d.SizeInBytes));
+    // (a buffer in a GPU view of the title's memory: where shaders read it)
+    let va = super::gpu_view_buffers::address(va as usize, size as usize, "a constant buffer view").map_or(va, |p| p as u64);
     let in_uma = crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize));
     if !in_uma {
         note_buffer_view();
@@ -2204,7 +2237,12 @@ fn buffer_words_at(va: u64, format: windows::Win32::Graphics::Dxgi::Common::DXGI
         (false, s) => (s, s),
     };
     let records = if stride == 0 { n.saturating_mul(4) } else { n };
-    crate::gpu::desc::buffer_words(va + first * elem as u64, stride, records, fmt)
+    // a view of memory in a GPU view of the title's CPU memory: where shaders read it (its
+    // own address is no window's – `mem` took the window from its bits 32 and 33)
+    let (from, bytes) = (va + first * elem as u64, records as u64 * if stride == 0 { 1 } else { stride as u64 });
+    let from = unsafe { super::gpu_view_buffers::address(from as usize, bytes as usize, "a buffer view of memory") }.map_or(from, |p| p as u64);
+    note_stray_view(from);
+    crate::gpu::desc::buffer_words(from, stride, records, fmt)
 }
 
 unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, counter: *mut c_void, desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, cpu: u64) {
@@ -6565,6 +6603,50 @@ mod srv_tests {
         let mut d2 = cube;
         d2.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
         assert!(cube_as_cube_array(&d2).is_none());
+    }
+}
+
+#[cfg(test)]
+mod gpu_view_buffer_view_tests {
+    use super::*;
+    use crate::hle::kernelx::mirrors::{self, apply_batches, PAGE};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT;
+
+    /// A buffer view of memory in a GPU view (device #70 / #71: no resource) gets a V# whose
+    /// address is unified memory holding the pages the queue's page-mapping method put under
+    /// the view. (It carried the GPU-view address: `mem` read another window's bytes.)
+    #[test]
+    fn a_buffer_view_of_memory_in_a_gpu_view_reads_the_mapped_pages() {
+        let Some(u) = crate::gpu::uma::get() else { return };
+        #[repr(C)]
+        struct Batch {
+            dest: u64,
+            ranges_n: u32,
+            _pad: u32,
+            ranges: usize,
+        }
+        // (addresses far above anything Windows hands out, and a size no other test uses)
+        let (cpu, gpu, size) = (0x71B0_0000_0000usize, 0x71B6_0000_0000usize, 0x12D * PAGE);
+        mirrors::reserved(cpu, size, 0x2040_2000, 0x04);
+        mirrors::reserved(gpu, size, 0x2040_2000, 0x801);
+        let pool: Vec<u32> = (0..(2 * PAGE / 4) as u32).map(|i| 0xB0F0_0000 | i).collect();
+        unsafe {
+            // pool page 1 under the view's page 3
+            let r = [[0u32, 1, 1]];
+            let b = Batch { dest: (gpu + 3 * PAGE) as u64, ranges_n: 1, _pad: 0, ranges: r.as_ptr() as usize };
+            assert!(apply_batches(1, &b as *const Batch as usize, pool.as_ptr() as usize, 2).is_some());
+            // 8 elements of 4 bytes from element 2 of the memory at the page's byte 0x100
+            let words = buffer_words_at((gpu + 3 * PAGE + 0x100) as u64, DXGI_FORMAT_R32_UINT, 2, 8, 0, false);
+            let v = crate::gpu::desc::buffer(&words);
+            assert!(u.contains(v.address as usize), "the V# names {:#x}, which is not unified memory", v.address);
+            assert_eq!((v.stride, v.num_records), (4, 8));
+            let first = (PAGE + 0x100) / 4 + 2;
+            assert_eq!(std::slice::from_raw_parts(v.address as *const u32, 8), &pool[first..first + 8], "the pool page's elements");
+            // memory outside any GPU view keeps its address
+            let own = buffer_words_at(u.base() as u64 + 0x40, DXGI_FORMAT_R32_UINT, 0, 4, 0, false);
+            assert_eq!(crate::gpu::desc::buffer(&own).address, u.base() as u64 + 0x40);
+        }
+        mirrors::released(cpu);
     }
 }
 

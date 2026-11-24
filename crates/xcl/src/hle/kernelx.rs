@@ -180,6 +180,26 @@ pub mod mirrors {
         gpu: BTreeMap<usize, (usize, usize)>,
     }
     static STATE: Mutex<State> = Mutex::new(State { cpu: Vec::new(), gpu: BTreeMap::new() });
+    /// the lowest address of a GPU view and the end of the highest one (`in_some_view`)
+    static BOUNDS: [std::sync::atomic::AtomicUsize; 2] = [std::sync::atomic::AtomicUsize::new(usize::MAX), std::sync::atomic::AtomicUsize::new(0)];
+
+    fn set_bounds(s: &State) {
+        use std::sync::atomic::Ordering::Release;
+        BOUNDS[0].store(s.gpu.keys().next().copied().unwrap_or(usize::MAX), Release);
+        BOUNDS[1].store(s.gpu.iter().map(|(&g, &(n, _))| g + n).max().unwrap_or(0), Release);
+    }
+
+    /// Whether `va` lies in the CPU view some GPU view is paired with.
+    pub fn in_cpu_view(va: usize) -> bool {
+        STATE.lock().unwrap().gpu.values().any(|&(size, cpu)| va >= cpu && va < cpu + size)
+    }
+
+    /// Whether `va` lies in a GPU view: `source(va).is_some()`, without the lock for an
+    /// address outside all of them (asked for every root descriptor a title binds).
+    pub fn in_some_view(va: usize) -> bool {
+        use std::sync::atomic::Ordering::Acquire;
+        va >= BOUNDS[0].load(Acquire) && va < BOUNDS[1].load(Acquire) && source(va).is_some()
+    }
 
     /// A reservation of `size` bytes at `base` with allocation type `t` and protection `p`.
     pub fn reserved(base: usize, size: usize, t: u32, p: u32) {
@@ -192,6 +212,7 @@ pub mod mirrors {
             let taken: Vec<usize> = s.gpu.values().map(|&(_, c)| c).collect();
             if let Some(&(cpu, _)) = s.cpu.iter().rev().find(|&&(b, n)| n == size && !taken.contains(&b)) {
                 s.gpu.insert(base, (size, cpu));
+                set_bounds(&s);
                 super::GPU_VIEW_MAP_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
                 crate::xlog_info!("kernelx: reservation {base:#x} ({size:#x} bytes, no CPU access) is the GPU view of {cpu:#x}");
             }
@@ -219,6 +240,7 @@ pub mod mirrors {
             }
             pages.changed.retain(|&(a, _)| a < g || a >= g + n);
         }
+        set_bounds(&s);
     }
 
     /// Bytes of a page the queue's page-mapping method maps (the console's 64 KiB pages).

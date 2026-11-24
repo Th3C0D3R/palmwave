@@ -240,6 +240,8 @@ pub(super) unsafe extern "system" fn set_graphics_root_constants(this: *mut c_vo
 /// #40 / #42)
 pub(super) unsafe extern "system" fn set_graphics_root_descriptor(this: *mut c_void, i: u32, va: u64) {
     note_address(va);
+    // (in a GPU view of the title's CPU memory: where shaders read it)
+    let va = super::gpu_view_buffers::root_address(va);
     put_in(this, true, i, 0, &va.to_le_bytes());
 }
 
@@ -1172,6 +1174,7 @@ pub(super) unsafe extern "system" fn set_compute_root_constants(this: *mut c_voi
 /// #39 / #41): the 64-bit GPU address
 pub(super) unsafe extern "system" fn set_compute_root_descriptor(this: *mut c_void, i: u32, va: u64) {
     note_address(va);
+    let va = super::gpu_view_buffers::root_address(va);
     put(this, i, 0, &va.to_le_bytes());
 }
 

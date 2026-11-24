@@ -3259,6 +3259,10 @@ unsafe fn gpu_va(list: *mut c_void, va: u64, bytes: usize, what: &str, mirror: b
     if t != va || va == 0 || bytes == 0 {
         return t;
     }
+    // in a GPU view of the title's CPU memory: the pages mapped under it, kept in step
+    if let Some(p) = super::gpu_view_buffers::address(va as usize, bytes, what) {
+        return pc_va(p as u64);
+    }
     // in a window by number: a PC resource's GPU address
     if crate::gpu::uma::get().is_none_or(|u| u.contains(va as usize)) || !crate::gpu::shader::readable(va as usize, bytes) {
         return t;

@@ -369,8 +369,9 @@ static TEXTURES: Mutex<Table> = Mutex::new(Table::new());
 static REFRESH: Mutex<()> = Mutex::new(());
 static TEXTURES_GEN: AtomicU64 = AtomicU64::new(0);
 static TEXTURES_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// cached `watch_ranges` keyed by `(sparse::mapped_gen, TEXTURES_GEN, graphics_reservations_gen)`
-static WATCH_CACHE: Mutex<Option<((u64, u64, u64), Arc<Vec<(usize, usize)>>)>> = Mutex::new(None);
+/// cached `watch_ranges` keyed by `(sparse::mapped_gen, TEXTURES_GEN, graphics_reservations_gen,
+/// gpu_view_buffers::gen)`
+static WATCH_CACHE: Mutex<Option<((u64, u64, u64, u64), Arc<Vec<(usize, usize)>>)>> = Mutex::new(None);
 /// the queue uploads go to, per device
 static QUEUES: Mutex<BTreeMap<usize, ID3D12CommandQueue>> = Mutex::new(BTreeMap::new());
 static UPLOADS: AtomicU64 = AtomicU64::new(0);
@@ -585,6 +586,13 @@ fn recheck_gpu_view_sources() {
     let all = SEEN.swap(gen, Ordering::AcqRel) != gen;
     if !all && pages.is_empty() {
         return;
+    }
+    // the buffers there, as shaders read them
+    unsafe {
+        if all {
+            super::gpu_view_buffers::views_changed();
+        }
+        super::gpu_view_buffers::pages_changed(&pages);
     }
     let mut changed = false;
     // (the shadowed textures too: one comes back when the texture over it goes)
@@ -805,6 +813,7 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
         super::sparse::mapped_gen(),
         TEXTURES_GEN.load(Ordering::Acquire),
         crate::hle::kernelx::graphics_reservations_gen(),
+        super::gpu_view_buffers::gen(),
     );
     {
         let g = WATCH_CACHE.lock().unwrap();
@@ -820,6 +829,7 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     regions.extend(crate::hle::kernelx::graphics_reservations());
     let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().by_res.values().flat_map(|e| e.src.ranges(e.tex.size() as usize).map(|(s, e)| (s & !0xFFF, (e + 0xFFF) & !0xFFF)).collect::<Vec<_>>()).collect();
     wanted.extend(super::sparse::mapped_ranges());
+    wanted.extend(super::gpu_view_buffers::source_ranges());
     let computed = Arc::new(watch_ranges(&regions, wanted));
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
     computed
@@ -892,6 +902,15 @@ unsafe fn refresh_once(queue: *mut c_void) {
             }
         });
         dirty.sort_unstable();
+        // buffers in GPU views: the pages written under them are copied to where shaders read
+        // them, and those pages go to video memory with this submit
+        let mut copied = Vec::new();
+        super::gpu_view_buffers::written(&dirty, page as usize, &mut copied);
+        if !copied.is_empty() {
+            dirty.extend(copied);
+            dirty.sort_unstable();
+            dirty.dedup();
+        }
         dirty.len()
     });
     super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
