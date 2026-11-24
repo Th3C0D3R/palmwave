@@ -506,6 +506,7 @@ pub unsafe fn record(list: *mut c_void, resource_barrier: ResourceBarrierFn, lis
 }
 
 const PC_GET_TYPE: usize = 8;
+const PC_COPY_RESOURCE: usize = 17;
 const PC_RESOURCE_BARRIER: usize = 26;
 
 unsafe fn record_on_adopted(this: *mut c_void, n: u32, groups: usize) {
@@ -516,7 +517,15 @@ unsafe fn record_on_adopted(this: *mut c_void, n: u32, groups: usize) {
 
 /// command list #146 Barrier(NumBarrierGroups, pBarrierGroups)
 pub(super) unsafe extern "system" fn barrier_x(this: *mut c_void, n: u32, groups: *const c_void) {
-    super::list_x::note_depth_uav_barrier_groups(n, groups);
+    let syncs = super::list_x::note_depth_uav_barrier_groups(n, groups);
+    // depth buffers that shaders write: their twins follow the title's layout changes (#970)
+    for (res, into) in syncs {
+        let rb: unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER) = std::mem::transmute(super::real::orig_fn(this, PC_RESOURCE_BARRIER));
+        let cr: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(super::real::orig_fn(this, PC_COPY_RESOURCE));
+        let barrier = |b: &[D3D12_RESOURCE_BARRIER]| rb(this, b.len() as u32, b.as_ptr());
+        let copy = |dst: &ID3D12Resource, src: &ID3D12Resource| cr(this, dst.as_raw(), src.as_raw());
+        super::depth_twin::sync(res, into, &barrier, &copy);
+    }
     record_on_adopted(this, n, groups as usize);
 }
 

@@ -34,6 +34,8 @@ const TRANSITIONS_MARKER: u32 = 0x8C0F_E007;
 const COPY_BUFFER_MARKER: u32 = 0x8C0F_E008;
 const CLEAR_UAV_MARKER: u32 = 0x8C0F_E009;
 const COPY_TEXTURE_MARKER: u32 = 0x8C0F_E00A;
+/// a depth buffer and its twin, copied at an enhanced barrier (resource, into UNORDERED_ACCESS)
+const TWIN_COPY_MARKER: u32 = 0x8C0F_E00B;
 /// root parameter header: 0xC0000000 | i << 10 (bits 31:30 set: the inline code leaves its
 /// dirty flag alone); the inline code adds the constant offset · 4 (bits 9:2) and
 /// (count − 1) << 16
@@ -544,8 +546,11 @@ unsafe extern "system" fn cl_copy_texture_region(this: *mut c_void, dst: *const 
     push(this as usize, &w);
 }
 unsafe extern "system" fn cl_barrier(this: *mut c_void, n: u32, groups: *const c_void) {
-    super::list_x::note_depth_uav_barrier_groups(n, groups);
+    let syncs = super::list_x::note_depth_uav_barrier_groups(n, groups);
     push(this as usize, &[BARRIER_MARKER]);
+    for (res, into) in syncs {
+        push(this as usize, &[TWIN_COPY_MARKER, res as u32, (res >> 32) as u32, into as u32]);
+    }
 }
 unsafe extern "system" fn cl_allocate_upload_memory(this: *mut c_void, size: usize, align: usize) -> *mut u8 {
     let Some(u) = crate::gpu::uma::get() else { return std::ptr::null_mut() };
@@ -832,6 +837,12 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                     out.skipped += 1;
                 }
                 at += 35;
+            } else if w0 == TWIN_COPY_MARKER {
+                let res = get(1) as usize | (get(2) as usize) << 32;
+                let barrier = |b: &[D3D12_RESOURCE_BARRIER]| list.ResourceBarrier(b);
+                let copy = |dst: &ID3D12Resource, src: &ID3D12Resource| list.CopyResource(dst, src);
+                super::depth_twin::sync(res, get(3) != 0, &barrier, &copy);
+                at += 4;
             } else if w0 == BARRIER_MARKER {
                 list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                     Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
