@@ -225,7 +225,7 @@ mod used {
             let path = crate::gpu::recomp::dxc::cache_dir().join("used-pipelines.txt");
             let earlier = parse(&std::fs::read_to_string(&path).unwrap_or_default());
             if !earlier.is_empty() {
-                crate::xlog_info!("D3D12.X: the pipelines of {} shader sets an earlier run used are built ahead of their first use", earlier.len());
+                crate::xlog_info!("D3D12.X: earlier runs used the pipelines of {} shader sets ({})", earlier.len(), path.display());
             }
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
@@ -248,7 +248,9 @@ mod used {
         let mut g = get().now.lock().unwrap();
         if g.0.insert(key) {
             if let Some(f) = g.1.as_mut() {
-                let _ = writeln!(f, "{key:016x}");
+                // at once and in one write (`writeln!` writes the digits and the newline apart):
+                // a run that is ended or crashes keeps whole lines
+                let _ = f.write_all(format!("{key:016x}\n").as_bytes());
             }
         }
     }
