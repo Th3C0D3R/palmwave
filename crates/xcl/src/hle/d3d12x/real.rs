@@ -1158,7 +1158,7 @@ unsafe fn view_shape(res: &ID3D12Resource, format: windows::Win32::Graphics::Dxg
     use crate::gpu::desc::ImageType as T;
     let r = res.GetDesc();
     let f = if format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN { r.Format } else { format };
-    let fmt = crate::gpu::desc::gfx10_format(f).unwrap_or(0);
+    let fmt = shader_view_image_format(f);
     let mips = if mips == 0 || mips == u32::MAX { r.MipLevels as u32 } else { mips };
     let (w, h, d) = (r.Width as u32, r.Height, r.DepthOrArraySize as u32);
     let ty = match dim {
@@ -1180,6 +1180,14 @@ unsafe fn view_shape(res: &ID3D12Resource, format: windows::Win32::Graphics::Dxg
         _ => 1,
     };
     Some((fmt, ty, w, h, depth, mips))
+}
+
+/// The T#'s numeric class must match the PC view, including its stencil-only formats.
+fn shader_view_image_format(format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT) -> u32 {
+    match format.0 {
+        22 | 47 => 5, // X32_TYPELESS_G8X24_UINT / X24_TYPELESS_G8_UINT: R8_UINT
+        _ => crate::gpu::desc::gfx10_format(format).unwrap_or(0),
+    }
 }
 
 fn resource_dim_to_view(r: &D3D12_RESOURCE_DESC) -> i32 {
@@ -2058,6 +2066,16 @@ fn pc_srv(rd: &D3D12_RESOURCE_DESC, v: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>)
     out.Format = DXGI_FORMAT(f as i32);
     // the PC reads stencil from plane 1; the console's view of it is plane 0 in a stencil format
     if stencil {
+        if v.is_some_and(|v| v.Format.0 == 62) {
+            // An R8_UINT view exposes stencil in red; the PC stencil formats put it in green.
+            // Compose the title's swizzle with (green, zero, zero, one), preserving constants.
+            let mapping = out.Shader4ComponentMapping;
+            for c in 0..4 {
+                let from = (mapping >> (3 * c)) & 7;
+                let to = match from { 0 => 1, 1 | 2 => 4, 3 => 5, x => x };
+                out.Shader4ComponentMapping = (out.Shader4ComponentMapping & !(7 << (3 * c))) | (to << (3 * c));
+            }
+        }
         if out.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D {
             out.Anonymous.Texture2D.PlaneSlice = 1;
         } else if out.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY {
@@ -6227,6 +6245,169 @@ mod rect_list_pso_tests {
             assert_eq!(g.PrimitiveTopologyType, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
             assert!(untranslated_stream_desc(desc(&tri), true).is_none());
             assert!(untranslated_stream_desc(desc(&rect), false).is_none());
+        }
+    }
+}
+
+#[cfg(test)]
+mod stencil_view_tests {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+
+    fn depth_desc(format: DXGI_FORMAT) -> D3D12_RESOURCE_DESC {
+        D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 8, Height: 8, DepthOrArraySize: 1, MipLevels: 1,
+            Format: format, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, ..Default::default()
+        }
+    }
+
+    fn stencil_srv(format: DXGI_FORMAT, mapping: u32, array: bool) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+        let mut v = D3D12_SHADER_RESOURCE_VIEW_DESC { Format: format, Shader4ComponentMapping: mapping, ..Default::default() };
+        if array {
+            v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            v.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV { MipLevels: 1, ArraySize: 1, ..Default::default() };
+        } else {
+            v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            v.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() };
+        }
+        v
+    }
+
+    fn mapping(channels: [u32; 4]) -> u32 {
+        1 << 12 | channels.iter().enumerate().map(|(c, x)| x << (3 * c)).sum::<u32>()
+    }
+
+    #[test]
+    fn stencil_views_keep_the_unsigned_image_class() {
+        for format in [DXGI_FORMAT_X32_TYPELESS_G8X24_UINT, DXGI_FORMAT_X24_TYPELESS_G8_UINT] {
+            assert_eq!(shader_view_image_format(format), 5, "stencil must select Texture2D<uint4>");
+        }
+        assert_eq!(shader_view_image_format(DXGI_FORMAT_R8_UINT), 5);
+        assert_eq!(shader_view_image_format(DXGI_FORMAT_R32_FLOAT), 22);
+    }
+
+    #[test]
+    fn stencil_r8_views_compose_the_titles_component_mapping() {
+        for (resource, view) in [(DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT), (DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_X24_TYPELESS_G8_UINT)] {
+            for array in [false, true] {
+                for (from, to) in [([0, 1, 2, 3], [1, 4, 4, 5]), ([5, 0, 4, 0], [5, 1, 4, 1])] {
+                    let v = pc_srv(&depth_desc(resource), Some(&stencil_srv(DXGI_FORMAT_R8_UINT, mapping(from), array))).unwrap();
+                    assert_eq!((v.Format, v.Shader4ComponentMapping), (view, mapping(to)));
+                    let plane = unsafe { if array { v.Anonymous.Texture2DArray.PlaneSlice } else { v.Anonymous.Texture2D.PlaneSlice } };
+                    assert_eq!(plane, 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stencil_native_views_keep_the_titles_component_mapping() {
+        for (resource, view) in [(DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT), (DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_X24_TYPELESS_G8_UINT)] {
+            let v = stencil_srv(view, mapping([1, 0, 5, 4]), false);
+            assert_eq!(pc_srv(&depth_desc(resource), Some(&v)).unwrap().Shader4ComponentMapping, v.Shader4ComponentMapping);
+        }
+        let ordinary = depth_desc(DXGI_FORMAT_R8_TYPELESS);
+        assert!(pc_srv(&ordinary, Some(&stencil_srv(DXGI_FORMAT_R8_UINT, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, false))).is_none());
+    }
+
+    #[test]
+    fn gpu_stencil_r8_view_image_load_returns_integer_stencil() {
+        use crate::gpu::{rdna2::encode, recomp::{self, dxc, runner}};
+        use std::mem::{transmute_copy, ManuallyDrop};
+        if dxc::location().is_err() { runner::skip_test("no DXC"); return; }
+        unsafe {
+            let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let selector = crate::gpu::adapter::Selector::from_env_or("auto");
+            let Some((adapter, adapter_desc)) = crate::gpu::adapter::candidates(&factory, &selector).into_iter().next() else { runner::skip_test("no GPU"); return };
+            println!("stencil view test adapter: {}", crate::gpu::adapter::name(&adapter_desc));
+            let Ok(dev) = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0) else { runner::skip_test("no GPU"); return };
+            let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL { HighestShaderModel: D3D_SHADER_MODEL_6_6 };
+            if dev.CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &mut sm as *mut _ as _, std::mem::size_of_val(&sm) as u32).is_err() || sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
+                runner::skip_test("no GPU"); return;
+            }
+            let mut code = encode("IMAGE_LOAD", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 15), ("DIM", 1), ("UNORM", 1)], None).unwrap();
+            code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+            let t = recomp::translate(&code, &recomp::Options { wave64: false, ..Default::default() }).unwrap();
+            assert!(t.complete(), "{:?}", t.unsupported);
+            let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+            let rs = recomp::pso::abi_root_signature(&dev, false).unwrap();
+            let pso: ID3D12PipelineState = dev.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: transmute_copy(&rs), CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() }, ..Default::default()
+            }).unwrap();
+            let buffer = |bytes, heap, state, flags| -> ID3D12Resource {
+                let d = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: bytes, Height: 1, DepthOrArraySize: 1, MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, Flags: flags, ..Default::default()
+                };
+                let mut r = None;
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &d, state, None, &mut r).unwrap();
+                r.unwrap()
+            };
+            let transition = |r: &ID3D12Resource, before, after| D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: transmute_copy(r), Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, StateBefore: before, StateAfter: after
+                }) }, ..Default::default()
+            };
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            for (i, format) in [DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_R24G8_TYPELESS].into_iter().enumerate() {
+                let d = depth_desc(format);
+                let mut depth: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_DEPTH_WRITE, None, &mut depth).unwrap();
+                let depth = depth.unwrap();
+                let heaps = |ty, flags| -> ID3D12DescriptorHeap { dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: ty, NumDescriptors: 1, Flags: flags, NodeMask: 0 }).unwrap() };
+                let dsv_heap = heaps(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, D3D12_DESCRIPTOR_HEAP_FLAG_NONE);
+                let srv_heap = heaps(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE);
+                let sampler_heap = heaps(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE);
+                let dsv = dsv_heap.GetCPUDescriptorHandleForHeapStart();
+                dev.CreateDepthStencilView(&depth, default_dsv(&d).as_ref(), dsv);
+                let v = pc_srv(&d, Some(&stencil_srv(DXGI_FORMAT_R8_UINT, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, false))).unwrap();
+                dev.CreateShaderResourceView(&depth, Some(&v), srv_heap.GetCPUDescriptorHandleForHeapStart());
+                let (fmt, ty, w, h, z, m) = view_shape(&depth, v.Format, v.ViewDimension.0, 1, 1).unwrap();
+                let mut io = vec![0u32; recomp::KERNEL_SGPRS + recomp::KERNEL_LANES * recomp::KERNEL_VGPRS];
+                io[16..24].copy_from_slice(&crate::gpu::desc::xcl_image_for_view(0, fmt, ty, w, h, z, m));
+                io[126] = u32::MAX;
+                io[127] = u32::MAX;
+                let io_bytes = (io.len() * 4) as u64;
+                let res_bytes = (recomp::KERNEL_RES_DWORDS * 4) as u64;
+                let upload = buffer(io_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_FLAG_NONE);
+                let input = buffer(io_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+                let output = buffer(res_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+                let rb = buffer(res_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE);
+                let mut ptr = std::ptr::null_mut();
+                upload.Map(0, None, Some(&mut ptr)).unwrap();
+                std::ptr::copy_nonoverlapping(io.as_ptr(), ptr as *mut u32, io.len());
+                upload.Unmap(0, None);
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso).unwrap();
+                list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.25, 0xA5, None);
+                list.CopyBufferRegion(&input, 0, &upload, 0, io_bytes);
+                list.ResourceBarrier(&[transition(&input, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS), transition(&depth, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)]);
+                list.SetDescriptorHeaps(&[Some(srv_heap.clone()), Some(sampler_heap.clone())]);
+                list.SetComputeRootSignature(&rs);
+                list.SetComputeRootUnorderedAccessView(0, input.GetGPUVirtualAddress());
+                list.SetComputeRootUnorderedAccessView(1, output.GetGPUVirtualAddress());
+                list.SetComputeRootUnorderedAccessView(2, input.GetGPUVirtualAddress());
+                list.Dispatch(1, 1, 1);
+                list.ResourceBarrier(&[transition(&output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                list.CopyBufferRegion(&rb, 0, &output, 0, res_bytes);
+                list.Close().unwrap();
+                queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                let value = i as u64 + 1;
+                queue.Signal(&fence, value).unwrap();
+                crate::gpu::fence::wait(&fence, value, &dev, None, 10_000).unwrap();
+                rb.Map(0, None, Some(&mut ptr)).unwrap();
+                let values = std::slice::from_raw_parts(ptr as *const u32, recomp::KERNEL_RES_DWORDS);
+                let observed: Vec<_> = (0..32).map(|lane| {
+                    let at = recomp::KERNEL_SGPRS + lane * recomp::KERNEL_VGPRS + 10;
+                    values[at..at + 4].to_vec()
+                }).collect();
+                rb.Unmap(0, None);
+                assert!(observed.iter().all(|v| v == &[0xA5, 0, 0, 1]), "format {}: {observed:?}", format.0);
+                assert_eq!(dev.GetDeviceRemovedReason(), Ok(()));
+            }
         }
     }
 }
