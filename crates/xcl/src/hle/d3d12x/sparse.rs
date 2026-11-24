@@ -601,7 +601,10 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
     match made {
         Ok(s) => {
             crate::xlog_info!("D3D12.X: {} sparse window(s) for the title's own memory (tiled buffers on video memory)", out.len());
-            *STATE.lock().unwrap() = Some(s);
+            // a state this replaces (the windows set up again) goes after the lock: the release of
+            // its last buffers reaches `forget_buffer`, which takes the lock (#344)
+            let old = STATE.lock().unwrap().replace(s);
+            drop(old);
             IN_USE.store(true, Ordering::Release);
             for (a, b) in std::mem::take(&mut *EARLY.lock().unwrap()) {
                 committed(a, b - a);
