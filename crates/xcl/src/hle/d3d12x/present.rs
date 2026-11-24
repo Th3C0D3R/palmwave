@@ -502,6 +502,9 @@ struct Presenter {
     fence: ID3D12Fence,
     copy_source: Option<ID3D12Resource>,
     dumps: Vec<FrameDump>,
+    /// `XCL_SHOW_TARGET`'s pass for the swap chain's format; failed: the title's picture only
+    viewer: Option<super::show_target::Viewer>,
+    viewer_failed: bool,
     disabled: bool,
     value: u64,
     event: HANDLE,
@@ -556,7 +559,7 @@ unsafe fn new_presenter(queue: usize) -> Option<Presenter> {
     } else { None };
     Some(Presenter {
         queue, dev: dev.clone(), sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN, alloc, list, fence,
-        copy_source: None, dumps: Vec::new(), disabled: false, value: 0, event,
+        copy_source: None, dumps: Vec::new(), viewer: None, viewer_failed: false, disabled: false, value: 0, event,
         last: Instant::now() - Duration::from_secs(1),
         overlay: None, overlay_init: None, overlay_format: DXGI_FORMAT_UNKNOWN, timing,
         frame_stats: super::overlay_stats::FrameStats::default(),
@@ -671,6 +674,9 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     p.copy_source = None;
     if let Some(timing) = &mut p.timing { timing.completed(); }
     p.dumps.clear();
+    if let Some(v) = p.viewer.as_mut() {
+        v.done();
+    }
     // `XCL_MESH_RECORD_DUMP`: the queue is past the frame before this one
     super::mesh_dump::flush();
     // `XCL_MESH_INPUT_DUMP`: likewise
@@ -711,16 +717,30 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     if p.alloc.Reset().is_err() || p.list.Reset(&p.alloc, None).is_err() {
         return;
     }
-    let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
-    p.list.ResourceBarrier(&b1);
+    // the targets the title drew into during this frame (`XCL_RT_DUMP`, `XCL_SHOW_TARGET`)
+    let drawn = super::rt_dump::enabled().then(|| super::rt_dump::take_frame(PRESENTS.load(Ordering::Relaxed)));
     if let Some(timing) = &p.timing { timing.stamp(&p.list, 0); }
-    p.list.CopyResource(&bb, &src);
+    // the back buffer's state while it is written: the debug view drawn into it, or the
+    // title's picture copied
+    let mut written = if drawn.as_ref().is_some_and(|t| debug_view(p, t, &bb)) {
+        D3D12_RESOURCE_STATE_RENDER_TARGET
+    } else {
+        let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
+        p.list.ResourceBarrier(&b1);
+        p.list.CopyResource(&bb, &src);
+        D3D12_RESOURCE_STATE_COPY_DEST
+    };
     if let Some(timing) = &p.timing { timing.stamp(&p.list, 1); }
     if super::overlay::enabled() { p.frame_stats.record_frame(Instant::now()); }
     if let Some(timing) = &p.timing { timing.stamp(&p.list, 2); }
     let mut overlay_drawn = false;
     if super::overlay::visible() {
         if let Some(overlay) = &mut p.overlay {
+            // (the overlay draws into a back buffer in COPY_DEST and leaves it there)
+            if written != D3D12_RESOURCE_STATE_COPY_DEST {
+                p.list.ResourceBarrier(&[transition(&bb, written, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                written = D3D12_RESOURCE_STATE_COPY_DEST;
+            }
             let lines = p.frame_stats.lines(p.timing.as_ref().and_then(|t| t.copy_ms), p.timing.as_ref().and_then(|t| t.overlay_ms));
             overlay_drawn = overlay.draw(&p.dev, &p.list, &bb, &lines);
         }
@@ -762,27 +782,28 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     // `XCL_RT_DUMP`: the targets the title drew into during this frame (subresource 0: of a
     // depth-stencil target, the depth plane), each copied from the state the title left it in
     // (COMMON: promoted for the copy, as the frame is)
-    if super::rt_dump::enabled() {
-        for (k, super::rt_dump::Source { res, desc: d, state, view }) in super::rt_dump::frame_targets(PRESENTS.load(Ordering::Relaxed)).into_iter().enumerate() {
+    if let Some(t) = drawn.as_ref() {
+        for (k, super::rt_dump::Source { res, desc: d, state, view }) in t.targets.iter().take(t.dumped).enumerate() {
+            let (state, view) = (*state, *view);
             let readable = state == D3D12_RESOURCE_STATE_COMMON || state.0 & D3D12_RESOURCE_STATE_COPY_SOURCE.0 != 0;
             let barrier = |before, after| {
-                let mut b = transition(&res, before, after);
+                let mut b = transition(res, before, after);
                 (*b.Anonymous.Transition).Subresource = 0;
                 p.list.ResourceBarrier(&[b]);
             };
             if !readable {
                 barrier(state, D3D12_RESOURCE_STATE_COPY_SOURCE);
             }
-            let copy = readback_copy(&p.list, &res, &d);
+            let copy = readback_copy(&p.list, res, d);
             if !readable {
                 barrier(D3D12_RESOURCE_STATE_COPY_SOURCE, state);
             }
             if let Some((buffer, footprint)) = copy {
-                dumps.push(FrameDump { _source: res, buffer, footprint, format: d.Format, tag: String::new(), rt: Some((k, view)) });
+                dumps.push(FrameDump { _source: res.clone(), buffer, footprint, format: d.Format, tag: String::new(), rt: Some((k, view)) });
             }
         }
     }
-    let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
+    let b2 = [transition(&bb, written, D3D12_RESOURCE_STATE_PRESENT)];
     p.list.ResourceBarrier(&b2);
     if p.list.Close().is_err() {
         return;
@@ -866,6 +887,32 @@ fn present_wait_from(v: Option<&str>) -> u32 {
     v.and_then(|v| v.trim().parse().ok()).unwrap_or(120_000)
 }
 
+/// `XCL_SHOW_TARGET`: the view it asks for of `frame`'s targets recorded on `p.list`, drawn into
+/// all of the back buffer `bb` (true: `bb` is left in RENDER_TARGET). False – the switch is off,
+/// the frame has no such target, or no pass could be made (no DXC: logged once) – the title's
+/// picture is copied as usual.
+unsafe fn debug_view(p: &mut Presenter, frame: &super::rt_dump::Frame, bb: &ID3D12Resource) -> bool {
+    if !super::show_target::enabled() {
+        return false;
+    }
+    if p.viewer.as_ref().is_none_or(|v| v.fmt != p.fmt) {
+        // inside a non-blocking pipeline creation nothing may compile: the picture this time
+        if p.viewer_failed || crate::gpu::recomp::dxc::in_cached_only() {
+            return false;
+        }
+        match super::show_target::Viewer::new(&p.dev, p.fmt) {
+            Ok(v) => p.viewer = Some(v),
+            Err(e) => {
+                p.viewer_failed = true;
+                crate::xlog_warn!("present: XCL_SHOW_TARGET: no pass for the debug view ({e}) – the title's picture is shown");
+                return false;
+            }
+        }
+    }
+    let Some(v) = p.viewer.as_mut() else { return false };
+    v.record(&p.dev, &p.list, frame, bb, (p.w, p.h))
+}
+
 /// `XCL_FRAME_DUMP=1`: every 120th shown frame is written to the logs folder (`XCL_FRAME_DUMP=n`,
 /// n > 1: every n-th; a title loading at a few frames a second shows few)
 /// (`frame_<n>.bmp`, a quarter of each side; `XCL_FRAME_DUMP_FULL=1`: full size) – what the title presented, before the window.
@@ -920,7 +967,7 @@ pub fn last_frame_dump() -> Option<FrameDumpSample> {
 }
 
 /// a copy of subresource 0 of `src` into a new readback buffer, recorded on `list`
-unsafe fn readback_copy(list: &ID3D12GraphicsCommandList, src: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
+pub(super) unsafe fn readback_copy(list: &ID3D12GraphicsCommandList, src: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
     let dev: ID3D12Device = {
         let mut d: Option<ID3D12Device> = None;
         src.GetDevice(&mut d).ok()?;
