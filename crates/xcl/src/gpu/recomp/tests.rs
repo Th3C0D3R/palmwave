@@ -8682,3 +8682,105 @@ fn gpu_mesh_fp16_params_reach_the_pixel_shader() {
         assert!(got.iter().zip(want).all(|(a, b)| (a - b).abs() < 4e-3), "pixel ({x},{y}) = {got:?}, expected {want:?}");
     }
 }
+
+/// The programs of a frame census through the translator, with the options the runtime gives
+/// them on a GPU with 32-lane waves (`pso`: four memory windows from the descriptor heap, the
+/// split wave64 form for compute and mesh programs, the 32-lane form for wave64 VS / PS), and
+/// what the translation says about itself: instructions it could not translate or left out,
+/// lane reads `upper_lanes` could not resolve, programs that keep the `pc` block chain.
+/// `XCL_SAMPLE_RPF`; `XCL_FRAME_PROGRAMS` = a file of `stage<TAB>hash<TAB>weight` lines (the
+/// hash of the container, as a frame census names it; AS = an MS in the AS slot);
+/// `XCL_FRAME_OUT` = a folder for `programs.tsv` and each program's HLSL and disassembly
+/// (title data: never commit it); `XCL_FRAME_WINDOWS` = the windows (default 4 from the heap).
+#[test]
+#[ignore]
+fn retail_frame_programs_translation_report() {
+    use std::collections::BTreeMap;
+    let (Ok(path), Ok(list)) = (std::env::var("XCL_SAMPLE_RPF"), std::env::var("XCL_FRAME_PROGRAMS")) else { return };
+    let out = std::env::var("XCL_FRAME_OUT").ok().map(std::path::PathBuf::from);
+    let windows: u32 = std::env::var("XCL_FRAME_WINDOWS").ok().and_then(|v| v.parse().ok()).unwrap_or(4 | super::HEAP_WINDOWS);
+    // hash → (stage, weight)
+    let mut want: BTreeMap<u64, (String, usize)> = BTreeMap::new();
+    for l in std::fs::read_to_string(list).unwrap().lines() {
+        let mut f = l.split('\t');
+        let (Some(stage), Some(Ok(h))) = (f.next(), f.next().map(|h| u64::from_str_radix(h.trim(), 16))) else { continue };
+        want.insert(h, (stage.to_string(), f.next().and_then(|w| w.trim().parse().ok()).unwrap_or(1)));
+    }
+    let data = std::fs::read(path).unwrap();
+    let mut rows = Vec::new();
+    // what → (programs, weight)
+    let mut gaps: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    let mut found = std::collections::BTreeSet::new();
+    for r in crate::gpu::pack::scan(&data, 0x40) {
+        let Some(blob) = crate::gpu::pack::inflate(&data, &r) else { continue };
+        let hash = crate::gpu::shader::fnv64(&blob);
+        let Some((stage, weight)) = want.get(&hash) else { continue };
+        if !found.insert(hash) {
+            continue;
+        }
+        let hw = match stage.as_str() {
+            "VS" => 4,
+            "PS" => 5,
+            "CS" => 6,
+            _ => 7,
+        };
+        let Some(sh) = crate::gpu::xbox::parse(&blob) else { continue };
+        let Some(f) = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == hw)) else { continue };
+        let (Some(mode), Some(p)) = (super::interface(&blob, &sh, f), f.programs.first()) else {
+            rows.push(format!("{stage}\t{hash:016x}\t{weight}\t{}\tno interface", r.name));
+            continue;
+        };
+        let code = &f.data[p.offset..p.offset + p.len];
+        let wave64 = super::fssm_wave64(f, code);
+        let graphics = matches!(mode, Mode::Vertex(_) | Mode::Pixel(_));
+        let (hazards, resolved) = if graphics && wave64 { super::wave_lane_reads(code) } else { Default::default() };
+        let interface = format!("{mode:?} output table {:?}", super::vs_output_table(&f.data));
+        let t = translate(code, &Options { mode, wave64, split_wave64: true, mem_windows: windows, ..Default::default() });
+        let mut notes: Vec<String> = Vec::new();
+        let (instructions, bytes) = match &t {
+            Ok(t) => {
+                notes.extend(t.unsupported_why.keys().map(|k| format!("untranslated {k}")));
+                notes.extend(t.ignored.keys().map(|k| format!("ignored {k}")));
+                if t.hlsl.contains("pc ==") {
+                    notes.push("pc block chain".into());
+                }
+                (t.instructions, t.hlsl.len())
+            }
+            Err(e) => {
+                notes.push(format!("error {}", e.lines().next().unwrap_or("")));
+                (0, 0)
+            }
+        };
+        notes.extend(hazards.iter().map(|h| format!("lane hazard {h}")));
+        notes.extend(resolved.iter().map(|h| format!("lane read {h}")));
+        for n in &notes {
+            let g = gaps.entry(format!("{stage:<2} {n}")).or_default();
+            g.0 += 1;
+            g.1 += weight;
+        }
+        rows.push(format!("{stage}\t{hash:016x}\t{weight}\t{}\twave{}\t{instructions}\t{bytes}\t{}", r.name, if wave64 { 64 } else { 32 }, notes.join("; ")));
+        if let (Some(dir), Ok(t)) = (&out, &t) {
+            std::fs::write(dir.join(format!("{stage}_{hash:016x}.hlsl")), &t.hlsl).unwrap();
+            // the interface and the disassembly, with the fields of an export its text leaves out
+            let mut s = format!("; {} {interface}\n", r.name);
+            let mut off = 0;
+            while off + 4 <= code.len() {
+                let Ok(d) = crate::gpu::rdna2::decode(&code[off..], off as u64) else { break };
+                let fv = |n: &str| crate::gpu::rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
+                let exp = if d.enc.name == "ENC_EXP" { format!(" ; en={:#x} compr={} done={} vm={}", fv("EN"), fv("COMPR"), fv("DONE"), fv("VM")) } else { String::new() };
+                s.push_str(&format!("{:05x}: {}{exp}\n", d.pc, crate::gpu::rdna2::format(&d)));
+                off += d.len;
+            }
+            std::fs::write(dir.join(format!("{stage}_{hash:016x}.s")), s).unwrap();
+            std::fs::write(dir.join(format!("{stage}_{hash:016x}.fssm")), &f.data[..p.offset.min(f.data.len())]).unwrap();
+        }
+    }
+    let missing: Vec<String> = want.iter().filter(|(h, _)| !found.contains(h)).map(|(h, (s, w))| format!("{s} {h:016x} ({w})")).collect();
+    println!("{} of {} programs found in the pack; not in it: {missing:?}", found.len(), want.len());
+    for (k, (n, w)) in &gaps {
+        println!("  {n:>5} programs {w:>6} uses  {k}");
+    }
+    if let Some(dir) = &out {
+        std::fs::write(dir.join("programs.tsv"), rows.join("\n")).unwrap();
+    }
+}
