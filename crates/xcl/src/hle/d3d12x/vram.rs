@@ -1664,6 +1664,27 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     }
 }
 
+/// The pages' fences (tile mappings of the title's textures), for the log of a GPU wait that
+/// timed out: completed / signalled, and the value each queue last waited for. A lock another
+/// thread holds is not waited for. `name` names a queue.
+pub(super) fn fence_summary(name: &dyn Fn(usize) -> String) -> String {
+    let Ok(g) = PAGES.try_lock() else { return "pages busy".into() };
+    let v: Vec<String> = g
+        .values()
+        .flatten()
+        .map(|p| {
+            let mut waited: Vec<String> = p.waited.iter().map(|(&q, &v)| format!("{}>={v}", name(q))).collect();
+            waited.sort();
+            format!("pages {}/{} (queues wait for {})", unsafe { p.fence.GetCompletedValue() }, p.value, waited.join(" "))
+        })
+        .collect();
+    if v.is_empty() {
+        "no pages".into()
+    } else {
+        v.join(", ")
+    }
+}
+
 #[cfg(test)]
 pub(super) static VRAM_TEST_LOCK: Mutex<()> = Mutex::new(());
 

@@ -1145,6 +1145,20 @@ static ON_QUEUE: Mutex<BTreeMap<usize, QueueUploads>> = Mutex::new(BTreeMap::new
 /// upload buffer bytes a title queue may have in flight; past it the oldest batches are waited for
 const IN_FLIGHT_BYTES: u64 = 512 << 20;
 
+/// The upload batches on title queues the GPU has not run, for the log of a GPU wait that
+/// timed out. A lock another thread holds is not waited for. `name` names a queue.
+pub(super) fn upload_summary(name: &dyn Fn(usize) -> String) -> String {
+    let Ok(g) = ON_QUEUE.try_lock() else { return "uploads busy".into() };
+    let v: Vec<String> = g
+        .iter()
+        .filter_map(|(&q, u)| {
+            let left = u.in_flight.iter().filter(|f| unsafe { !f.done() }).count();
+            (left > 0).then(|| format!("{} {left} batches ({} MB in flight)", name(q), u.bytes >> 20))
+        })
+        .collect();
+    format!("uploads on title queues not run: {}", if v.is_empty() { "none".into() } else { v.join(", ") })
+}
+
 /// The title's queue, when uploads can run on it: a DIRECT queue of `dev`.
 unsafe fn title_queue_for(dev: &ID3D12Device, title: Option<&ID3D12CommandQueue>) -> Option<ID3D12CommandQueue> {
     let q = title?;

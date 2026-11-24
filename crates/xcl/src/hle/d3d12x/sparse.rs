@@ -1541,6 +1541,42 @@ fn needs_later_submit(queue: usize) -> bool {
     g.as_mut().is_some_and(|s| unsafe { s.needs_later_submit(queue, &mut Vec::new()) })
 }
 
+/// The fences here, for the log of a GPU wait that timed out: the sparse queue's (tile mappings
+/// and the uploads of what the CPU wrote: completed / signalled, and the value each title queue
+/// last waited for) and each title queue's for its copies back (completed / given out, and the
+/// jobs not done – the title's signals put off behind them among them). A lock another thread
+/// holds is not waited for. `name` names a queue.
+pub(super) fn fence_summary(name: &dyn Fn(usize) -> String) -> String {
+    let sparse = match STATE.try_lock() {
+        Ok(g) => match g.as_ref() {
+            Some(s) => {
+                let mut waited: Vec<String> = s.waited.iter().map(|(&q, &v)| format!("{}>={v}", name(q))).collect();
+                waited.sort();
+                format!("sparse queue {}/{} (queues wait for {})", unsafe { s.fence.GetCompletedValue() }, s.value, waited.join(" "))
+            }
+            None => "no sparse queue".into(),
+        },
+        Err(_) => "sparse queue busy".into(),
+    };
+    let copies = match (RB.try_lock(), JOBS.try_lock()) {
+        (Ok(order), Ok(jobs)) => {
+            let mut v: Vec<String> = order
+                .0
+                .iter()
+                .flatten()
+                .map(|(&q, (fence, given))| {
+                    let left = jobs.as_ref().map_or(0, |j| j.queues.get(&q).map_or(0, |d| d.len()) + j.running.get(&q).map_or(0, |&n| n as usize));
+                    format!("{} {}/{given} ({left} jobs)", name(q), unsafe { fence.GetCompletedValue() })
+                })
+                .collect();
+            v.sort();
+            format!("copies back {}", if v.is_empty() { "none".into() } else { v.join(", ") })
+        }
+        _ => "copies back busy".into(),
+    };
+    format!("{sparse}; {copies}")
+}
+
 /// A copy back on a title queue, recorded and not yet submitted.
 struct CopyBack {
     buf: ID3D12Resource,
