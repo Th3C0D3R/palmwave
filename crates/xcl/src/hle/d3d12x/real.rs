@@ -1239,6 +1239,7 @@ fn buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_
     let base = at as u64 + first * elem as u64;
     let room = (bytes as u64).saturating_sub(first * elem as u64);
     let records = if stride == 0 { (n as u64 * 4).min(room) } else { (n as u64).min(room / stride as u64) };
+    super::target_memory::note_view(base, records * if stride == 0 { 1 } else { stride as u64 }, "a buffer view");
     crate::gpu::desc::buffer_words(base, stride, records as u32, fmt)
 }
 
@@ -1873,6 +1874,7 @@ unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12
         note_buffer_view();
     }
     let (va, size) = if in_uma { (va, size) } else { (0, 0) };
+    super::target_memory::note_view(va, size as u64, "a constant buffer view");
     super::console_heap::write(&slot, &crate::gpu::desc::cbv_words(va, size));
 }
 
@@ -2292,6 +2294,7 @@ fn buffer_words_at(va: u64, format: windows::Win32::Graphics::Dxgi::Common::DXGI
         None => from,
     };
     note_stray_view(from);
+    super::target_memory::note_view(from, bytes, "a buffer view of memory");
     crate::gpu::desc::buffer_words(from, stride, records, fmt)
 }
 

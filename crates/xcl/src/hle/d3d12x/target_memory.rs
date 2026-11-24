@@ -16,6 +16,7 @@
 //! resources over the same memory. One texel only: whatever a console texture's tiling, texel
 //! (0, 0) of its first mip is at its address; a larger target would need the console's layout
 //! (XG) to be written back. Draws through ExecuteIndirect or DispatchMesh are not followed.
+//! A buffer or constant buffer view that names such a target's memory is logged (`note_view`).
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -38,6 +39,9 @@ struct Target {
     buffer: ID3D12Resource,
     offset: u64,
     format: DXGI_FORMAT,
+    /// its address and the bytes of its texel (`note_view`)
+    va: usize,
+    bytes: u32,
 }
 
 /// target → the buffer its texel is copied to
@@ -102,13 +106,30 @@ pub unsafe fn note_target(device: *mut c_void, res: usize, va: usize, d: &D3D12_
     if offset % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64 != 0 {
         return failed("not at a multiple of 512 bytes");
     }
-    let old = TARGETS.lock().unwrap().get_or_insert_with(HashMap::new).insert(res, Target { buffer, offset, format: d.Format });
+    let old = TARGETS.lock().unwrap().get_or_insert_with(HashMap::new).insert(res, Target { buffer, offset, format: d.Format, va, bytes });
     if old.is_none() {
         LIVE.fetch_add(1, Ordering::Relaxed);
     }
     let n = N.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 8 || n.is_power_of_two() {
         crate::xlog_info!("D3D12.X: a render target of one texel at {va:#x} (format {}): copied to that memory after each draw into it ({n} so far)", d.Format.0);
+    }
+}
+
+/// A buffer or constant buffer view of `bytes` at `va` was made (`what`): logged when it names
+/// the memory of a one-texel target – the reads its copies are for.
+pub fn note_view(va: u64, bytes: u64, what: &str) {
+    if LIVE.load(Ordering::Relaxed) == 0 || va == 0 || bytes == 0 {
+        return;
+    }
+    let (va, bytes) = (va as usize, bytes as usize);
+    let hit = TARGETS.lock().unwrap().as_ref().and_then(|m| m.values().find(|t| t.va < va + bytes && va < t.va + t.bytes as usize).map(|t| t.va));
+    static N: AtomicU64 = AtomicU64::new(0);
+    if let Some(at) = hit {
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            crate::xlog_info!("D3D12.X: {what} of {bytes} bytes at {va:#x} names the memory of the render target of one texel at {at:#x} ({n} so far)");
+        }
     }
 }
 
