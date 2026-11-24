@@ -3626,7 +3626,7 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
     }
     if super::rt_dump::enabled() {
         for b in out.iter().filter(|b| b[0] == 0) {
-            super::rt_dump::note_transition(this as usize, (b[2] as u64 | (b[3] as u64) << 32) as usize, b[4], D3D12_RESOURCE_STATES(b[6] as i32), b[1] & 1 != 0);
+            super::rt_dump::note_transition(this as usize, (b[2] as u64 | (b[3] as u64) << 32) as usize, b[4], D3D12_RESOURCE_STATES(b[5] as i32), D3D12_RESOURCE_STATES(b[6] as i32), b[1] & 1 != 0);
         }
     }
     // the states uploads into textures kept in step start from once this list has run

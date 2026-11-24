@@ -204,16 +204,6 @@ pub fn rtv_resource(handle: usize) -> Option<usize> {
     RTVS.lock().unwrap().as_ref()?.get(&handle).copied()
 }
 
-/// `res` if a render-target view names it now (which keeps it alive), with a reference of its own.
-pub(super) unsafe fn live_target(res: usize) -> Option<ID3D12Resource> {
-    let g = RTVS.lock().unwrap();
-    if !g.as_ref()?.values().any(|&r| r == res) {
-        return None;
-    }
-    let raw = res as *mut c_void;
-    ID3D12Resource::from_raw_borrowed(&raw).cloned()
-}
-
 /// The resource bound as render target 0 on `list` (`XCL_TRACE_FRAME`).
 pub fn rt0_resource(list: usize) -> Option<usize> {
     let h = *LISTS.lock().unwrap().as_ref()?.get(&list)?;
@@ -521,8 +511,8 @@ struct FrameDump {
     footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     format: DXGI_FORMAT,
     tag: String,
-    /// a render target of the frame (`XCL_RT_DUMP`): its rank
-    rt: Option<usize>,
+    /// a target of the frame (`XCL_RT_DUMP`): its rank and how the title used it
+    rt: Option<(usize, super::rt_dump::View)>,
 }
 
 unsafe impl Send for Presenter {}
@@ -707,10 +697,11 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
             dumps.push(FrameDump { _source: res, buffer, footprint, format, tag, rt: None });
         }
     }
-    // `XCL_RT_DUMP`: the color render targets the title bound during this frame, each copied
-    // from the state the title left it in (COMMON: promoted for the copy, as the frame is)
+    // `XCL_RT_DUMP`: the targets the title drew into during this frame (subresource 0: of a
+    // depth-stencil target, the depth plane), each copied from the state the title left it in
+    // (COMMON: promoted for the copy, as the frame is)
     if super::rt_dump::enabled() {
-        for (k, (res, d, state)) in super::rt_dump::frame_targets(PRESENTS.load(Ordering::Relaxed)).into_iter().enumerate() {
+        for (k, super::rt_dump::Source { res, desc: d, state, view }) in super::rt_dump::frame_targets(PRESENTS.load(Ordering::Relaxed)).into_iter().enumerate() {
             let readable = state == D3D12_RESOURCE_STATE_COMMON || state.0 & D3D12_RESOURCE_STATE_COPY_SOURCE.0 != 0;
             let barrier = |before, after| {
                 let mut b = transition(&res, before, after);
@@ -725,7 +716,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
                 barrier(D3D12_RESOURCE_STATE_COPY_SOURCE, state);
             }
             if let Some((buffer, footprint)) = copy {
-                dumps.push(FrameDump { _source: res, buffer, footprint, format: d.Format, tag: String::new(), rt: Some(k) });
+                dumps.push(FrameDump { _source: res, buffer, footprint, format: d.Format, tag: String::new(), rt: Some((k, view)) });
             }
         }
     }
@@ -760,7 +751,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
             Ok(()) => {
                 for dump in p.dumps.drain(..) {
                     match dump.rt {
-                        Some(k) => super::rt_dump::write(&dump.buffer, &dump.footprint, dump.format, PRESENTS.load(Ordering::Relaxed), k),
+                        Some((k, view)) => super::rt_dump::write(&dump.buffer, &dump.footprint, dump.format, PRESENTS.load(Ordering::Relaxed), k, view),
                         None => write_frame(&dump.buffer, &dump.footprint, dump.format, &dump.tag),
                     }
                 }

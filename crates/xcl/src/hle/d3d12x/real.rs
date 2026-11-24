@@ -1936,6 +1936,9 @@ unsafe extern "system" fn dev_create_dsv_x(this: *mut c_void, res: *mut c_void, 
     if copy.is_none() {
         copy = ID3D12Resource::from_raw_borrowed(&res).and_then(|r| default_dsv(&r.GetDesc()));
     }
+    if super::rt_dump::enabled() {
+        super::rt_dump::note_dsv_view(cpu as usize, res, copy.is_some_and(|c| c.Flags.0 & D3D12_DSV_FLAG_READ_ONLY_DEPTH.0 != 0));
+    }
     f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu)
 }
 
@@ -5416,6 +5419,9 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "OMSetRenderTargets")));
     f(this, n, rtvs, single, dsv);
     super::list_x::note_render_targets(this, n, rtvs, single, dsv);
+    if let Some(&d) = dsv.as_ref().filter(|_| super::rt_dump::enabled()) {
+        super::rt_dump::note_depth_bound(this as usize, d);
+    }
     if super::present::trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 12 {
