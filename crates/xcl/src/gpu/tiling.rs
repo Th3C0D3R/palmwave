@@ -175,6 +175,54 @@ impl Layout {
         block * self.block_bytes + (xor as usize ^ self.base_xor)
     }
 
+    /// `offset_z` in two parts, so that a row of elements costs a lookup and an XOR each:
+    /// `offset_z(x, y, z, w) == row + (columns[x - x0] ^ xor)` with `(row, xor) = self.row(y, z, w)`.
+    /// A column is its block's offset in the row plus the in-block bits x gives (both XOR terms
+    /// stay under `block_bytes`, so they do not reach the block's offset).
+    fn columns(&self, x0: usize, n: usize) -> Vec<usize> {
+        let hi = |t: &[u32], c: usize, b: usize| t[(c / b) % t.len()];
+        (x0..x0 + n).map(|x| (x / self.block_w) * self.block_bytes | (self.ox[x % self.block_w] ^ hi(&self.hx, x, self.block_w)) as usize).collect()
+    }
+
+    /// the other part of `columns`: (the offset of row `y`'s blocks, the in-block bits y and z
+    /// and the base swizzle give)
+    fn row(&self, y: usize, z: usize, w: usize) -> (usize, usize) {
+        let hi = |t: &[u32], c: usize, b: usize| t[(c / b) % t.len()];
+        let xor = self.oy[y % self.block_h] ^ self.oz[z % self.block_d] ^ hi(&self.hy, y, self.block_h) ^ hi(&self.hz, z, self.block_d);
+        ((y / self.block_h) * w.div_ceil(self.block_w) * self.block_bytes, xor as usize ^ self.base_xor)
+    }
+
+    /// One row of linear elements (`dst`) from `src`: element k at `base + (columns[k] ^ xor)`;
+    /// elements past the end of `src` are left as they are. `contiguous`: the columns follow
+    /// each other (a linear layout), so with no XOR the row is one copy.
+    fn copy_row(&self, src: &[u8], base: usize, xor: usize, columns: &[usize], contiguous: bool, dst: &mut [u8]) {
+        fn each<const E: usize>(src: &[u8], base: usize, xor: usize, columns: &[usize], dst: &mut [u8]) {
+            for (d, &c) in dst.chunks_exact_mut(E).zip(columns) {
+                let o = base + (c ^ xor);
+                if let Some(s) = src.get(o..o + E) {
+                    d.copy_from_slice(s);
+                }
+            }
+        }
+        let e = 1usize << self.elem_log2;
+        if contiguous && xor == 0 {
+            let Some(&first) = columns.first() else { return };
+            let start = base + first;
+            let n = dst.len().min(src.len().saturating_sub(start) / e * e);
+            if n > 0 {
+                dst[..n].copy_from_slice(&src[start..start + n]);
+            }
+            return;
+        }
+        match e {
+            1 => each::<1>(src, base, xor, columns, dst),
+            2 => each::<2>(src, base, xor, columns, dst),
+            4 => each::<4>(src, base, xor, columns, dst),
+            8 => each::<8>(src, base, xor, columns, dst),
+            _ => each::<16>(src, base, xor, columns, dst),
+        }
+    }
+
     /// tiled → linear rows (`w << elem_log2` bytes each); bytes past the end of `src` read as 0
     pub fn detile(&self, src: &[u8], w: usize, h: usize) -> Vec<u8> {
         let e = 1usize << self.elem_log2;
@@ -363,19 +411,24 @@ impl Chain {
     /// bytes past the end of `mem` read as 0
     pub fn detile_volume(&self, mem: &[u8], i: usize) -> Vec<u8> {
         let l = self.levels[i];
-        let e = 1usize << self.layout.elem_log2;
-        let mut out = vec![0u8; l.width * l.height * l.depth * e];
-        for z in 0..l.depth {
-            for y in 0..l.height {
-                for x in 0..l.width {
-                    let o = self.element_at_z(&l, x, y, z);
-                    if let Some(s) = mem.get(o..o + e) {
-                        out[((z * l.height + y) * l.width + x) * e..][..e].copy_from_slice(s);
-                    }
-                }
-            }
+        let lay = &self.layout;
+        let row_bytes = l.width << lay.elem_log2;
+        let mut out = vec![0u8; row_bytes * l.height * l.depth];
+        let (columns, contiguous) = self.level_columns(&l);
+        for (r, dst) in out.chunks_exact_mut(row_bytes).enumerate() {
+            let (z, y) = (r / l.height, r % l.height);
+            let (row, xor) = lay.row(y + l.origin.1, z, l.pitch);
+            lay.copy_row(mem, (z / lay.block_d) * self.slice_bytes + l.offset + row, xor, &columns, contiguous, dst);
         }
         out
+    }
+
+    /// `Layout::columns` of level `l`'s elements, and whether they follow each other
+    fn level_columns(&self, l: &MipLevel) -> (Vec<usize>, bool) {
+        let columns = self.layout.columns(l.origin.0, l.width);
+        let e = 1usize << self.layout.elem_log2;
+        let contiguous = columns.windows(2).all(|p| p[1] == p[0] + e);
+        (columns, contiguous)
     }
 
     /// depth slices of linear rows of level `i` → their places in a 3D texture (`dst`)
@@ -396,28 +449,13 @@ impl Chain {
     /// bytes past the end of `src` read as 0
     pub fn detile_level(&self, src: &[u8], i: usize, slice: usize) -> Vec<u8> {
         let l = self.levels[i];
-        let e = 1usize << self.layout.elem_log2;
-        let mut out = vec![0u8; l.width * l.height * e];
-        if self.layout.mode == 0 && self.layout.base_xor == 0 && l.origin == (0, 0) {
-            // linear: a row's elements are contiguous, so it is copied whole (the elements that
-            // are all in `src`, as below) – a video plane of 3840×2160 is 2160 copies, not 8 M
-            let row = l.width * e;
-            for y in 0..l.height {
-                let o = self.element_at(&l, 0, y, slice);
-                let n = src.len().saturating_sub(o).min(row) / e * e;
-                if n > 0 {
-                    out[y * row..][..n].copy_from_slice(&src[o..o + n]);
-                }
-            }
-            return out;
-        }
-        for y in 0..l.height {
-            for x in 0..l.width {
-                let o = self.element_at(&l, x, y, slice);
-                if let Some(s) = src.get(o..o + e) {
-                    out[(y * l.width + x) * e..][..e].copy_from_slice(s);
-                }
-            }
+        let lay = &self.layout;
+        let row_bytes = l.width << lay.elem_log2;
+        let mut out = vec![0u8; row_bytes * l.height];
+        let (columns, contiguous) = self.level_columns(&l);
+        for (y, dst) in out.chunks_exact_mut(row_bytes).enumerate() {
+            let (row, xor) = lay.row(y + l.origin.1, slice, l.pitch);
+            lay.copy_row(src, l.offset + row, xor, &columns, contiguous, dst);
         }
         out
     }
@@ -624,6 +662,83 @@ mod tests {
             }
             for (i, lin) in want.iter().enumerate() {
                 assert_eq!(&c.detile_volume(&mem, i), lin, "mode {mode} e{e}: level {i} overwritten");
+            }
+        }
+    }
+
+    /// `detile_level` / `detile_volume` (a row at a time) give what the element-by-element
+    /// address (`element_at`, `element_at_z`) reads: every mode (linear too), element size and
+    /// pipe configuration, levels in and out of the mip tail, array slices past the first, a
+    /// base swizzle, and a source cut short (the missing elements read as 0).
+    #[test]
+    fn row_detile_matches_the_element_address() {
+        let bytes = |n: usize, seed: u32| -> Vec<u8> {
+            let mut s = seed;
+            (0..n)
+                .map(|_| {
+                    s = s.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                    (s >> 16) as u8
+                })
+                .collect()
+        };
+        let want_level = |c: &Chain, src: &[u8], i: usize, slice: usize| -> Vec<u8> {
+            let l = c.levels[i];
+            let e = 1usize << c.layout.elem_log2;
+            let mut out = vec![0u8; l.width * l.height * e];
+            for y in 0..l.height {
+                for x in 0..l.width {
+                    let o = c.element_at(&l, x, y, slice);
+                    if let Some(s) = src.get(o..o + e) {
+                        out[(y * l.width + x) * e..][..e].copy_from_slice(s);
+                    }
+                }
+            }
+            out
+        };
+        for mode in std::iter::once(0).chain(MODES) {
+            for e in 0..5 {
+                // the pipe configuration changes the tables, not the code path: three of them
+                for cfg in [(0, 0), (3, 2), (5, 3)].map(|(p, k)| PipeConfig { pipes_log2: p, pkrs_log2: k }) {
+                    for base_xor in [0usize, 0x100] {
+                        let mut lay = Layout::new(mode, e, cfg).unwrap();
+                        lay.base_xor = base_xor & (lay.block_bytes - 1);
+                        let c = Chain::new(lay, 70, 45, 1, 7);
+                        let src = bytes(c.slice_bytes, mode * 97 + e + cfg.pipes_log2 * 7);
+                        for cut in [src.len(), src.len() * 2 / 3] {
+                            for slice in [0, 3] {
+                                for i in 0..c.levels.len() {
+                                    assert_eq!(c.detile_level(&src[..cut], i, slice), want_level(&c, &src[..cut], i, slice), "mode {mode} e{e} {cfg:?} xor {base_xor:#x} cut {cut} slice {slice} level {i}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // 3D: thick and thin modes
+        let cfg = PipeConfig { pipes_log2: 3, pkrs_log2: 2 };
+        for mode in [0u32, 5, 9, 17, 21, 24, 25, 26, 27] {
+            for e in 0..5 {
+                let c = Chain::new_3d(Layout::new_3d(mode, e, cfg).unwrap(), 40, 24, 12, 1, 5);
+                let mem = bytes(c.slice_bytes * c.layers(), mode + e);
+                for cut in [mem.len(), mem.len() / 2] {
+                    for i in 0..c.levels.len() {
+                        let l = c.levels[i];
+                        let el = 1usize << e;
+                        let mut want = vec![0u8; l.width * l.height * l.depth * el];
+                        for z in 0..l.depth {
+                            for y in 0..l.height {
+                                for x in 0..l.width {
+                                    let o = c.element_at_z(&l, x, y, z);
+                                    if let Some(s) = mem[..cut].get(o..o + el) {
+                                        want[((z * l.height + y) * l.width + x) * el..][..el].copy_from_slice(s);
+                                    }
+                                }
+                            }
+                        }
+                        assert_eq!(c.detile_volume(&mem[..cut], i), want, "3D mode {mode} e{e} cut {cut} level {i}");
+                    }
+                }
             }
         }
     }
