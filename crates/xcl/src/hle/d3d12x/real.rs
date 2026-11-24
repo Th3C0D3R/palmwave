@@ -818,13 +818,20 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     // methods the newer console layout keeps at other slots: picked at each call
     if kind == Kind::CommandList {
         let older_handlers = console_slots(kind);
-        for (newer, older) in NEWER_LIST_SLOTS {
-            let Some(&(_, f)) = older_handlers.iter().find(|e| e.0 == older) else { continue };
+        for (newer, what) in newer_list_slots() {
             if newer >= total {
                 continue;
             }
-            let pc = if newer < scanned { *ot.add(newer) } else { v[1 + newer] };
-            v[1 + newer] = super::guard::make_layout_split(super::guard::LayoutTargets { older: v[1 + newer], newer: f, pc, newer_layout: &QUEUE_SHIFTED });
+            let f = match what {
+                NewerListSlot::Console(older) => {
+                    let Some(&(_, f)) = older_handlers.iter().find(|e| e.0 == older) else { continue };
+                    f
+                }
+                NewerListSlot::Pc(p) => pc[1 + p],
+                NewerListSlot::Extension => stubs::make_stub_info(DLL, &format!("{}::#{newer} (console extension, newer layout)", iface.name), 0).0,
+            };
+            let runtime = if newer < scanned { *ot.add(newer) } else { v[1 + newer] };
+            v[1 + newer] = super::guard::make_layout_split(super::guard::LayoutTargets { older: v[1 + newer], newer: f, pc: runtime, newer_layout: &QUEUE_SHIFTED });
         }
     }
     // XCL_D3D12_TRACE: every public method called from console code is logged
@@ -854,6 +861,8 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
 /// ResolveQueryData, SetPredication), so SetDescriptorHeaps … DiscardResource move up by 4
 /// (32–55 = PC 28–51); ID3D12GraphicsCommandList1 is at 104–109 (PC 60–65), the shading-rate
 /// methods at 124 / 125 (PC 77 / 78). The console-only methods in between: `list_x`.
+/// These are the older layout's slots; the newer layout has the ones from #104 on two slots
+/// later (`newer_list_slots`).
 fn console_remap(kind: Kind) -> Vec<(usize, usize)> {
     match kind {
         Kind::CommandList => (28..=31).map(|x| (x, x + 24)).chain((32..=55).map(|x| (x, x - 4))).chain((104..=109).map(|x| (x, x - 44))).chain([(124, 77), (125, 78)]).collect(),
@@ -5376,7 +5385,46 @@ pub(super) static QUEUE_SHIFTED: AtomicBool = AtomicBool::new(false);
 static QUEUE_OLDER: AtomicBool = AtomicBool::new(false);
 
 /// command list slots of the newer layout → the older layout's slot of the same method
-const NEWER_LIST_SLOTS: [(usize, usize); 23] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (101, 99), (129, 127), (139, 10)];
+const NEWER_LIST_SLOTS: [(usize, usize); 24] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (101, 99), (110, 108), (129, 127), (139, 10)];
+
+/// `console_remap`'s command list slots from here on are two slots later in the newer layout
+const NEWER_LIST_PC_FROM: usize = 104;
+
+/// What a title on the newer command list layout reaches at a slot where the layouts differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewerListSlot {
+    /// the console method XCL has at this slot of the older layout (`console_slots`)
+    Console(usize),
+    /// the PC method at this PC slot
+    Pc(usize),
+    /// a console extension XCL does not have: logged, S_OK
+    Extension,
+}
+
+/// The newer command list layout, slot by slot where it differs from the older one:
+/// `NEWER_LIST_SLOTS`, and the PC methods the older layout has from #104 on (`console_remap`),
+/// which sit two slots later like the console methods around them – a retail game passes
+/// RSSetShadingRate's arguments (a rate, two combiners) to #126, and the shift is 2 at #101 as
+/// well, so ID3D12GraphicsCommandList1 is at 106–111 (ResolveSubresourceRegion #110) and the
+/// shading-rate methods at 126 / 127. The slots they leave (104, 105, 124, 125) hold the
+/// older layout's 102, 103, 122, 123: before, a title's #108 (OMSetDepthBounds there) ran
+/// the ResolveSubresourceRegion handler and its #126 was a stub.
+fn newer_list_slots() -> Vec<(usize, NewerListSlot)> {
+    let handled: Vec<usize> = console_slots(Kind::CommandList).iter().map(|e| e.0).collect();
+    let mut v: Vec<(usize, NewerListSlot)> = NEWER_LIST_SLOTS.iter().map(|&(newer, older)| (newer, NewerListSlot::Console(older))).collect();
+    let moved: Vec<(usize, usize)> = console_remap(Kind::CommandList).into_iter().filter(|e| e.0 >= NEWER_LIST_PC_FROM).collect();
+    for &(older, pc) in &moved {
+        if !v.iter().any(|e| e.0 == older + 2) {
+            v.push((older + 2, NewerListSlot::Pc(pc)));
+        }
+    }
+    for &(older, _) in &moved {
+        if !v.iter().any(|e| e.0 == older) {
+            v.push((older, if handled.contains(&(older - 2)) { NewerListSlot::Console(older - 2) } else { NewerListSlot::Extension }));
+        }
+    }
+    v
+}
 
 pub(super) unsafe fn list_device(list: *mut c_void) -> Option<ID3D12Device> {
     type F = unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT;
@@ -6063,6 +6111,43 @@ mod list_slot_tests {
         assert_eq!(NEWER_LIST_SLOTS.iter().filter(|e| e.0 == 101).count(), 1);
         let call: unsafe extern "system" fn(*mut c_void, u32, u32) -> i32 = unsafe { std::mem::transmute(f) };
         assert_eq!(unsafe { call(std::ptr::null_mut(), 1, 2) }, 0);
+    }
+
+    /// The PC methods the console keeps from #104 on are two slots later in the newer layout,
+    /// like the console methods around them (#126 gets RSSetShadingRate's arguments): no newer
+    /// slot keeps the older layout's method there.
+    #[test]
+    fn the_newer_layout_has_the_pc_methods_from_104_two_slots_later() {
+        let slots = newer_list_slots();
+        let at = |slot: usize| {
+            let found: Vec<NewerListSlot> = slots.iter().filter(|e| e.0 == slot).map(|e| e.1).collect();
+            assert_eq!(found.len(), 1, "newer #{slot}: {found:?}");
+            found[0]
+        };
+        // ID3D12GraphicsCommandList1 (PC 60–65) at 106–111, ResolveSubresourceRegion (PC 64) with
+        // the console's handler, as at the older layout's #108
+        for (slot, pc) in [(106, 60), (107, 61), (108, 62), (109, 63), (111, 65)] {
+            assert_eq!(at(slot), NewerListSlot::Pc(pc), "newer #{slot}");
+        }
+        assert_eq!(at(110), NewerListSlot::Console(108));
+        let handlers = console_slots(Kind::CommandList);
+        assert_eq!(handlers.iter().find(|e| e.0 == 108).expect("#108 has a handler").1, super::super::list_x::resolve_subresource_region_x as usize);
+        // RSSetShadingRate / RSSetShadingRateImage (PC 77 / 78) at 126 / 127
+        assert_eq!(at(126), NewerListSlot::Pc(77));
+        assert_eq!(at(127), NewerListSlot::Pc(78));
+        // what the older layout has there is two slots earlier: console extensions without a handler
+        for slot in [104, 105, 124, 125] {
+            assert_eq!(at(slot), NewerListSlot::Extension, "newer #{slot}");
+            assert!(!handlers.iter().any(|e| e.0 == slot - 2), "older #{} has no handler", slot - 2);
+        }
+        // every older slot of these PC methods is covered, and none keeps the older layout's method
+        let older = console_remap(Kind::CommandList);
+        for &(slot, pc) in older.iter().filter(|e| e.0 >= NEWER_LIST_PC_FROM) {
+            assert_eq!(at(slot + 2), if slot == 108 { NewerListSlot::Console(108) } else { NewerListSlot::Pc(pc) });
+            assert_ne!(at(slot), NewerListSlot::Pc(pc), "newer #{slot} is not the older layout's method");
+        }
+        assert!(slots.iter().all(|e| e.0 > 59), "the layouts agree up to #59");
+        assert_eq!(slots.len(), NEWER_LIST_SLOTS.len() + 11);
     }
 }
 
