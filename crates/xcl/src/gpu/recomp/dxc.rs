@@ -648,17 +648,38 @@ pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<
     rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?
 }
 
-/// The optimisation arguments a source of `len` bytes gets (none when `extra` has its own
-/// `-O`; see `compile_here`). At -O0 DXC keeps every source statement visible to a debugger
+/// Bytes of `src` that are code: without the indentation of its lines and without the lines
+/// that are only a comment (the emitter writes one for every console instruction).
+fn code_len(src: &str) -> usize {
+    src.lines().map(str::trim_start).filter(|l| !l.starts_with("//")).map(|l| l.len() + 1).sum()
+}
+
+/// `src` is a translated program in the block chain form (`recomp::translate`: a dispatch on
+/// `pc` for every block), not in structured control flow.
+fn block_chain(src: &str) -> bool {
+    src.contains("\n    uint pc = ")
+}
+
+/// The optimisation arguments `src` gets (none when `extra` has its own `-O`; see
+/// `compile_here`). At -O0 DXC keeps every source statement visible to a debugger
 /// with a no-op (`load @dx.nothing.a`): 787 000 of the 2.7 million instructions of a retail
 /// CS of 88 863 instructions. `-opt-disable debug-nops` leaves them out, and what they kept
 /// alive: that program's DXIL 15.3 → 10.8 MB, another's 7.1 → 5.5, in the same DXC time.
-fn size_args(len: usize, extra: &[&str]) -> &'static [&'static str] {
+///
+/// A file over 8 MB whose code (`code_len`) is not, and which has no block chain, is
+/// optimised: the 29 MB of a structured retail CS of 88 863 instructions are 8.35 MB of code,
+/// and its DXIL is 5.9 MB at -O1 in 160 s for 10.8 MB at -O0 in 76 s (one of 88 445: 5.9 MB
+/// in 137 s for 10.7 in 62). With a block chain (`block_chain`) -O0 stays: -O1 had not
+/// finished after 560 s for one of 76 699 instructions and 5.7 MB of code (-O0: 62 s), nor
+/// after 323 s for one of 46 741 and 4.0 MB (-O0: 80 s).
+/// A source of 8 MB or less gets what its size always gave it.
+fn size_args(src: &str, extra: &[&str]) -> &'static [&'static str] {
+    const ENORMOUS: usize = 8 * 1024 * 1024;
     if extra.iter().any(|a| a.starts_with("-O")) {
         &[]
-    } else if len > 8 * 1024 * 1024 {
+    } else if src.len() > ENORMOUS && (block_chain(src) || code_len(src) > ENORMOUS) {
         &["-O0", "-opt-disable", "debug-nops"]
-    } else if len > 1024 * 1024 {
+    } else if src.len() > 1024 * 1024 {
         &["-O1"]
     } else {
         &[]
@@ -675,7 +696,7 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
     // compile). -O0 only as a safety net for enormous sources.
     // -O1 from 1 MB on: the same DXIL size at a quarter less time (a retail game's 4.8 MB HLSL of
     // a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3; -O0 10.6 s, but twice the DXIL)
-    args.extend(size_args(src.len(), extra).iter().map(|a| crate::util::wide(a)));
+    args.extend(size_args(src, extra).iter().map(|a| crate::util::wide(a)));
     args.extend(extra.iter().map(|a| crate::util::wide(a)));
     let ptrs: Vec<PCWSTR> = args.iter().map(|a| PCWSTR(a.as_ptr())).collect();
     let buf = DxcBuffer { Ptr: src.as_ptr() as *const c_void, Size: src.len(), Encoding: DXC_CP_UTF8.0 };
@@ -702,14 +723,44 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
 mod size_args_tests {
     use super::*;
 
+    /// `len` bytes of statements, each line with `indent` spaces and a comment line before it
+    fn source(len: usize, indent: usize) -> String {
+        let line = format!("{}// 0000: v_mov_b32\n{}v1 = v0;\n", " ".repeat(indent), " ".repeat(indent));
+        line.repeat(len / 9 + 1)
+    }
+
     #[test]
     fn enormous_sources_get_o0_without_debug_nops() {
-        assert_eq!(size_args(200 << 10, &[]), &[] as &[&str]);
-        assert_eq!(size_args((1 << 20) + 1, &[]), &["-O1"]);
-        assert_eq!(size_args(8 << 20, &[]), &["-O1"]);
-        assert_eq!(size_args((8 << 20) + 1, &[]), &["-O0", "-opt-disable", "debug-nops"]);
+        const O0: &[&str] = &["-O0", "-opt-disable", "debug-nops"];
+        assert_eq!(size_args(&source(200 << 10, 0), &[]), &[] as &[&str]);
+        assert_eq!(size_args(&source(1 << 20, 0), &[]), &["-O1"]);
+        assert_eq!(size_args(&source(8 << 20, 0), &[]), O0);
         // the caller's own level stands
-        assert_eq!(size_args(30 << 20, &["-O3"]), &[] as &[&str]);
+        assert_eq!(size_args(&source(8 << 20, 0), &["-O3"]), &[] as &[&str]);
+    }
+
+    /// Indentation and comment lines are not code: a file over 8 MB with less code than that
+    /// is optimised, unless it is a block chain. Up to 8 MB of file the arguments are what
+    /// the file's size always gave.
+    #[test]
+    fn o0_is_for_8_mb_of_code_not_of_indentation_and_comments() {
+        assert_eq!(code_len("    // 0000: v_mov_b32\n    v1 = v0;\n\t\tv2 = v1; // kept\n//\n"), 9 + 17);
+        let padded = source(3 << 20, 24);
+        assert!(padded.len() > 8 << 20 && code_len(&padded) < 4 << 20, "{} / {}", padded.len(), code_len(&padded));
+        assert_eq!(size_args(&padded, &[]), &["-O1"]);
+        let chain = format!("void main()\n{{\n    uint pc = 0;\n{padded}}}\n");
+        assert_eq!(size_args(&chain, &[]), &["-O0", "-opt-disable", "debug-nops"]);
+        // under the limits by the file's size, whatever the code in it
+        for (text, args) in [(source(100 << 10, 24), &[] as &[&str]), (source(512 << 10, 24), &["-O1"]), (source(900 << 10, 24), &["-O1"])] {
+            assert!(text.len() <= 8 << 20);
+            assert_eq!(size_args(&text, &[]), args, "{} bytes", text.len());
+            let chain = format!("{{\n    uint pc = 0;\n{text}");
+            assert!(block_chain(&chain) && chain.len() <= 8 << 20);
+            assert_eq!(size_args(&chain, &[]), args, "{} bytes of a block chain", chain.len());
+        }
+        let bare = "v1 = v0;\n".repeat((1 << 20) / 9);
+        assert!(bare.len() <= 1 << 20 && bare.len() > 1000 << 10);
+        assert_eq!(size_args(&bare, &[]), &[] as &[&str]);
     }
 
     /// The loaded DXC takes the arguments, and its -O0 DXIL is smaller without the no-ops.
@@ -725,7 +776,7 @@ mod size_args_tests {
         }
         src.push_str("    io.Store(8u, a ^ b);\n}\n");
         let plain = compile(&src, "main", "cs_6_6", &["-O0"]).unwrap();
-        let args = size_args((8 << 20) + 1, &[]);
+        let args = size_args(&source(8 << 20, 0), &[]);
         // `extra` with an -O of its own: exactly these arguments
         let lean = compile(&src, "main", "cs_6_6", args).unwrap();
         assert!(lean.len() < plain.len(), "{} bytes without the no-ops, {} with", lean.len(), plain.len());
