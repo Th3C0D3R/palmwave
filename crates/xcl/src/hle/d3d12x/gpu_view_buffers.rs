@@ -513,10 +513,20 @@ pub(super) unsafe fn landed(parts: &[(usize, usize, usize)], seq: u64) {
     }
 }
 
+/// `XCL_GPU_VIEW_ROOT_UAV_WRITEBACK=1`: a root UAV marks its whole mirror GPU-written, so what
+/// shaders write through it goes back to the title's pages after each submission. Off by
+/// default: with it, run P54 crashed on entering the world, a dozen of the title's threads
+/// reading objects overwritten with shader data (float infinities where pointers were), while
+/// the write-back still has known ordering gaps (an older readback can land after a newer one).
+fn root_uav_writeback() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(test) || *ON.get_or_init(|| std::env::var("XCL_GPU_VIEW_ROOT_UAV_WRITEBACK").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// A root CBV (2), SRV (3), or UAV (4): UAV mirrors also need their writes copied back.
 pub(super) unsafe fn root_descriptor(va: u64, kind: u32) -> u64 {
     let at = root_address(va);
-    if kind == 4 {
+    if kind == 4 && root_uav_writeback() {
         // A root descriptor has no size; one byte identifies the held mirror to mark whole.
         mark_written(at as usize, 1, "a root UAV");
     }
