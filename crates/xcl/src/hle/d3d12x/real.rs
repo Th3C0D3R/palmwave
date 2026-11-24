@@ -6434,6 +6434,20 @@ mod queue_tests {
     unsafe extern "system" fn signal(_: *mut c_void, _: usize, _: usize) -> i32 {
         0
     }
+    unsafe extern "system" fn all_completed(_: *mut c_void) -> u64 {
+        u64::MAX
+    }
+
+    /// A fence object whose only method, GetCompletedValue (slot 8), says every value has
+    /// completed: a title Signal reads it once the sparse windows exist (`sparse::title_signal`,
+    /// made by an earlier test of the run), and a plain number there was an access violation
+    /// that ended the whole test binary. Leaked, as the sparse notes may outlive the test.
+    fn fake_fence() -> usize {
+        let vtbl: &'static mut [usize; 12] = Box::leak(Box::new([0usize; 12]));
+        vtbl[8] = all_completed as usize;
+        let obj: &'static mut [usize; 1] = Box::leak(Box::new([vtbl.as_ptr() as usize]));
+        obj.as_ptr() as usize
+    }
 
     /// Queue #18 before the layout is known writes 8 bytes; after a Signal at #14 (the older
     /// layout) it is GetDesc with all 16.
@@ -6446,7 +6460,7 @@ mod queue_tests {
         let vtbl = ext.as_ptr() as usize + 8;
         let mut obj = [vtbl];
         let this = obj.as_mut_ptr() as *mut c_void;
-        let fence = 0x5EED_0000usize;
+        let fence = fake_fence();
         QUEUE_SHIFTED.store(false, Ordering::Release);
         QUEUE_OLDER.store(false, Ordering::Release);
         unsafe {

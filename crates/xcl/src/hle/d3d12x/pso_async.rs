@@ -1308,7 +1308,9 @@ mod draw_wait_tests {
         old.charge(Duration::from_secs(1));
         let (c2, me) = (0x7410_0061usize, std::thread::current().id());
         let (here_tx, here_rx) = mpsc::channel::<bool>();
-        submit_lazy(
+        // left out of building ahead: with the preload pool of an earlier test of the run up,
+        // a compute job it may take was built on one of its threads, not the waiting one
+        submit_lazy_ahead(
             c2,
             true,
             Box::new(move || {
@@ -1317,6 +1319,7 @@ mod draw_wait_tests {
                 c2 + 1
             }),
             0,
+            false,
         );
         assert_eq!(resolve_within(c2, None, &old, true), c2 + 1);
         assert!(here_rx.recv().unwrap(), "built in the waiting thread, as before");
