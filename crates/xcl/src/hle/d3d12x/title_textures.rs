@@ -479,6 +479,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         super::vram::unmap_superseded(r);
     }
     TEXTURES_GEN.fetch_add(1, Ordering::Release);
+    super::vram::filled_from_memory(res as usize);
     Ok(())
 }
 
@@ -646,6 +647,12 @@ fn recheck_source(e: &mut Entry) -> bool {
 /// by the GPU). The first upload, if still pending, stays: it runs before the title's submit
 /// that copies.
 pub fn note_gpu_write(res: usize) {
+    // page budget: an evicted texture is mapped again now, and uploaded whole before the submit
+    // that carries the write – the write would go nowhere, and what the CPU had filled in would
+    // not be under it
+    if super::vram::tracking() && super::vram::any_evicted() && super::vram::take_evicted(res) {
+        map_again(&[res]);
+    }
     let mut t = TEXTURES.lock().unwrap();
     if let Some(e) = t.get_mut(res) {
         if !e.gpu_written {
@@ -656,6 +663,15 @@ pub fn note_gpu_write(res: usize) {
     drop(t);
     // page budget: its texels are not in the title's memory, so the page budget keeps it
     super::vram::pin(res);
+}
+
+/// Page budget: a view of `res` was made – the title is about to use it. Recent, and mapped
+/// again if it was evicted (its T# reaches a shader-visible heap before the next look at them).
+pub fn view_made(res: usize) {
+    super::vram::touch(&[res]);
+    if super::vram::any_evicted() && super::vram::take_evicted(res) {
+        map_again(&[res]);
+    }
 }
 
 static GPU_WRITTEN: AtomicU64 = AtomicU64::new(0);
@@ -776,7 +792,8 @@ fn map_again(revive: &[usize]) {
     let mut t = TEXTURES.lock().unwrap();
     for res in mapped {
         if let Some(e) = t.get_mut(res) {
-            if !e.pending {
+            // (what the GPU wrote is not in the title's memory: nothing to upload over it)
+            if !e.pending && !e.gpu_written {
                 e.pending = true;
                 PENDING.fetch_add(1, Ordering::Relaxed);
             }
@@ -821,14 +838,14 @@ pub fn submitted(lists: &[*mut c_void]) {
     }
     // page budget: a texture the title uses is recent; an evicted one is
     // mapped again and uploaded whole at the next submit
-    let mut revive = Vec::new();
-    for &(res, _, _) in &notes {
-        super::vram::touch(res);
-        if super::vram::any_evicted() && super::vram::take_evicted(res) {
-            revive.push(res);
+    if super::vram::tracking() {
+        let used: Vec<usize> = notes.iter().map(|n| n.0).collect();
+        super::vram::touch(&used);
+        if super::vram::any_evicted() {
+            let revive: Vec<usize> = used.into_iter().filter(|&res| super::vram::take_evicted(res)).collect();
+            map_again(&revive);
         }
     }
-    map_again(&revive);
     let mut t = TEXTURES.lock().unwrap();
     for (res, sub, after) in notes {
         if let Some(e) = t.get_mut(res) {
@@ -1046,14 +1063,25 @@ unsafe fn refresh_once(queue: *mut c_void) {
             })
             .collect()
     });
-    // page budget: a texture the CPU wrote again is mapped again before its
-    // whole upload
-    if super::vram::any_evicted() {
-        for (r, _) in &todo {
-            if super::vram::take_evicted(r.as_raw() as usize) {
-                super::vram::remap_if_unmapped(r);
-                forget_content(r.as_raw() as usize);
-            }
+    // page budget: a texture the CPU wrote is in use; an evicted one is mapped again before
+    // its whole upload, and one that cannot be stays evicted and is not uploaded into nothing
+    let mut todo = todo;
+    if super::vram::tracking() {
+        let used: Vec<usize> = todo.iter().map(|(r, _)| r.as_raw() as usize).collect();
+        super::vram::touch(&used);
+        if super::vram::any_evicted() {
+            todo.retain(|(r, _)| {
+                let res = r.as_raw() as usize;
+                if !super::vram::take_evicted(res) {
+                    return true;
+                }
+                if !super::vram::remap_if_unmapped(r) {
+                    super::vram::evicted_again(res);
+                    return false;
+                }
+                forget_content(res);
+                true
+            });
         }
     }
     upload_all(todo, ID3D12CommandQueue::from_raw_borrowed(&queue));

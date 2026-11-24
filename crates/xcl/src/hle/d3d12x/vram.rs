@@ -457,6 +457,8 @@ struct Target {
     used_extra: Vec<(usize, usize)>,
     /// a texture the CPU fills (its texels can be uploaded again from the title's memory)
     evictable: bool,
+    /// placed as a GPU-owned target (`place`): never evictable
+    gpu_owned: bool,
     /// placed, remapped, transitioned or its T# seen in a shader-visible heap last
     touched: std::time::Instant,
     /// where the last look at the view heaps found its T# (`seen`)
@@ -544,9 +546,10 @@ impl Pages {
         }
         let cap = pool_cap();
         if cap > 0 && self.pools.len() >= cap {
-            self.evict_lru(EVICT_BATCH);
-            if let Some(t) = self.free.pop() {
-                return Some(t);
+            // a round only when the last one's tiles are used up: the tiles of one texture are
+            // taken one by one, and a round for each took 512 tiles more every time
+            if self.cooling.is_empty() {
+                self.evict_lru(EVICT_BATCH);
             }
             // at the budget a tile is reused before it cooled: a draw still in flight may read
             // the newer texels there for a frame
@@ -885,7 +888,7 @@ unsafe fn place_on_pages(
         *ppv = std::ptr::null_mut();
         return None;
     };
-    pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, evictable: !require_aligned, touched: std::time::Instant::now(), seen: Seen::None });
+    pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, evictable: false, gpu_owned: require_aligned, touched: std::time::Instant::now(), seen: Seen::None });
     drop(g);
     PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw as usize);
     Some(hr)
@@ -964,9 +967,9 @@ pub(super) fn any_evicted() -> bool {
     EVICTED.lock().unwrap().as_ref().is_some_and(|s| !s.is_empty())
 }
 
-/// Whether the page budget follows the use of textures.
+/// Whether the page budget follows the use of textures (always in the tests).
 pub(super) fn tracking() -> bool {
-    pool_cap() != 0
+    cfg!(test) || pool_cap() != 0
 }
 
 /// Page budget: the T# of the textures `visible` is in a shader-visible view heap (they may be
@@ -1000,15 +1003,34 @@ pub(super) fn seen(visible: &[usize], cpu_only: &[usize]) -> Vec<usize> {
     back
 }
 
-/// Page budget: `res` was used (a transition the title submitted): later to be evicted.
-pub(super) fn touch(res: usize) {
+/// Page budget: the textures `used` were used (a transition the title submitted, an upload of
+/// what the CPU wrote, a view made): later to be evicted.
+pub(super) fn touch(used: &[usize]) {
+    if !tracking() || used.is_empty() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let mut g = PAGES.lock().unwrap();
+    for pages in g.values_mut().flatten() {
+        for res in used {
+            if let Some(t) = pages.targets.get_mut(res) {
+                t.touched = now;
+            }
+        }
+    }
+}
+
+/// Page budget: `res` is kept in step with the title's memory (`title_textures::register` took
+/// it): its texels can be uploaded again, so it may be evicted. A texture on the pages that is
+/// not kept in step never is: nothing would bring it back.
+pub(super) fn filled_from_memory(res: usize) {
     if !tracking() {
         return;
     }
     let mut g = PAGES.lock().unwrap();
     for pages in g.values_mut().flatten() {
         if let Some(t) = pages.targets.get_mut(&res) {
-            t.touched = std::time::Instant::now();
+            t.evictable = !t.gpu_owned;
             return;
         }
     }
@@ -1017,6 +1039,9 @@ pub(super) fn touch(res: usize) {
 /// Page budget: the GPU wrote `res`; its texels are not in the title's memory, so it is
 /// never evicted.
 pub(super) fn pin(res: usize) {
+    if !tracking() {
+        return;
+    }
     let mut g = PAGES.lock().unwrap();
     for pages in g.values_mut().flatten() {
         if let Some(t) = pages.targets.get_mut(&res) {
@@ -1626,6 +1651,9 @@ mod tests {
                 return;
             };
             let key = |r: &ID3D12Resource| r.as_raw() as usize;
+            for r in [&a, &b, &unseen, &own] {
+                filled_from_memory(key(r));
+            }
             let dev_key = dev.as_raw() as usize;
             let now = Instant::now();
             HEAPS_LOOKED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1686,13 +1714,18 @@ mod tests {
                 return;
             };
             let key = |r: &ID3D12Resource| r.as_raw() as usize;
+            // not kept in step with the title's memory: nothing would bring it back
+            let Some(alone) = place_at(0x60_3000_0000) else { return };
+            for r in [&old, &newer, &written] {
+                filled_from_memory(key(r));
+            }
             pin(key(&written));
             let dev_key = dev.as_raw() as usize;
             let now = Instant::now();
             {
                 let mut g = PAGES.lock().unwrap();
                 let pages = g.get_mut(&dev_key).unwrap().as_mut().unwrap();
-                for (r, age) in [(&old, 30), (&newer, 20), (&written, 40)] {
+                for (r, age) in [(&old, 30), (&newer, 20), (&written, 40), (&alone, 50)] {
                     pages.targets.get_mut(&key(r)).unwrap().touched = now - Duration::from_secs(age);
                 }
                 let used_before = pages.pages.len();
@@ -1700,13 +1733,14 @@ mod tests {
                 assert!(!pages.targets[&key(&old)].mapped, "the oldest CPU-filled texture is evicted");
                 assert!(pages.targets[&key(&newer)].mapped, "one is enough for one tile");
                 assert!(pages.targets[&key(&written)].mapped, "a GPU-written texture is never evicted");
+                assert!(pages.targets[&key(&alone)].mapped, "nor one that is not kept in step with the title's memory");
                 assert!(pages.pages.len() < used_before, "its pages went back");
             }
             assert!(take_evicted(key(&old)));
             assert!(!take_evicted(key(&old)), "true once");
             assert!(remap_if_unmapped(&old));
             assert!(PAGES.lock().unwrap().get(&dev_key).unwrap().as_ref().unwrap().targets[&key(&old)].mapped, "mapped again");
-            drop((old, newer, written));
+            drop((old, newer, written, alone));
         }
     }
 }

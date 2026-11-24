@@ -2107,9 +2107,13 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     f(this, res, desc, slot.pc_srv);
     super::console_heap::publish(&slot, false);
     super::console_heap::note_resource(&slot, res as usize);
-    if super::vram::tracking() && super::vram::is_placed_texture(res as usize) {
-        // a view the heaps cannot be followed to: never taken for unused
-        if !super::console_heap::note_index(&slot, res as usize) {
+    if super::vram::tracking() {
+        if !super::vram::is_placed_texture(res as usize) {
+            super::console_heap::forget_index(&slot);
+        } else if super::console_heap::note_index(&slot, res as usize) {
+            super::title_textures::view_made(res as usize);
+        } else {
+            // a view the heaps cannot be followed to: never taken for unused
             super::vram::pin(res as usize);
         }
     }

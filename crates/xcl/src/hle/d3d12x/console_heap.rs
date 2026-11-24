@@ -437,6 +437,25 @@ pub fn note_index(s: &Slot, res: usize) -> bool {
     true
 }
 
+/// A descriptor was copied to the slot of shared-heap index `dst`: the index names the texture
+/// the source's index `src` did (None: not an image, or of no texture on pages – then none).
+fn carry_index(m: &mut std::collections::HashMap<u32, usize>, src: Option<u32>, dst: u32) {
+    match src.and_then(|i| m.get(&i).copied()) {
+        Some(res) => m.insert(dst, res),
+        None => m.remove(&dst),
+    };
+}
+
+/// Slot `s` got a view that is not of a texture on pages: its index names none any more.
+pub fn forget_index(s: &Slot) {
+    if s.sampler || s.shared_srv == 0 {
+        return;
+    }
+    if let Some(m) = INDEX_RES.lock().unwrap().as_mut() {
+        m.remove(&s.index);
+    }
+}
+
 /// The textures on pages whose T# is in a slot now: (in a shader-visible view heap, only in
 /// CPU-only ones).
 pub fn referenced() -> (Vec<usize>, Vec<usize>) {
@@ -473,8 +492,16 @@ pub fn copy_words(src: &Slot, dst: &Slot) {
     unsafe { std::ptr::copy_nonoverlapping(src.at as *const u32, w.as_mut_ptr(), n) };
     if src.sampler {
         w[3] = (w[3] & !0xFFF) | (dst.index & 0xFFF);
-    } else if w[3] >> 28 >= 8 {
-        w[0] = dst.index;
+    } else {
+        let image = w[3] >> 28 >= 8;
+        if dst.shared_srv != 0 {
+            if let Some(m) = INDEX_RES.lock().unwrap().as_mut() {
+                carry_index(m, image.then_some(w[0]), dst.index);
+            }
+        }
+        if image {
+            w[0] = dst.index;
+        }
     }
     write(dst, &w[..n]);
     if !src.sampler {
@@ -598,6 +625,21 @@ mod tests {
                 m.remove(&i);
             }
         }
+    }
+
+    /// A T# copied through the device has the destination's index: it names the source's
+    /// texture there, and a slot overwritten with something else names none.
+    #[test]
+    fn a_copied_view_names_its_texture_at_the_destination_index() {
+        let mut m = std::collections::HashMap::from([(10u32, 0xAAA0usize), (20, 0xBBB0)]);
+        carry_index(&mut m, Some(10), 30);
+        assert_eq!((m.get(&10), m.get(&30)), (Some(&0xAAA0), Some(&0xAAA0)), "both slots name it");
+        carry_index(&mut m, Some(10), 20);
+        assert_eq!(m.get(&20), Some(&0xAAA0), "the slot's previous texture is no longer named there");
+        carry_index(&mut m, None, 30);
+        assert_eq!(m.get(&30), None, "a buffer over the slot");
+        carry_index(&mut m, Some(99), 20);
+        assert_eq!(m.get(&20), None, "an image of no texture on pages");
     }
 
     #[test]
