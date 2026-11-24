@@ -938,6 +938,7 @@ unsafe fn placed_resource_x(this: *mut c_void, va: u64, desc: *const u8, state: 
                     if depth_uav {
                         super::depth_twin::note_created(*ppv as usize, state);
                     }
+                    super::target_memory::note_target(this, *ppv as usize, va as usize, &pc, u32::from_le_bytes(x[0x20..0x24].try_into().unwrap()));
                 }
                 return hr;
             }
@@ -975,6 +976,10 @@ unsafe fn placed_resource_x(this: *mut c_void, va: u64, desc: *const u8, state: 
     }
     if hr >= 0 && !(*ppv).is_null() {
         real::note_title_address(*ppv as usize, va as usize);
+        if !buffer {
+            let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
+            super::target_memory::note_target(this, *ppv as usize, va as usize, &pc, u32::from_le_bytes(x[0x20..0x24].try_into().unwrap()));
+        }
     }
     if hr < 0 || once(&N, 4) {
         let w = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
