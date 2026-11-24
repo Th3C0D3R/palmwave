@@ -194,7 +194,7 @@ fn put_in(list: *mut c_void, gfx: bool, i: u32, offset: u32, bytes: &[u8]) {
         let (layout, args) = if gfx { (&s.layout_gfx, &mut s.args_gfx) } else { (&s.layout, &mut s.args) };
         let Some(at) = layout.as_ref().and_then(|l| l.params.get(i as usize)).map(|p| match *p {
             Param::Constants { at, .. } => at as usize + 4 * offset as usize,
-            Param::Descriptor { at } | Param::Table { at } => at as usize,
+            Param::Descriptor { at, .. } | Param::Table { at } => at as usize,
         }) else {
             return;
         };
@@ -206,6 +206,19 @@ fn put_in(list: *mut c_void, gfx: bool, i: u32, offset: u32, bytes: &[u8]) {
 
 fn put(list: *mut c_void, i: u32, offset: u32, bytes: &[u8]) {
     put_in(list, false, i, offset, bytes)
+}
+
+unsafe fn put_root_descriptor(list: *mut c_void, gfx: bool, i: u32, va: u64) {
+    note_address(va);
+    let kind = with(list, |s| {
+        let layout = if gfx { &s.layout_gfx } else { &s.layout };
+        match layout.as_ref().and_then(|l| l.params.get(i as usize)) {
+            Some(Param::Descriptor { kind, .. }) => *kind,
+            _ => 0,
+        }
+    });
+    let va = super::gpu_view_buffers::root_descriptor(va, kind);
+    put_in(list, gfx, i, 0, &va.to_le_bytes());
 }
 
 /// #34 SetGraphicsRootSignature (PC #30)
@@ -239,10 +252,7 @@ pub(super) unsafe extern "system" fn set_graphics_root_constants(this: *mut c_vo
 /// #42 / #44 / #46 SetGraphicsRoot{ConstantBuffer,ShaderResource,UnorderedAccess}View (PC #38 /
 /// #40 / #42)
 pub(super) unsafe extern "system" fn set_graphics_root_descriptor(this: *mut c_void, i: u32, va: u64) {
-    note_address(va);
-    // (in a GPU view of the title's CPU memory: where shaders read it)
-    let va = super::gpu_view_buffers::root_address(va);
-    put_in(this, true, i, 0, &va.to_le_bytes());
+    put_root_descriptor(this, true, i, va);
 }
 
 /// `XCL_TRACE_ADDRESSES=1`: root descriptor addresses of console code – in unified memory
@@ -389,6 +399,7 @@ unsafe fn bind_two_pass_stage(
     res_va: u64,
     compute_pass: bool,
 ) -> Result<Vec<u32>, String> {
+    super::list_x::ensure_view_heap(this);
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let windows = super::real::uma_window_vas();
     let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
@@ -453,7 +464,7 @@ fn root_arguments(this: *mut c_void) -> Vec<(usize, super::mesh_input_dump::Root
     params
         .filter_map(|(i, p)| match *p {
             Param::Table { at } => Some((i, Root::Table(word(at)))),
-            Param::Descriptor { at } => Some((i, Root::Buffer(word(at) as u64 | (word(at + 4) as u64) << 32))),
+            Param::Descriptor { at, .. } => Some((i, Root::Buffer(word(at) as u64 | (word(at + 4) as u64) << 32))),
             Param::Constants { at, count } => (count > 0).then(|| (i, Root::Constant(word(at)))),
         })
         .collect()
@@ -1138,7 +1149,7 @@ unsafe fn root_args_summary(this: *mut c_void, buffer_words: usize) -> String {
     for (i, p) in layout.params.iter().enumerate() {
         match *p {
             Param::Constants { at, count } => what.push(format!("p{i} constants {:x?}", (0..count.min(8) as usize).map(|k| word(at as usize + 4 * k)).collect::<Vec<_>>())),
-            Param::Descriptor { at } => {
+            Param::Descriptor { at, .. } => {
                 let va = (word(at as usize) as u64 | (word(at as usize + 4) as u64) << 32) as usize;
                 let w: Vec<u32> = if va != 0 && crate::gpu::shader::readable(va, 4 * buffer_words) { (0..buffer_words).map(|k| ((va + 4 * k) as *const u32).read_unaligned()).collect() } else { Vec::new() };
                 what.push(format!("p{i} buffer {va:#x} {w:x?}"));
@@ -1198,9 +1209,7 @@ pub(super) unsafe extern "system" fn set_compute_root_constants(this: *mut c_voi
 /// #41 / #43 / #45 SetComputeRoot{ConstantBuffer,ShaderResource,UnorderedAccess}View (PC #37 /
 /// #39 / #41): the 64-bit GPU address
 pub(super) unsafe extern "system" fn set_compute_root_descriptor(this: *mut c_void, i: u32, va: u64) {
-    note_address(va);
-    let va = super::gpu_view_buffers::root_address(va);
-    put(this, i, 0, &va.to_le_bytes());
+    put_root_descriptor(this, false, i, va);
 }
 
 /// #25 SetPipelineState: noted, then bound as on the PC
@@ -1274,7 +1283,7 @@ unsafe fn trace_fullscreen(this: *mut c_void, pso: usize, groups: [u32; 3]) {
                 what.push(format!("p{i} constants {w:x?}"));
                 values.extend(&w);
             }
-            Param::Descriptor { at } => {
+            Param::Descriptor { at, .. } => {
                 let lo = word(at as usize).unwrap_or(0) as u64;
                 let hi = word(at as usize + 4).unwrap_or(0) as u64;
                 let va = (lo | hi << 32) as usize;
@@ -1559,6 +1568,71 @@ mod tests {
         assert_eq!(tracked_pso(list), 0);
 
         forget(list);
+    }
+
+    fn root_descriptors_in_gpu_views(gfx: bool) {
+        use super::super::gpu_view_buffers as views;
+        use crate::hle::kernelx::mirrors;
+        if crate::gpu::uma::get().is_none() {
+            crate::gpu::recomp::runner::skip_test("no unified memory");
+            return;
+        }
+        const PAGE: usize = 0x1_0000;
+        let offset = gfx as usize * 0x1000_0000;
+        let (cpu, gpu, size) = (0x71D0_0000_0000usize + offset, 0x71D6_0000_0000usize + offset, (0x131 + gfx as usize) * PAGE);
+        mirrors::reserved(cpu, size, 0x2040_2000, 0x04);
+        mirrors::reserved(gpu, size, 0x2040_2000, 0x801);
+        let mut pool = vec![0x35u8; PAGE];
+        #[repr(C)]
+        struct PageBatch { dest: u64, count: u32, pad: u32, ranges: usize }
+        let ranges = [[0u32, 0, 1]];
+        let batch = PageBatch { dest: gpu as u64, count: 1, pad: 0, ranges: ranges.as_ptr() as usize };
+        let list = (0x7100_0300 + gfx as usize) as *mut c_void;
+        let layout = Arc::new(Layout {
+            params: (2..=4).map(|kind| Param::Descriptor { at: (kind - 2) * 8, kind }).collect(),
+            size: 24,
+            ..Default::default()
+        });
+        with(list, |s| {
+            if gfx { s.layout_gfx = Some(layout); s.args_gfx = vec![0; 24]; }
+            else { s.layout = Some(layout); s.args = vec![0; 24]; }
+        });
+        unsafe {
+            assert!(mirrors::apply_batches(1, &batch as *const _ as usize, pool.as_mut_ptr() as usize, 1).is_some());
+            let va = (gpu + 0x40) as u64;
+            let mut at = 0usize;
+            for i in 0..3 {
+                if gfx { set_graphics_root_descriptor(list, i, va); }
+                else { set_compute_root_descriptor(list, i, va); }
+                let address = with(list, |s| {
+                    let args = if gfx { &s.args_gfx } else { &s.args };
+                    u64::from_le_bytes(args[i as usize * 8..i as usize * 8 + 8].try_into().unwrap()) as usize
+                });
+                assert_ne!(address as u64, va, "the root descriptor must name its mirror");
+                assert_eq!(std::slice::from_raw_parts(address as *const u8, 4), &[0x35; 4]);
+                if i == 0 { at = address; }
+                assert_eq!(address, at);
+                views::look_done(views::look_begins());
+                assert_eq!(views::written_ranges().contains(&(at - 0x40, PAGE)), i == 2, "only the root UAV enables write-back");
+            }
+            let seq = views::next_seq();
+            *(at as *mut u32) = 0x1234_5678;
+            views::landed(&[(at - 0x40, 0, PAGE)], seq);
+            assert_eq!(&pool[0x40..0x44], &0x1234_5678u32.to_le_bytes(), "root UAV writes reach the title's page");
+            mirrors::released(cpu);
+            views::views_changed();
+        }
+        forget(list);
+    }
+
+    #[test]
+    fn compute_root_descriptors_translate_and_write_back_only_uavs() {
+        root_descriptors_in_gpu_views(false);
+    }
+
+    #[test]
+    fn graphics_root_descriptors_translate_and_write_back_only_uavs() {
+        root_descriptors_in_gpu_views(true);
     }
 
     #[repr(C)]
@@ -1855,5 +1929,66 @@ mod tests {
         );
         DISPATCH_MESH_SIGS.lock().unwrap().as_mut().unwrap().remove(&sig);
         assert_eq!(dispatch_mesh_sig_of(sig), None);
+    }
+
+    #[test]
+    fn two_pass_stages_restore_the_view_heap_after_reset_and_unbind() {
+        use crate::gpu::recomp::runner::skip_test;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+        #[repr(C)]
+        struct HeapList {
+            vt: *const usize,
+            calls: Mutex<Vec<Vec<usize>>>,
+        }
+        unsafe extern "system" fn set_heaps(this: *mut c_void, n: u32, heaps: *const usize) {
+            let heaps = if n == 0 { Vec::new() } else { std::slice::from_raw_parts(heaps, n as usize).to_vec() };
+            (*(this as *const HeapList)).calls.lock().unwrap().push(heaps);
+        }
+        unsafe extern "system" fn reset_list(_this: *mut c_void, _alloc: usize, _pso: usize) -> i32 {
+            0
+        }
+        unsafe {
+            if !crate::gpu::recomp::pso::heap_windows() {
+                return skip_test("heap windows disabled");
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                return skip_test("no GPU");
+            }
+            if !super::super::console_heap::shared_heap(&dev.unwrap()) {
+                return skip_test("no shared descriptor heap");
+            }
+            let heap = super::super::console_heap::global_heap().unwrap().as_raw() as usize;
+            let mut orig_vt = [0usize; 64];
+            orig_vt[10] = reset_list as usize;
+            orig_vt[28] = set_heaps as usize;
+            let mut ext_vt = vec![0usize; 65];
+            ext_vt[0] = orig_vt.as_ptr() as usize;
+            ext_vt[1..].copy_from_slice(&orig_vt);
+            let fake = Box::new(HeapList { vt: ext_vt.as_ptr().add(1), calls: Mutex::new(Vec::new()) });
+            let raw = &*fake as *const HeapList as *mut c_void;
+            let list = ID3D12GraphicsCommandList::from_raw_borrowed(&raw).unwrap();
+            let tp = real::TwoPassPso { compute: 0, compute_rs: 0, mesh_rs: 0, record: Default::default(), mesh_groups_per_record: 1, kind: "MS" };
+
+            // Exercise both stage entries. ABI setup then rejects the dummy root signature
+            // (or unavailable UMA windows); no real draw or shader execution is needed here.
+            for compute in [true, false] {
+                assert_eq!(list_x::reset_x(raw, raw as usize, 0), 0);
+                fake.calls.lock().unwrap().clear();
+                assert!(bind_two_pass_stage(raw, list, 0, &tp, 0, compute).is_err());
+                assert_eq!(*fake.calls.lock().unwrap(), vec![vec![heap]], "stage after Reset must bind the heap");
+                assert!(bind_two_pass_stage(raw, list, 0, &tp, 0, compute).is_err());
+                assert_eq!(fake.calls.lock().unwrap().len(), 1, "an already bound heap is kept");
+
+                list_x::set_descriptor_heaps_x(raw, 0, std::ptr::null());
+                assert!(bind_two_pass_stage(raw, list, 0, &tp, 0, compute).is_err());
+                assert_eq!(*fake.calls.lock().unwrap(), vec![vec![heap], vec![], vec![heap]], "stage after unbinding must restore the heap");
+            }
+            forget(raw);
+            console_list::allocator_reset(raw);
+            super::super::alloc_pool::forget(raw as usize);
+            list_x::on_release(raw as usize);
+        }
     }
 }

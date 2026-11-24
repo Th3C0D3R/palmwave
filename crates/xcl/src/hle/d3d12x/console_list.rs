@@ -61,7 +61,7 @@ pub enum Param {
     /// `count` 32-bit constants at byte `at`
     Constants { at: u32, count: u32 },
     /// root CBV / SRV / UAV: 64-bit GPU address at `at`
-    Descriptor { at: u32 },
+    Descriptor { at: u32, kind: u32 },
     /// descriptor table: 32-bit GPU address of its first descriptor (console shaders load
     /// it with the high half 0; amd_fidelityfx_upscaler_xbox.dll writes 1 word)
     Table { at: u32 },
@@ -109,7 +109,7 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
         let (ty, pay) = (r(poff + 12 * k)?, r(poff + 12 * k + 8)? as usize);
         let p = match ty {
             1 => Param::Constants { at: l.size, count: r(pay + 8)? },
-            2..=4 => Param::Descriptor { at: l.size },
+            2..=4 => Param::Descriptor { at: l.size, kind: ty },
             _ => Param::Table { at: l.size },
         };
         let bytes = match p {
@@ -156,7 +156,7 @@ pub fn inline_for(l: &Layout, user_sgprs: Option<u32>) -> u32 {
     }
     let end = |p: &Param| match *p {
         Param::Constants { at, count } => at + 4 * count,
-        Param::Descriptor { at } => at + 8,
+        Param::Descriptor { at, .. } => at + 8,
         Param::Table { at } => at + 4,
     };
     l.params.iter().map(end).take_while(|&e| e <= has).last().unwrap_or(0)
@@ -696,6 +696,12 @@ pub struct Translation {
     pub unknown: Option<(u32, usize)>,
 }
 
+unsafe fn write_root_descriptor(table: &mut [u8], at: u32, kind: u32, va: u64) {
+    if let Some(t) = table.get_mut(at as usize..at as usize + 8) {
+        t.copy_from_slice(&super::gpu_view_buffers::root_descriptor(va, kind).to_le_bytes());
+    }
+}
+
 /// Turn the recorded console commands into commands on the PC list and close it.
 pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     let obj = obj as usize;
@@ -926,12 +932,8 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         }
                         at += 2;
                     }
-                    Some(Param::Descriptor { at: o }) => {
-                        let o = o as usize;
-                        if let Some(t) = table.get_mut(o..o + 8) {
-                            t[..4].copy_from_slice(&get(1).to_le_bytes());
-                            t[4..].copy_from_slice(&get(2).to_le_bytes());
-                        }
+                    Some(Param::Descriptor { at: o, kind }) => {
+                        write_root_descriptor(&mut table, o, kind, get(1) as u64 | (get(2) as u64) << 32);
                         at += 3;
                     }
                     None => {
@@ -981,7 +983,7 @@ mod tests {
         r.extend([0, 0, 19, 0, 0, 0, 1, 0, 0, 0, 0, 0]);
         let bytes: Vec<u8> = r.iter().flat_map(|w| w.to_le_bytes()).collect();
         let l = layout_from_blob(&bytes).unwrap();
-        assert_eq!(l.params, vec![Param::Constants { at: 0, count: 19 }, Param::Descriptor { at: 76 }, Param::Descriptor { at: 84 }, Param::Descriptor { at: 92 }]);
+        assert_eq!(l.params, vec![Param::Constants { at: 0, count: 19 }, Param::Descriptor { at: 76, kind: 4 }, Param::Descriptor { at: 84, kind: 4 }, Param::Descriptor { at: 92, kind: 3 }]);
         assert_eq!(l.size, 100);
         assert_eq!(l.inline, 0, "19 constants do not fit in user SGPRs: everything in the table");
     }
@@ -1017,6 +1019,53 @@ mod tests {
             r.extend([0, 0, count]);
         }
         r.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn console_root_descriptors_use_mirrors_and_only_uavs_enable_writeback() {
+        use crate::hle::kernelx::mirrors;
+        use super::super::gpu_view_buffers as buffers;
+        let Some(u) = crate::gpu::uma::get() else {
+            crate::gpu::recomp::runner::skip_test("no UMA");
+            return;
+        };
+        const PAGE: usize = 0x1_0000;
+        let (cpu, gpu, size) = (0x71E0_0000_0000usize, 0x71E6_0000_0000usize, 0x135 * PAGE);
+        mirrors::reserved(cpu, size, 0x2040_2000, 0x04);
+        mirrors::reserved(gpu, size, 0x2040_2000, 0x801);
+        let mut pool = vec![0x31u8; PAGE];
+        #[repr(C)]
+        struct PageBatch { dest: u64, ranges_n: u32, _pad: u32, ranges: usize }
+        let ranges = [[0u32, 0, 1]];
+        let batch = PageBatch { dest: (gpu + 2 * PAGE) as u64, ranges_n: 1, _pad: 0, ranges: ranges.as_ptr() as usize };
+        let l = layout_from_blob(&rts0(&[(2, 0), (3, 0), (4, 0)])).unwrap();
+        let mut table = vec![0u8; l.size as usize];
+        unsafe {
+            assert!(mirrors::apply_batches(1, &batch as *const _ as usize, pool.as_mut_ptr() as usize, 1).is_some());
+            let mut mapped = 0usize;
+            for (i, p) in l.params.iter().enumerate() {
+                let Param::Descriptor { at, kind } = *p else { panic!("root descriptor") };
+                assert_eq!(kind, i as u32 + 2);
+                write_root_descriptor(&mut table, at, kind, (gpu + 2 * PAGE + i * 0x40) as u64);
+                let va = u64::from_le_bytes(table[at as usize..at as usize + 8].try_into().unwrap()) as usize;
+                if i == 0 {
+                    mapped = va;
+                    assert!(u.contains(mapped), "the console argument must name unified memory");
+                    assert_eq!(std::slice::from_raw_parts(mapped as *const u8, PAGE), &pool);
+                }
+                assert_eq!(va, mapped + i * 0x40, "the address retains its offset");
+                buffers::look_done(buffers::look_begins());
+                assert_eq!(buffers::written_ranges().contains(&(mapped, PAGE)), kind == 4, "only a UAV enables writeback");
+            }
+            let args = user_data(&l, &table, 0);
+            assert_eq!(&args[4..], &[mapped as u32, (mapped >> 32) as u32, (mapped + 0x40) as u32, ((mapped + 0x40) >> 32) as u32, (mapped + 0x80) as u32, ((mapped + 0x80) >> 32) as u32]);
+            let seq = buffers::next_seq();
+            std::ptr::write_bytes((mapped + 0x80) as *mut u8, 0xA7, 64);
+            buffers::landed(&[(mapped, 0, PAGE)], seq);
+            assert_eq!(&pool[0x80..0xC0], &[0xA7; 64], "the root UAV's writes reach the title's page");
+            mirrors::released(cpu);
+            buffers::views_changed();
+        }
     }
 
     /// What the console's compiler does (its output on these root signatures): parameters in

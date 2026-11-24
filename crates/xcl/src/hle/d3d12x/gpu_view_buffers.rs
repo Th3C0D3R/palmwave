@@ -513,6 +513,16 @@ pub(super) unsafe fn landed(parts: &[(usize, usize, usize)], seq: u64) {
     }
 }
 
+/// A root CBV (2), SRV (3), or UAV (4): UAV mirrors also need their writes copied back.
+pub(super) unsafe fn root_descriptor(va: u64, kind: u32) -> u64 {
+    let at = root_address(va);
+    if kind == 4 {
+        // A root descriptor has no size; one byte identifies the held mirror to mark whole.
+        mark_written(at as usize, 1, "a root UAV");
+    }
+    at
+}
+
 /// `address` for a root descriptor (an address without a size): the address itself when it is
 /// not in a GPU view.
 pub(super) unsafe fn root_address(va: u64) -> u64 {
