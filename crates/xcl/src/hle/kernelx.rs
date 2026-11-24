@@ -202,6 +202,10 @@ pub mod mirrors {
     }
 
     /// A reservation of `size` bytes at `base` with allocation type `t` and protection `p`.
+    /// Only reservations of 64 KiB pages made without a commit are views: one committed in the
+    /// same call (`t & 0x1000`) gets no pair. A GPU view pairs with the most recent CPU view of
+    /// its size that has none yet – the retail order (CPU view, then GPU view); two interleaved
+    /// streams of reservations of one size would pair wrongly.
     pub fn reserved(base: usize, size: usize, t: u32, p: u32) {
         if t & PAGES_64K != PAGES_64K || t & 0x1000 != 0 {
             return;
