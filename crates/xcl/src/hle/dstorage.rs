@@ -36,6 +36,7 @@ use std::os::windows::io::AsRawHandle;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use windows_sys::core::GUID;
@@ -298,18 +299,14 @@ enum FillTarget {
 }
 
 /// Fill the title's destination of `r` (exactly `destination_size` bytes) with solid blocks,
-/// neutral ones if `neutral`: the request then completes, so its pages are the ones at its turn,
-/// as for a request that runs (the magenta fill keeps the snapshot).
+/// neutral ones if `neutral`.
 unsafe fn bcpack_fill(r: &Request, target: &FillTarget, neutral: bool) -> bool {
     let block = if neutral { bcpack_neutral_block(r.bcpack()) } else { bcpack_fill_block(r.bcpack()) };
     let Some(block) = block else { return false };
     let n = r.destination_size as usize;
     let bytes: Vec<u8> = block.iter().copied().cycle().take(n).collect();
     let ok = match target {
-        FillTarget::Pages(pages) => {
-            let pages = if neutral { pages_at_turn(r, pages) } else { pages[..].into() };
-            crate::hle::kernelx::write_physical_pages(&pages, r.destination_page_offset as usize, &bytes)
-        }
+        FillTarget::Pages(pages) => crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &bytes),
         FillTarget::Virtual => {
             if !writable(r.destination as usize, n) {
                 return false;
@@ -828,16 +825,24 @@ pub fn counters() -> (u64, u64, u64) {
     (REQUESTS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed))
 }
 
-/// The destination pages of `r` at its turn. A page number of 0 in the snapshot taken at enqueue
-/// (no page has it): the entry is read again now. A retail title keeps its page arrays in its own
-/// tables and fills an entry after EnqueueRequest – its streaming requests were refused by the
-/// thousand with page 0. An array that had its pages at enqueue stays as it was snapshotted
-/// (titles also pass arrays on the stack).
-unsafe fn pages_at_turn<'a>(r: &Request, pages: &'a [usize]) -> std::borrow::Cow<'a, [usize]> {
-    if pages.contains(&0) && crate::gpu::shader::readable(r.destination as usize, std::mem::size_of_val(pages)) {
-        (0..pages.len()).map(|k| if pages[k] != 0 { pages[k] } else { (r.destination as *const usize).add(k).read_unaligned() }).collect::<Vec<_>>().into()
-    } else {
-        pages.into()
+/// How long a request that reached the worker before the title's Submit waits at most for the
+/// entries of its page arrays (once for all the batches waiting for that Submit,
+/// `QueueInner::fill_in_pages`).
+const PAGE_WAIT_MS: u64 = 5000;
+/// How often it reads them again meanwhile.
+const PAGE_POLL: Duration = Duration::from_millis(1);
+
+/// Read the entries of the title's page array at `array` that are 0 in `pages` again (no page
+/// has that number); entries that had a page keep the snapshot's (titles also pass arrays on the
+/// stack). An array that cannot be read is left as it was.
+unsafe fn reread_zero_pages(array: u64, pages: &mut [usize]) {
+    let mut now = vec![0usize; pages.len()];
+    if read_own(array as usize, now.as_mut_ptr() as *mut u8, std::mem::size_of_val(pages)) {
+        for (p, n) in pages.iter_mut().zip(now) {
+            if *p == 0 {
+                *p = n;
+            }
+        }
     }
 }
 
@@ -912,8 +917,8 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     };
 
     if r.dest_physical_pages() {
-        let pages = pages_at_turn(r, dest_pages.ok_or(E_ACCESS_VIOLATION)?);
-        if !crate::hle::kernelx::write_physical_pages(&pages, r.destination_page_offset as usize, &payload[..n]) {
+        let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
+        if !crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &payload[..n]) {
             return Err(E_ACCESS_VIOLATION);
         }
     } else if n > 0 {
@@ -990,13 +995,34 @@ struct FirstError {
     file: Vec<u16>,
 }
 
+/// Requests whose page array still had page 0 at their turn (`QueueInner::fill_in_pages`).
+struct PageWaits {
+    /// how long they wait at most (ms, `PAGE_WAIT_MS`)
+    bound_ms: AtomicU64,
+    /// the Submit a wait ran out for: the other requests waiting for it do not wait again
+    given_up: AtomicU64,
+    waited: AtomicU64,
+    /// of them, all their pages there in the end
+    filled: AtomicU64,
+    /// … a page still 0: the request failed as before
+    missing: AtomicU64,
+}
+
+impl PageWaits {
+    fn new() -> Self {
+        let z = || AtomicU64::new(0);
+        PageWaits { bound_ms: AtomicU64::new(PAGE_WAIT_MS), given_up: z(), waited: z(), filled: z(), missing: z() }
+    }
+}
+
 struct QueueInner {
     desc: [u8; 0x18],
     source_memory: bool,
     capacity: usize,
     pending: Mutex<Pending>,
     cancels: Mutex<Vec<CancelRule>>,
-    worker: Mutex<Option<mpsc::Sender<Vec<Entry>>>>,
+    /// batches with the title's Submit that covers them (`submit`)
+    worker: Mutex<Option<mpsc::Sender<(u64, Vec<Entry>)>>>,
     worker_active: (Mutex<bool>, Condvar),
     closed: AtomicBool,
     error_event: usize,
@@ -1006,6 +1032,10 @@ struct QueueInner {
     /// `XCL_DSTORAGE_BCPACK_FILL=neutral` when the queue was made: the fill is neutral and the
     /// request completes
     bcpack_neutral: AtomicBool,
+    /// the title's Submit calls, counted, and the wake-up of a request waiting for the next one
+    /// (`fill_in_pages`)
+    submits: (Mutex<u64>, Condvar),
+    page_waits: PageWaits,
 }
 
 impl QueueInner {
@@ -1028,19 +1058,32 @@ impl QueueInner {
         rules.iter().any(|r| tag & r.mask == r.value)
     }
 
-    fn submit(self: &Arc<Self>) {
+    /// `explicit`: the title's Submit, which covers everything it enqueued before (it fills its
+    /// page arrays in until then); otherwise the queue submits itself (half full), and its batch
+    /// may run before the title's next Submit (`fill_in_pages`).
+    fn submit(self: &Arc<Self>, explicit: bool) {
         // Lock `worker` before `pending` so concurrent `Submit()` calls always enqueue
         // batches to the channel in strict `seq` order.
         let mut w = self.worker.lock().unwrap();
         if self.closed.load(Ordering::Acquire) {
             return;
         }
+        let until = {
+            let mut n = self.submits.0.lock().unwrap();
+            if explicit {
+                *n += 1;
+                self.submits.1.notify_all();
+                *n
+            } else {
+                *n + 1
+            }
+        };
         let batch = std::mem::take(&mut self.pending.lock().unwrap().entries);
         if batch.is_empty() {
             return;
         }
         if w.is_none() {
-            let (tx, rx) = mpsc::channel::<Vec<Entry>>();
+            let (tx, rx) = mpsc::channel::<(u64, Vec<Entry>)>();
             let q = Arc::clone(self);
             *self.worker_active.0.lock().unwrap() = true;
             let started = std::thread::Builder::new().name("xcl-dstorage".into()).spawn(move || q.run(rx));
@@ -1054,13 +1097,13 @@ impl QueueInner {
             }
             *w = Some(tx);
         }
-        let sent = w.as_ref().unwrap().send(batch);
+        let sent = w.as_ref().unwrap().send((until, batch));
         // Release `worker` before dropping any unsent `batch` returned in `Err`.
         drop(w);
         drop(sent);
     }
 
-    fn run(&self, rx: mpsc::Receiver<Vec<Entry>>) {
+    fn run(&self, rx: mpsc::Receiver<(u64, Vec<Entry>)>) {
         struct ActiveGuard<'a>(&'a QueueInner);
         impl Drop for ActiveGuard<'_> {
             fn drop(&mut self) {
@@ -1071,7 +1114,7 @@ impl QueueInner {
         let _active = ActiveGuard(self);
         // the first failure of the requests since the last status entry
         let mut since_status = S_OK;
-        for batch in rx {
+        for (until, batch) in rx {
             for e in batch {
                 if self.closed.load(Ordering::Acquire) {
                     if let Entry::Status(s, i) = e {
@@ -1082,9 +1125,17 @@ impl QueueInner {
                     continue;
                 }
                 match e {
-                    Entry::Request { seq, req, file, dest_pages, src_pages } => {
+                    Entry::Request { seq, req, file, mut dest_pages, mut src_pages } => {
                         if self.is_cancelled(seq, req.tag) {
                             // Cancelled requests are skipped without affecting status or error record.
+                            continue;
+                        }
+                        // page arrays the title fills in after EnqueueRequest; the request is
+                        // dropped if the queue is closed or it is cancelled while it waits
+                        let turn = Some((seq, req.tag));
+                        if !dest_pages.as_mut().map_or(true, |p| self.fill_in_pages(req.destination, p, until, turn))
+                            || !src_pages.as_mut().map_or(true, |p| self.fill_in_pages(req.source, p, until, turn))
+                        {
                             continue;
                         }
                         if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref()) } {
@@ -1094,10 +1145,16 @@ impl QueueInner {
                             }
                         }
                     }
-                    Entry::Refused { hr, req, file, fill } => {
+                    Entry::Refused { hr, req, file, mut fill } => {
                         // the destination gets solid blocks and the request still fails, unless
-                        // they are neutral ones: then it completes, as a request that ran
+                        // they are neutral ones: then it completes, as a request that ran, with
+                        // the pages at its turn (the magenta fill keeps the snapshot)
                         let neutral = self.bcpack_neutral.load(Ordering::Relaxed);
+                        if let Some(FillTarget::Pages(p)) = fill.as_mut().filter(|_| neutral) {
+                            if !self.fill_in_pages(req.destination, p, until, None) {
+                                continue;
+                            }
+                        }
                         let filled = fill.as_ref().is_some_and(|t| unsafe { bcpack_fill(&req, t, neutral) });
                         if filled && neutral {
                             continue;
@@ -1125,6 +1182,89 @@ impl QueueInner {
         }
     }
 
+    /// A destination or source page array with page 0 in it at the request's turn (no page has
+    /// that number). A retail title fills the entries in after EnqueueRequest and before the
+    /// Submit that covers the request, and a half-full queue submits itself, so whole batches
+    /// reached the worker early: 2,047 of its streaming requests failed within 2 s. The entries
+    /// that are 0 are read again now, then on a short poll until they are all there, the title's
+    /// Submit `until` has come (then once more), or `PAGE_WAIT_MS` passed – once for all the
+    /// requests waiting for that Submit. A page still 0 then fails the request as before. The
+    /// wait holds no lock the title's calls take; Close and CancelRequestsWithTag wake it.
+    /// false: the queue was closed or the request (`turn`: its seq and tag) cancelled meanwhile.
+    fn fill_in_pages(&self, array: u64, pages: &mut [usize], until: u64, turn: Option<(u64, u64)>) -> bool {
+        if !pages.contains(&0) {
+            return true;
+        }
+        let w = &self.page_waits;
+        let mut since = None;
+        loop {
+            // the count before the read: what the title wrote before that Submit is seen
+            let covered = *self.submits.0.lock().unwrap() >= until;
+            unsafe { reread_zero_pages(array, pages) };
+            if !pages.contains(&0) || covered || until <= w.given_up.load(Ordering::Relaxed) {
+                break;
+            }
+            let start = *since.get_or_insert_with(|| {
+                self.page_wait_starts(until);
+                Instant::now()
+            });
+            if start.elapsed() >= Duration::from_millis(w.bound_ms.load(Ordering::Relaxed)) {
+                w.given_up.fetch_max(until, Ordering::Relaxed);
+                break;
+            }
+            if self.closed.load(Ordering::Acquire) || turn.is_some_and(|(seq, tag)| self.is_cancelled(seq, tag)) {
+                self.page_wait_ends(None);
+                return false;
+            }
+            let n = self.submits.0.lock().unwrap();
+            if *n < until && !self.closed.load(Ordering::Acquire) {
+                drop(self.submits.1.wait_timeout(n, PAGE_POLL).unwrap());
+            }
+        }
+        if since.is_some() {
+            self.page_wait_ends(Some(!pages.contains(&0)));
+        }
+        true
+    }
+
+    /// A request starts waiting for its page array: a line the first time on this queue.
+    fn page_wait_starts(&self, until: u64) {
+        if self.page_waits.waited.fetch_add(1, Ordering::Relaxed) == 0 {
+            crate::xlog_warn!(
+                "DirectStorage: queue {:p} (capacity {}): a request has page 0 in its page array at its turn, before the title's Submit #{until} that covers it (the queue submitted itself when half full): it waits for its pages or that Submit, {} ms at most",
+                self,
+                self.capacity,
+                self.page_waits.bound_ms.load(Ordering::Relaxed)
+            );
+        }
+    }
+
+    /// … and its wait ends (`filled`: all its pages there; None: closed or cancelled): the counts
+    /// on every power of two of the requests that waited.
+    fn page_wait_ends(&self, filled: Option<bool>) {
+        let w = &self.page_waits;
+        match filled {
+            Some(true) => w.filled.fetch_add(1, Ordering::Relaxed),
+            Some(false) => w.missing.fetch_add(1, Ordering::Relaxed),
+            None => 0,
+        };
+        let k = w.waited.load(Ordering::Relaxed);
+        if k.is_power_of_two() {
+            let (f, m) = (w.filled.load(Ordering::Relaxed), w.missing.load(Ordering::Relaxed));
+            crate::xlog_info!(
+                "DirectStorage: queue {:p}: {k} requests waited for their page arrays: {f} got their pages, {m} still had page 0 and failed, {} were closed or cancelled",
+                self,
+                k.saturating_sub(f + m)
+            );
+        }
+    }
+
+    /// Wake a request waiting for its page array (`fill_in_pages`) to look at the queue again.
+    fn wake_page_waits(&self) {
+        drop(self.submits.0.lock().unwrap());
+        self.submits.1.notify_all();
+    }
+
     fn enqueue(self: &Arc<Self>, e: Entry) {
         let n = {
             let mut p = self.pending.lock().unwrap();
@@ -1141,7 +1281,7 @@ impl QueueInner {
         };
         // as on PC: a half-full queue submits by itself
         if n >= (self.capacity / 2).max(1) {
-            self.submit();
+            self.submit(false);
         }
     }
 
@@ -1157,7 +1297,7 @@ impl QueueInner {
             p.entries.len()
         };
         if n >= (self.capacity / 2).max(1) {
-            self.submit();
+            self.submit(false);
         }
     }
 }
@@ -1231,6 +1371,8 @@ unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8,
         errors: Mutex::new((0, None)),
         bcpack_fill: AtomicBool::new(fill),
         bcpack_neutral: AtomicBool::new(neutral),
+        submits: (Mutex::new(0), Condvar::new()),
+        page_waits: PageWaits::new(),
     });
     let o = new_object(queue_vtbl(), inner);
     let hr = queue_qi(o, riid, out);
@@ -1351,7 +1493,7 @@ unsafe extern "system" fn queue_enqueue_signal(p: *mut c_void, fence: *mut c_voi
 unsafe extern "system" fn queue_submit(p: *mut c_void) {
     let q = queue(p);
     if !q.closed.load(Ordering::Acquire) {
-        q.submit();
+        q.submit(true);
     }
 }
 
@@ -1373,6 +1515,9 @@ unsafe extern "system" fn queue_cancel(p: *mut c_void, mask: u64, value: u64) {
     } else {
         rules.push(CancelRule { up_to_seq: cutoff, mask, value });
     }
+    drop(rules);
+    // a request waiting for its page array may be one of them
+    q.wake_page_waits();
 }
 
 unsafe extern "system" fn queue_close(p: *mut c_void) {
@@ -1397,6 +1542,8 @@ unsafe extern "system" fn queue_close(p: *mut c_void) {
         }
         // `Entry::Signal` drops `FenceRef` (calling Release); `Entry::Request` drops `FileInner`.
     }
+    // a request waiting for its page array (`fill_in_pages`) is dropped now
+    q.wake_page_waits();
     // Wait outside queue locks so no in-flight worker request can still touch caller buffers
     // after `Close()` returns (including for concurrent `Close()` callers).
     let (lock, cvar) = &q.worker_active;
@@ -2508,6 +2655,171 @@ mod tests {
 
             CloseHandle(ev);
             queue_close(q);
+            queue_release(q);
+            status_release(s);
+        }
+    }
+
+    /// A memory queue of `capacity` (it submits itself when half full) and a status array of `n`.
+    unsafe fn memory_queue(capacity: u16, n: u32) -> (*mut c_void, *mut c_void) {
+        let mut f = std::ptr::null_mut();
+        assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+        let mut desc = [0u8; 0x18];
+        desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+        desc[8..10].copy_from_slice(&capacity.to_le_bytes());
+        desc[10] = 2;
+        let (mut q, mut s) = (std::ptr::null_mut(), std::ptr::null_mut());
+        assert_eq!(factory_create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+        assert_eq!(factory_create_status_array(f, n, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+        (q, s)
+    }
+
+    /// Whether `f` holds within 5 s.
+    fn wait_until(f: impl Fn() -> bool) -> bool {
+        let t = Instant::now();
+        while !f() && t.elapsed().as_secs() < 5 {
+            std::thread::yield_now();
+        }
+        f()
+    }
+
+    /// The title fills its page arrays in after EnqueueRequest and before its Submit, and the queue
+    /// (capacity 4) submits itself when half full: the worker reaches the request first, waits, and
+    /// the bytes land in the right pages – through a destination page array, then a source one.
+    #[test]
+    fn page_arrays_filled_in_before_the_titles_submit_are_waited_for() {
+        use crate::hle::kernelx::{AllocateTitlePhysicalPages, FreeTitlePhysicalPages, MapTitlePhysicalPages, PHYS_PAGE_SIZE};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        if crate::gpu::uma::get().is_none() {
+            return;
+        }
+        unsafe {
+            let mut count = 2usize;
+            let mut pages = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, pages.as_mut_ptr()), 1);
+            let reserved = VirtualAlloc(std::ptr::null(), 2 * PHYS_PAGE_SIZE, MEM_RESERVE, PAGE_READWRITE);
+            assert!(!reserved.is_null());
+            assert_eq!(MapTitlePhysicalPages(reserved, 2, 0, 4, pages.as_mut_ptr()), reserved);
+            let (q, s) = memory_queue(4, 2);
+            let w = &queue(q).page_waits;
+            let data: Vec<u8> = (0..0x1800u32).map(|i| (i * 7 + 3) as u8).collect();
+            let page_off = (PHYS_PAGE_SIZE - 0x800) as u16;
+
+            // destination: the request and its status entry fill the queue to half, it submits
+            // itself, and the worker reaches the request before the title has put its second page in
+            let mut table = Box::new([pages[0], 0usize]);
+            queue_enqueue_request(q, request_ex(SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT, table.as_ptr() as u64, page_off, data.len() as u32, data.as_ptr() as u64, 0, data.len() as u32, 0, 0).as_ptr());
+            queue_enqueue_status(q, s, 0);
+            assert!(wait_until(|| w.waited.load(Ordering::Relaxed) == 1), "the worker waits for the page");
+            assert!(!status_is_complete(s, 0));
+            std::ptr::write_volatile(&mut table[1], pages[1]);
+            queue_submit(q);
+            assert!(wait_until(|| status_is_complete(s, 0)));
+            assert_eq!(status_get_hresult(s, 0), S_OK);
+            let got = std::slice::from_raw_parts((reserved as *const u8).add(page_off as usize), data.len());
+            assert_eq!(got, &data[..], "across both pages");
+
+            // source: the same with the pages it reads from
+            let mut readback = vec![0u8; data.len()];
+            let mut sources = Box::new([0usize, 0usize]);
+            queue_enqueue_request(q, request_ex(SOURCE_MEMORY_BIT | SOURCE_PHYS_PAGES_BIT, readback.as_mut_ptr() as u64, 0, readback.len() as u32, sources.as_ptr() as u64, page_off as u64, readback.len() as u32, 0, 0).as_ptr());
+            queue_enqueue_status(q, s, 1);
+            assert!(wait_until(|| w.waited.load(Ordering::Relaxed) == 2), "the worker waits for the source pages");
+            assert!(!status_is_complete(s, 1));
+            std::ptr::write_volatile(&mut sources[0], pages[0]);
+            std::ptr::write_volatile(&mut sources[1], pages[1]);
+            queue_submit(q);
+            assert!(wait_until(|| status_is_complete(s, 1)));
+            assert_eq!(status_get_hresult(s, 1), S_OK);
+            assert_eq!(readback, data);
+            assert_eq!((w.filled.load(Ordering::Relaxed), w.missing.load(Ordering::Relaxed)), (2, 0));
+
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+            MapTitlePhysicalPages(reserved, 2, 0, 4, std::ptr::null_mut());
+            VirtualFree(reserved, 0, MEM_RELEASE);
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
+        }
+    }
+
+    /// A page array entry the title never fills in: the request fails as before – at once when the
+    /// title's Submit comes, at the bound when none does, and then without waiting again for the
+    /// other requests waiting for that same Submit.
+    #[test]
+    fn a_page_array_entry_never_filled_in_still_fails() {
+        unsafe {
+            let (q, s) = memory_queue(4, 3);
+            let w = &queue(q).page_waits;
+            let src = [0x5Au8; 16];
+            let table = Box::new([0usize]);
+            // a request and its status entry: the queue submits itself
+            let enqueue = |index: u32| {
+                queue_enqueue_request(q, request_ex(SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT, table.as_ptr() as u64, 0, 16, src.as_ptr() as u64, 0, 16, 0, 0).as_ptr());
+                queue_enqueue_status(q, s, index);
+            };
+            let result = |index: u32| {
+                assert!(wait_until(|| status_is_complete(s, index)));
+                status_get_hresult(s, index)
+            };
+
+            // the title's Submit comes without the page: the request fails then, not at the bound
+            enqueue(0);
+            assert!(wait_until(|| w.waited.load(Ordering::Relaxed) == 1));
+            let t = Instant::now();
+            queue_submit(q);
+            assert_eq!(result(0), E_ACCESS_VIOLATION);
+            assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+
+            // no Submit: it fails at the bound
+            w.bound_ms.store(200, Ordering::Relaxed);
+            let t = Instant::now();
+            enqueue(1);
+            assert_eq!(result(1), E_ACCESS_VIOLATION);
+            assert!(t.elapsed() >= Duration::from_millis(200), "{:?}", t.elapsed());
+
+            // the next request waiting for that Submit does not wait again
+            enqueue(2);
+            assert_eq!(result(2), E_ACCESS_VIOLATION);
+            assert_eq!((w.waited.load(Ordering::Relaxed), w.missing.load(Ordering::Relaxed)), (2, 2));
+
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+        }
+    }
+
+    /// Close and CancelRequestsWithTag reach a request waiting for its page array at once.
+    #[test]
+    fn close_and_cancel_end_a_page_array_wait_at_once() {
+        unsafe {
+            let (q, s) = memory_queue(4, 2);
+            let w = &queue(q).page_waits;
+            let src = [0x5Au8; 16];
+            let table = Box::new([0usize]);
+            let enqueue = |index: u32, tag: u64| {
+                queue_enqueue_request(q, request_ex(SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT, table.as_ptr() as u64, 0, 16, src.as_ptr() as u64, 0, 16, 0, tag).as_ptr());
+                queue_enqueue_status(q, s, index);
+            };
+
+            // cancelled while it waits: skipped as cancelled requests are, long before the bound
+            enqueue(0, 0x77);
+            assert!(wait_until(|| w.waited.load(Ordering::Relaxed) == 1));
+            let t = Instant::now();
+            queue_cancel(q, 0xFF, 0x77);
+            assert!(wait_until(|| status_is_complete(s, 0)));
+            assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+            assert_eq!(status_get_hresult(s, 0), S_OK, "a cancelled request does not fail");
+
+            // closed while it waits: Close returns at once and the request is dropped
+            enqueue(1, 0);
+            assert!(wait_until(|| w.waited.load(Ordering::Relaxed) == 2));
+            let t = Instant::now();
+            queue_close(q);
+            assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+            assert_eq!(status_get_hresult(s, 1), E_QUEUE_CLOSED);
+            assert_eq!((w.filled.load(Ordering::Relaxed), w.missing.load(Ordering::Relaxed)), (0, 0), "neither ran");
+
             queue_release(q);
             status_release(s);
         }
