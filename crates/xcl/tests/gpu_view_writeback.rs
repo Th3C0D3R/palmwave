@@ -29,6 +29,8 @@ fn gpu_writes_into_a_gpu_view_buffer_reach_the_titles_page_by_its_fence() {
     unsafe {
         std::env::set_var("XCL_UMA_MB", "64");
         std::env::set_var("XCL_COHERENT_MB", "64");
+        // the write-back is off unless asked for (4914546)
+        std::env::set_var("XCL_GPU_VIEW_WRITEBACK", "1");
         let Ok(dev) = xcl::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
             println!("SKIPPED: no GPU");
             return;
