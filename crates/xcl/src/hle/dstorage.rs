@@ -377,6 +377,22 @@ enum FillTarget {
     Pages(Vec<usize>),
 }
 
+/// Where a virtual address in a GPU view (`kernelx::mirrors`) is read or written: its own
+/// mapping when pages are mapped there (`physical_page_at` or `MEM_COMMIT`), else the paired
+/// CPU view.
+fn mirror_address(va: usize) -> usize {
+    let Some(src) = crate::hle::kernelx::mirrors::source(va) else { return va };
+    if crate::hle::kernelx::physical_page_at(va) {
+        return va;
+    }
+    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) } != 0 && m.State == MEM_COMMIT {
+        va
+    } else {
+        src
+    }
+}
+
 /// Fill the title's destination of `r` (exactly `destination_size` bytes) with solid blocks,
 /// neutral ones if `neutral`; the bytes written are counted in `filled`, by mode.
 unsafe fn bcpack_fill(r: &Request, target: &FillTarget, neutral: bool, filled: &[AtomicU64; 16]) -> bool {
@@ -387,11 +403,12 @@ unsafe fn bcpack_fill(r: &Request, target: &FillTarget, neutral: bool, filled: &
     let ok = match target {
         FillTarget::Pages(pages) => crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &bytes),
         FillTarget::Virtual => {
-            if !writable(r.destination as usize, n) {
+            let dst = mirror_address(r.destination as usize);
+            if !writable(dst, n) {
                 return false;
             }
             if n > 0 {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), r.destination as *mut u8, n);
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, n);
             }
             true
         }
@@ -1037,8 +1054,11 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
             );
         }
     }
-    if !r.dest_physical_pages() && !writable(r.destination as usize, n) {
-        return Err(E_ACCESS_VIOLATION);
+    let dst = (!r.dest_physical_pages()).then(|| mirror_address(r.destination as usize));
+    if let Some(d) = dst {
+        if !writable(d, n) {
+            return Err(E_ACCESS_VIOLATION);
+        }
     }
     let mut in_flight = InFlight(0);
     in_flight.add(r.source_size as usize);
@@ -1050,11 +1070,12 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
                 return Err(E_ACCESS_VIOLATION);
             }
         } else {
-            if !crate::gpu::shader::readable(r.source as usize, r.source_size as usize) {
+            let s = mirror_address(r.source as usize);
+            if !crate::gpu::shader::readable(s, r.source_size as usize) {
                 return Err(E_ACCESS_VIOLATION);
             }
             if !b.is_empty() {
-                std::ptr::copy_nonoverlapping(r.source as *const u8, b.as_mut_ptr(), b.len());
+                std::ptr::copy_nonoverlapping(s as *const u8, b.as_mut_ptr(), b.len());
             }
         }
         b
@@ -1113,7 +1134,7 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
             }
         }
     } else if n > 0 {
-        std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination as *mut u8, n);
+        std::ptr::copy_nonoverlapping(payload.as_ptr(), dst.unwrap() as *mut u8, n);
     }
     Ok(())
 }
@@ -3358,6 +3379,140 @@ mod tests {
             assert_eq!(status_get_hresult(s, 1), E_QUEUE_CLOSED);
             assert_eq!((w.filled.load(Ordering::Relaxed), w.missing.load(Ordering::Relaxed)), (0, 0), "neither ran");
 
+            queue_release(q);
+            status_release(s);
+        }
+    }
+
+    #[test]
+    fn gpu_view_addresses_read_and_write_their_paired_cpu_view() {
+        use crate::hle::kernelx;
+        use windows_sys::Win32::System::Memory as mem;
+
+        // Larger than all four UMA windows together so both reservations use the watched
+        // Windows fallback (reserving address space only) and pair in `kernelx::mirrors`.
+        // (A size no other test of this binary reserves: a GPU view pairs with the most recent
+        // unpaired CPU view of its size.)
+        const SIZE: usize = (24usize << 30) + 3 * PAGE;
+        const PAGE: usize = 0x1_0000;
+        struct Reservation(usize);
+        impl Drop for Reservation {
+            fn drop(&mut self) {
+                unsafe { kernelx::VirtualFree(self.0 as *mut c_void, 0, mem::MEM_RELEASE); }
+            }
+        }
+        struct PhysicalPage { id: usize, at: usize }
+        impl Drop for PhysicalPage {
+            fn drop(&mut self) {
+                unsafe {
+                    if kernelx::physical_page_at(self.at) {
+                        kernelx::MapTitlePhysicalPages(self.at as *mut c_void, 1, 0, 4, std::ptr::null_mut());
+                    }
+                    kernelx::FreeTitlePhysicalPages(std::ptr::null_mut(), 1, &mut self.id);
+                }
+            }
+        }
+        unsafe {
+            let cpu = Reservation(kernelx::VirtualAlloc(std::ptr::null(), SIZE, 0x2040_2000, mem::PAGE_READWRITE) as usize);
+            let gpu = Reservation(kernelx::VirtualAlloc(std::ptr::null(), SIZE, 0x2040_2000, 0x801) as usize);
+            assert!(cpu.0 != 0 && gpu.0 != 0);
+            assert_eq!(kernelx::mirrors::source(gpu.0 + PAGE), Some(cpu.0 + PAGE));
+
+            // Commit two pages in the CPU view; the GPU view remains reserved and PAGE_NOACCESS.
+            let cpu_src = cpu.0 + PAGE;
+            let cpu_dst = cpu.0 + 2 * PAGE;
+            let gpu_src = gpu.0 + PAGE;
+            let gpu_dst = gpu.0 + 2 * PAGE;
+            assert_eq!(kernelx::VirtualAlloc(cpu_src as *const c_void, 2 * PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE) as usize, cpu_src);
+
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&8u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 4, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+            let qv = *(q as *const *const usize);
+            let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+            let status: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*qv.add(4));
+            let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+            let sv = *(s as *const *const usize);
+            let complete: unsafe extern "system" fn(*mut c_void, u32) -> bool = std::mem::transmute(*sv.add(3));
+            let hresult: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = std::mem::transmute(*sv.add(4));
+            let run = |r: &[u8; REQUEST_BYTES], index: u32| {
+                enqueue(q, r.as_ptr());
+                status(q, s, index);
+                submit(q);
+                let t = std::time::Instant::now();
+                while !complete(s, index) && t.elapsed().as_secs() < 5 {
+                    std::thread::yield_now();
+                }
+                hresult(s, index)
+            };
+
+            // 1. Zlib memory source in the GPU view inflating into a destination in the GPU view:
+            //    both resolve through `kernelx::mirrors` to the committed CPU view.
+            let plain: Vec<u8> = (0..1024).map(|i| (i & 0xF) as u8).collect();
+            let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
+            assert!(packed.len() < plain.len());
+            std::ptr::copy_nonoverlapping(packed.as_ptr(), cpu_src as *mut u8, packed.len());
+            std::ptr::write_bytes(cpu_dst as *mut u8, 0xAA, plain.len() + 64);
+            assert_eq!(
+                run(&request(SOURCE_MEMORY_BIT | ZLIB_BIT, gpu_dst as u64, plain.len() as u32, gpu_src as u64, 0, packed.len() as u32), 0),
+                S_OK
+            );
+            assert_eq!(std::slice::from_raw_parts(cpu_dst as *const u8, plain.len()), &plain[..]);
+            assert!(std::slice::from_raw_parts((cpu_dst + plain.len()) as *const u8, 64).iter().all(|&b| b == 0xAA));
+
+            // 2. Refused BCPack fill (`XCL_DSTORAGE_BCPACK_FILL`) to a GPU-view destination writes
+            //    solid blocks into the paired CPU view without changing the error status. (BC2:
+            //    a mode without a decoder, refused at enqueue.)
+            queue(q).bcpack_fill.store(true, Ordering::Relaxed);
+            let fill_dst_cpu = cpu_dst + 0x800;
+            let fill_dst_gpu = gpu_dst + 0x800;
+            std::ptr::write_bytes(fill_dst_cpu as *mut u8, 0xCD, 64);
+            assert_eq!(
+                run(&request(SOURCE_MEMORY_BIT | 2 << BCPACK_SHIFT, fill_dst_gpu as u64, 32, gpu_src as u64, 0, 16), 1),
+                E_DECOMPRESSION
+            );
+            let block = bcpack_fill_block(2).unwrap();
+            assert!(std::slice::from_raw_parts(fill_dst_cpu as *const u8, 32).chunks(16).all(|c| c == &block[..]));
+            assert!(std::slice::from_raw_parts((fill_dst_cpu + 32) as *const u8, 32).iter().all(|&b| b == 0xCD));
+
+            // 3. When a physical page is mapped directly into the GPU view (even lazily before its
+            //    first touch), writes go to that page in the GPU view rather than the CPU view.
+            if crate::gpu::uma::get().is_some() {
+                let (mut count, mut id) = (1usize, 0usize);
+                if kernelx::AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, &mut id) != 0 {
+                    let mut mapped = PhysicalPage { id, at: gpu_dst };
+                    assert_eq!(kernelx::MapTitlePhysicalPages(gpu_dst as *mut c_void, 1, 0, 4, &mut mapped.id) as usize, gpu_dst);
+                    assert!(kernelx::physical_page_at(gpu_dst));
+                    std::ptr::write_bytes(cpu_dst as *mut u8, 0x55, plain.len());
+                    assert_eq!(
+                        run(&request(SOURCE_MEMORY_BIT, gpu_dst as u64, plain.len() as u32, cpu_src as u64, 0, plain.len() as u32), 2),
+                        S_OK
+                    );
+                    assert_eq!(
+                        std::slice::from_raw_parts(gpu_dst as *const u8, plain.len()),
+                        std::slice::from_raw_parts(cpu_src as *const u8, plain.len()),
+                        "a page mapped in the GPU view receives the write itself"
+                    );
+                    assert!(
+                        std::slice::from_raw_parts(cpu_dst as *const u8, plain.len()).iter().all(|&b| b == 0x55),
+                        "the paired CPU view is left untouched while the GPU view has its own page"
+                    );
+                }
+            } else {
+                crate::gpu::recomp::runner::skip_test("no unified memory");
+            }
+
+            queue_close(q);
             queue_release(q);
             status_release(s);
         }
