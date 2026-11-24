@@ -2,10 +2,14 @@
 //!
 //! In the split form every mask write (`v_cmp*`, carries) exchanges the two halves' ballots so
 //! that both halves hold the whole 64-bit mask. A mask that is only ever read lane by lane –
-//! `v_cndmask_b32`'s selector, the carry-in of `v_add_co_ci` / `v_sub(rev)_co_ci` – needs just
-//! the reading lane's own bit, which its own half has. This is a backward liveness analysis
-//! over the SGPRs: a register is *whole-live* after an instruction when some path may read
-//! its whole value (any SALU / SMEM / VALU scalar operand, a branch on VCCZ, …) before it is
+//! `v_cndmask_b32`'s selector, the carry-in of `v_add_co_ci` / `v_sub(rev)_co_ci`, or even-aligned
+//! 64-bit lane-wise SALU ops (`s_mov_b64`, `s_and_b64`, `s_or_b64`, `s_xor_b64`, `s_not_b64`,
+//! `s_andn2_b64`, `s_orn2_b64`, `s_nand_b64`, `s_nor_b64`, `s_xnor_b64`, `s_wqm_b64`,
+//! `s_cselect_b64`, `s_cmov_b64`) whose destination is not whole-live and whose `scc` (if written)
+//! is dead – needs just the reading lane's own bit, which its own half has. This is a backward
+//! liveness analysis over the SGPRs and `scc`: a register is *whole-live* after an instruction
+//! when some path may read its whole value (any non-lane-wise SALU / SMEM / VALU scalar operand,
+//! a branch on VCCZ, a lane-wise op whose destination or written `scc` is live, …) before it is
 //! written again. A mask write whose destination is not whole-live needs no exchange.
 //!
 //! After a mask stays in its half the two halves hold different values in its registers, so a
@@ -58,10 +62,213 @@ fn reads_mask_per_lane(name: &str) -> bool {
     matches!(name, "V_CNDMASK_B32" | "V_ADD_CO_CI_U32" | "V_SUB_CO_CI_U32" | "V_SUBREV_CO_CI_U32")
 }
 
+/// 64-bit SALU ops whose low and high dwords depend only on the corresponding dwords of their
+/// inputs (no bit crosses the 32-lane half boundary): `(is_lane_wise, sets_scc)`.
+/// When neither their destination nor (if `sets_scc`) `scc` is whole-live afterward, each half
+/// can evaluate the op on its own 32-lane half word without exchanging the inputs.
+fn lane_wise_salu64(name: &str) -> Option<bool> {
+    match name {
+        "S_MOV_B64" | "S_CMOV_B64" | "S_CSELECT_B64" => Some(false),
+        "S_NOT_B64"
+        | "S_WQM_B64"
+        | "S_AND_B64"
+        | "S_OR_B64"
+        | "S_XOR_B64"
+        | "S_ANDN2_B64"
+        | "S_ORN2_B64"
+        | "S_NAND_B64"
+        | "S_NOR_B64"
+        | "S_XNOR_B64" => Some(true),
+        _ => None,
+    }
+}
+
+fn is_cmp_suffix(s: &str) -> bool {
+    matches!(
+        s,
+        "EQ_I32" | "LG_I32" | "GT_I32" | "GE_I32" | "LT_I32" | "LE_I32" | "EQ_U32" | "LG_U32" | "GT_U32" | "GE_U32" | "LT_U32" | "LE_U32"
+    )
+}
+
+/// Whether `emit.rs` unconditionally overwrites `scc` for `d` (conservative: false whenever unsure).
+fn writes_scc(d: &Decoded) -> bool {
+    let n = d.inst.name;
+    match d.enc.name {
+        "ENC_SOPK" => n == "S_ADDK_I32" || n.strip_prefix("S_CMPK_").is_some_and(is_cmp_suffix),
+        "ENC_SOPC" => {
+            matches!(n, "S_CMP_EQ_U64" | "S_CMP_LG_U64" | "S_BITCMP0_B32" | "S_BITCMP1_B32" | "S_BITCMP0_B64" | "S_BITCMP1_B64")
+                || n.strip_prefix("S_CMP_").is_some_and(is_cmp_suffix)
+        }
+        "ENC_SOP1" | "ENC_SOP2" => {
+            if let Some(op) = n.strip_prefix("S_").and_then(|s| s.strip_suffix("_B32").or_else(|| s.strip_suffix("_B64"))) {
+                if let Some(kind) = op.strip_suffix("_SAVEEXEC").or_else(|| op.strip_suffix("_WREXEC")) {
+                    return matches!(kind, "AND" | "OR" | "XOR" | "ANDN2" | "ORN2" | "NAND" | "NOR" | "XNOR" | "ANDN1" | "ORN1");
+                }
+            }
+            matches!(
+                n,
+                "S_NOT_B32"
+                    | "S_BCNT0_I32_B32"
+                    | "S_BCNT1_I32_B32"
+                    | "S_ABS_I32"
+                    | "S_AND_B32"
+                    | "S_OR_B32"
+                    | "S_XOR_B32"
+                    | "S_ANDN2_B32"
+                    | "S_ORN2_B32"
+                    | "S_NAND_B32"
+                    | "S_NOR_B32"
+                    | "S_XNOR_B32"
+                    | "S_ADD_U32"
+                    | "S_SUB_U32"
+                    | "S_ADDC_U32"
+                    | "S_SUBB_U32"
+                    | "S_ADD_I32"
+                    | "S_SUB_I32"
+                    | "S_LSHL_B32"
+                    | "S_LSHR_B32"
+                    | "S_ASHR_I32"
+                    | "S_LSHL1_ADD_U32"
+                    | "S_LSHL2_ADD_U32"
+                    | "S_LSHL3_ADD_U32"
+                    | "S_LSHL4_ADD_U32"
+                    | "S_BFE_U32"
+                    | "S_BFE_I32"
+                    | "S_MIN_U32"
+                    | "S_MAX_U32"
+                    | "S_MIN_I32"
+                    | "S_MAX_I32"
+                    | "S_WQM_B32"
+                    | "S_ABSDIFF_I32"
+                    | "S_NOT_B64"
+                    | "S_WQM_B64"
+                    | "S_BCNT1_I32_B64"
+                    | "S_BCNT0_I32_B64"
+                    | "S_LSHL_B64"
+                    | "S_LSHR_B64"
+                    | "S_ASHR_I64"
+                    | "S_BFE_U64"
+                    | "S_BFE_I64"
+                    | "S_AND_B64"
+                    | "S_OR_B64"
+                    | "S_XOR_B64"
+                    | "S_ANDN2_B64"
+                    | "S_ORN2_B64"
+                    | "S_NAND_B64"
+                    | "S_NOR_B64"
+                    | "S_XNOR_B64"
+            )
+        }
+        _ => false,
+    }
+}
+
+/// Whether `d` may read `scc` (either implicitly or via scalar source code 253).
+fn reads_scc(d: &Decoded) -> bool {
+    let n = d.inst.name;
+    if matches!(n, "S_CBRANCH_SCC0" | "S_CBRANCH_SCC1" | "S_CSELECT_B32" | "S_CSELECT_B64" | "S_ADDC_U32" | "S_SUBB_U32")
+        || n.starts_with("S_CMOV")
+    {
+        return true;
+    }
+    if d.variant == Variant::Sdwa {
+        let Some(e) = ext_encoding(d) else { return true };
+        let fv = |f: &str| rdna2::field_value(e, &d.words, f).unwrap_or(0);
+        if (fv("S0") == 1 && fv("VSRC0") == 253) || (d.enc.field("VSRC1").is_some() && fv("S1") == 1 && fv("VSRC1") == 253) {
+            return true;
+        }
+    }
+    for o in d.ienc.operands {
+        if o.output {
+            continue;
+        }
+        if o.ty == "OPR_SSRC_SPECIAL_SCC" {
+            return true;
+        }
+        if o.implicit {
+            continue;
+        }
+        let Some(f) = o.field else { continue };
+        if f == "LITERAL" || (f == "SRC0" && d.variant != Variant::Plain) {
+            continue;
+        }
+        if !["SREG", "SSRC", "SDST", "OPR_SRC", "SMEM_OFFSET"].iter().any(|k| o.ty.contains(k)) {
+            continue;
+        }
+        if rdna2::register_scale(f) == 1 && rdna2::field_value(d.enc, &d.words, f) == Some(253) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Instructions that keep (part of) their destination's old value: the destination is read
 /// and not overwritten.
 fn keeps_destination(name: &str) -> bool {
     name.starts_with("S_CMOV") || matches!(name, "S_ADDK_I32" | "S_MULK_I32" | "S_BITSET0_B32" | "S_BITSET1_B32" | "S_BITSET0_B64" | "S_BITSET1_B64")
+}
+
+struct InstFlow {
+    whole: Regs,
+    kill: Regs,
+    /// Even-aligned 64-bit lane-wise SALU op: `(dst, lane_srcs, sets_scc)`.
+    lane_op: Option<(Regs, Regs, bool)>,
+    reads_scc: bool,
+    writes_scc: bool,
+}
+
+fn flow(d: &Decoded) -> InstFlow {
+    let (whole, kill) = uses(d);
+    let r_scc = reads_scc(d);
+    let w_scc = writes_scc(d);
+    let Some(sets_scc) = lane_wise_salu64(d.inst.name) else {
+        return InstFlow { whole, kill, lane_op: None, reads_scc: r_scc, writes_scc: w_scc };
+    };
+    if d.variant != Variant::Plain {
+        return InstFlow { whole, kill, lane_op: None, reads_scc: r_scc, writes_scc: w_scc };
+    }
+    // Verify even SGPR pair alignment on dst and all register sources so low/high half words can
+    // never cross-alias; scalar special codes `vccz` (251) / `execz` (252) always read whole.
+    let keeps = keeps_destination(d.inst.name);
+    let (mut dst_regs, mut lane_srcs, mut force_whole) = (0 as Regs, 0 as Regs, 0 as Regs);
+    for o in d.ienc.operands {
+        let Some(f) = o.field else { continue };
+        if o.implicit || f == "LITERAL" {
+            continue;
+        }
+        if !["SREG", "SSRC", "SDST", "OPR_SRC"].iter().any(|k| o.ty.contains(k)) {
+            continue;
+        }
+        let code = rdna2::field_value(d.enc, &d.words, f).unwrap_or(0) * rdna2::register_scale(f);
+        let n = (o.size as u64).div_ceil(32).max(1);
+        if o.output {
+            if code == 125 {
+                continue;
+            }
+            if code > 126 || code & 1 != 0 || n != 2 {
+                return InstFlow { whole, kill, lane_op: None, reads_scc: r_scc, writes_scc: w_scc };
+            }
+            let r = range(code, 2);
+            dst_regs |= r;
+            if keeps {
+                lane_srcs |= r;
+            }
+        } else {
+            match code {
+                251 => force_whole |= VCC,
+                252 => force_whole |= EXEC,
+                125 => {}
+                c if c <= 127 => {
+                    if c > 126 || c & 1 != 0 || n != 2 {
+                        return InstFlow { whole, kill, lane_op: None, reads_scc: r_scc, writes_scc: w_scc };
+                    }
+                    lane_srcs |= range(c, 2);
+                }
+                _ => {}
+            }
+        }
+    }
+    InstFlow { whole: force_whole, kill, lane_op: Some((dst_regs, lane_srcs, sets_scc)), reads_scc: r_scc, writes_scc: w_scc }
 }
 
 /// (read whole, overwritten) SGPRs of one instruction. Lane-by-lane mask reads are left out
@@ -167,23 +374,39 @@ pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
         .iter()
         .map(|d| loops.iter().filter(|&&(a, b)| a <= d.pc && d.pc < b).map(|&(_, b)| pcs.range(b..).next().map(|(_, &j)| j)).collect())
         .collect();
-    let gen_kill: Vec<(Regs, Regs)> = insts.iter().map(uses).collect();
+    let flows: Vec<InstFlow> = insts.iter().map(flow).collect();
+    let scc_at_end = end_reads_all;
     let mut live_in = vec![0 as Regs; insts.len()];
     let mut live_out = vec![0 as Regs; insts.len()];
+    let mut scc_in = vec![false; insts.len()];
+    let mut scc_out = vec![false; insts.len()];
     loop {
         let mut changed = false;
         for i in (0..insts.len()).rev() {
-            let out = match &succ[i] {
-                None => ALL,
-                Some(s) if s.is_empty() => at_end,
-                Some(s) => s.iter().fold(EXEC, |m, &j| m | live_in[j]),
+            let (out, sout) = match &succ[i] {
+                None => (ALL, true),
+                Some(s) if s.is_empty() => (at_end, scc_at_end),
+                Some(s) => s.iter().fold((EXEC, false), |(m, sc), &j| (m | live_in[j], sc || scc_in[j])),
             };
-            let left = exits[i].iter().fold(0, |m, e| m | at_end | e.map_or(0, |j| live_in[j]));
-            let (gen, kill) = gen_kill[i];
-            let inn = gen | (out & !kill) | left | EXEC;
-            if out != live_out[i] || inn != live_in[i] {
+            let (left, sleft) = exits[i].iter().fold((0 as Regs, false), |(m, sc), e| {
+                (m | at_end | e.map_or(0, |j| live_in[j]), sc || scc_at_end || e.is_some_and(|j| scc_in[j]))
+            });
+            let f = &flows[i];
+            let mut gen = f.whole;
+            if let Some((dst, srcs, sets_scc)) = f.lane_op {
+                // Lane-wise 64-bit SALU op needs whole inputs iff its destination is whole-live
+                // afterward, or it writes `scc` and `scc` is live afterward.
+                if (out & dst) != 0 || (sets_scc && sout) {
+                    gen |= srcs;
+                }
+            }
+            let inn = gen | (out & !f.kill) | left | EXEC;
+            let sinn = f.reads_scc || (sout && !f.writes_scc) || sleft;
+            if out != live_out[i] || inn != live_in[i] || sout != scc_out[i] || sinn != scc_in[i] {
                 live_out[i] = out;
                 live_in[i] = inn;
+                scc_out[i] = sout;
+                scc_in[i] = sinn;
                 changed = true;
             }
         }
@@ -252,9 +475,8 @@ mod tests {
 
     #[test]
     fn scalar_reads_and_branches_keep_the_exchange() {
-        let readers: [I; 5] = [
+        let readers: [I; 4] = [
             ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
-            MOV_S2_VCC,
             ("S_CBRANCH_VCCZ", "ENC_SOPP", &[("SIMM16", 0)]),
             ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 106)]),
             ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 106)]),
@@ -263,28 +485,31 @@ mod tests {
             let p = asm(&[CMP, reader, ENDPGM]);
             assert!(mask_needed(&whole_live_out(&p, false), 0, 106), "{}", reader.0);
         }
+        // s_mov_b64 keeps the exchange when its destination is read whole
+        let p = asm(&[CMP, MOV_S2_VCC, ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 2)]), ENDPGM]);
+        assert!(mask_needed(&whole_live_out(&p, false), 0, 106));
     }
 
     #[test]
     fn a_whole_read_on_one_path_or_around_a_loop_keeps_the_exchange() {
-        // v_cmp; s_cbranch_scc0 → skip; v_cndmask; s_branch → end; skip: s_mov s[2:3], vcc; end
+        // v_cmp; s_cbranch_scc0 → skip; v_cndmask; s_branch → end; skip: s_bcnt1 vcc; end
         let p = asm(&[
             CMP,
             ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 2)]),
             CNDMASK,
             ("S_BRANCH", "ENC_SOPP", &[("SIMM16", 1)]),
-            MOV_S2_VCC,
+            BCNT_VCC,
             ENDPGM,
         ]);
         assert!(mask_needed(&whole_live_out(&p, false), 0, 106));
         // loop: the mask written at the bottom is read whole at the top of the next iteration
-        let p = asm(&[MOV_S2_VCC, CMP, ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)]), ENDPGM]);
+        let p = asm(&[BCNT_VCC, CMP, ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)]), ENDPGM]);
         assert!(mask_needed(&whole_live_out(&p, false), 1, 106));
     }
 
     #[test]
     fn overwritten_before_any_whole_read() {
-        let p = asm(&[CMP, CNDMASK, CMP_LT, MOV_S2_VCC, ENDPGM]);
+        let p = asm(&[CMP, CNDMASK, CMP_LT, BCNT_VCC, ENDPGM]);
         let live = whole_live_out(&p, false);
         assert!(!mask_needed(&live, 0, 106));
         assert!(mask_needed(&live, 2, 106));
@@ -386,7 +611,7 @@ mod tests {
             ("S_ADD_U32", "ENC_SOP2", &[("SDST", 30), ("SSRC0", 30), ("SSRC1", 255)][..], Some(20)),
             ("S_ADDC_U32", "ENC_SOP2", &[("SDST", 31), ("SSRC0", 31), ("SSRC1", 128)][..], None),
             ("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 30)][..], None),
-            (MOV_S2_VCC.0, MOV_S2_VCC.1, MOV_S2_VCC.2, None),
+            (BCNT_VCC.0, BCNT_VCC.1, BCNT_VCC.2, None),
             (CNDMASK.0, CNDMASK.1, CNDMASK.2, None),
             (ENDPGM.0, ENDPGM.1, ENDPGM.2, None),
         ] {
@@ -450,5 +675,129 @@ mod tests {
         let p = asm(&[CMP, mov, ("S_MOV_B64", "ENC_SOP1", &[("SDST", 106), ("SSRC0", 128)]), ENDPGM]);
         assert!(uses(&p[1]).0 & VCC == VCC);
         assert!(mask_needed(&whole_live_out(&p, false), 0, 106));
+    }
+
+    #[test]
+    fn bitwise_mask_chain_for_selector_needs_no_exchange() {
+        let cmp_s22: I = ("V_CMP_LT_U32", "ENC_VOP3", &[("VDST", 22), ("SRC0", V + 2), ("SRC1", V + 3)]);
+        let p = asm(&[
+            CMP_S20,
+            cmp_s22,
+            ("S_AND_B64", "ENC_SOP2", &[("SDST", 24), ("SSRC0", 20), ("SSRC1", 22)]),
+            ("S_NOT_B64", "ENC_SOP1", &[("SDST", 24), ("SSRC0", 24)]),
+            ("S_OR_B64", "ENC_SOP2", &[("SDST", 26), ("SSRC0", 24), ("SSRC1", 20)]),
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 106), ("SSRC0", 26)]),
+            CNDMASK,
+            ENDPGM,
+        ]);
+        let live = whole_live_out(&p, false);
+        assert!(!mask_needed(&live, 0, 20));
+        assert!(!mask_needed(&live, 1, 22));
+        // kernel mode reads all SGPRs and SCC at end: exchanges are kept
+        let live_k = whole_live_out(&p, true);
+        assert!(mask_needed(&live_k, 0, 20));
+        assert!(mask_needed(&live_k, 1, 22));
+    }
+
+    #[test]
+    fn bitwise_mask_with_live_scc_keeps_exchange() {
+        let cmp_s22: I = ("V_CMP_LT_U32", "ENC_VOP3", &[("VDST", 22), ("SRC0", V + 2), ("SRC1", V + 3)]);
+        let and_vcc: I = ("S_AND_B64", "ENC_SOP2", &[("SDST", 106), ("SSRC0", 20), ("SSRC1", 22)]);
+        let br_scc: I = ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 0)]);
+        // SCC from s_and_b64 is live at s_cbranch_scc0 -> inputs must be exchanged
+        let p = asm(&[CMP_S20, cmp_s22, and_vcc, CNDMASK, br_scc, ENDPGM]);
+        let live = whole_live_out(&p, false);
+        assert!(mask_needed(&live, 0, 20));
+        assert!(mask_needed(&live, 1, 22));
+        // Overwriting SCC before the branch makes s_and_b64's SCC dead -> no exchange needed
+        let cmp_scc: I = ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)]);
+        let p = asm(&[CMP_S20, cmp_s22, and_vcc, CNDMASK, cmp_scc, br_scc, ENDPGM]);
+        let live = whole_live_out(&p, false);
+        assert!(!mask_needed(&live, 0, 20));
+        assert!(!mask_needed(&live, 1, 22));
+    }
+
+    #[test]
+    fn bitwise_mask_feeding_whole_read_keeps_exchange() {
+        let cmp_s22: I = ("V_CMP_LT_U32", "ENC_VOP3", &[("VDST", 22), ("SRC0", V + 2), ("SRC1", V + 3)]);
+        // Feeding s_and_saveexec_b64 (whole read of s[20:21])
+        let p = asm(&[
+            CMP_S20,
+            cmp_s22,
+            ("S_AND_B64", "ENC_SOP2", &[("SDST", 20), ("SSRC0", 20), ("SSRC1", 22)]),
+            ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 24), ("SSRC0", 20)]),
+            ENDPGM,
+        ]);
+        let live = whole_live_out(&p, false);
+        assert!(mask_needed(&live, 0, 20));
+        assert!(mask_needed(&live, 1, 22));
+        // Writing EXEC directly
+        let p = asm(&[CMP_S20, cmp_s22, ("S_AND_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 20), ("SSRC1", 22)]), ENDPGM]);
+        let live = whole_live_out(&p, false);
+        assert!(mask_needed(&live, 0, 20));
+        assert!(mask_needed(&live, 1, 22));
+    }
+
+    #[test]
+    fn cselect_and_cmov_b64_propagate_lane_masks_and_keep_scc_uniform() {
+        let cmp_s22: I = ("V_CMP_LT_U32", "ENC_VOP3", &[("VDST", 22), ("SRC0", V + 2), ("SRC1", V + 3)]);
+        // Uniform SCC from s_cmp_eq_u32 -> s_cselect_b64 needs no exchange on its mask inputs
+        let p = asm(&[
+            CMP_S20,
+            cmp_s22,
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)]),
+            ("S_CSELECT_B64", "ENC_SOP2", &[("SDST", 106), ("SSRC0", 20), ("SSRC1", 22)]),
+            CNDMASK,
+            ENDPGM,
+        ]);
+        let live = whole_live_out(&p, false);
+        assert!(!mask_needed(&live, 0, 20));
+        assert!(!mask_needed(&live, 1, 22));
+        // s_cmov_b64 reads SCC from s_and_b64 -> s_and_b64's inputs must be exchanged so SCC is uniform
+        let p = asm(&[
+            CMP_S20,
+            cmp_s22,
+            ("S_AND_B64", "ENC_SOP2", &[("SDST", 24), ("SSRC0", 20), ("SSRC1", 22)]),
+            ("S_CMOV_B64", "ENC_SOP1", &[("SDST", 106), ("SSRC0", 20)]),
+            CNDMASK,
+            ENDPGM,
+        ]);
+        let live = whole_live_out(&p, false);
+        assert!(mask_needed(&live, 0, 20));
+        assert!(mask_needed(&live, 1, 22));
+    }
+
+    #[test]
+    fn vccz_operand_and_odd_alignment_in_bitwise_ops_keep_exchange() {
+        // SRC_VCCZ (251) tests all 64 bits of VCC -> VCC must stay exchanged
+        let p = asm(&[
+            CMP,
+            ("S_AND_B64", "ENC_SOP2", &[("SDST", 20), ("SSRC0", 22), ("SSRC1", 251)]),
+            ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 3), ("SRC1", V + 4), ("SRC2", 20)]),
+            ENDPGM,
+        ]);
+        assert!(mask_needed(&whole_live_out(&p, false), 0, 106));
+        // Odd-aligned pair s[21:22] crosses even/odd half boundary -> stay conservative
+        let p = asm(&[
+            CMP_S20,
+            ("S_AND_B64", "ENC_SOP2", &[("SDST", 24), ("SSRC0", 21), ("SSRC1", 22)]),
+            ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 3), ("SRC1", V + 4), ("SRC2", 24)]),
+            ENDPGM,
+        ]);
+        assert!(mask_needed(&whole_live_out(&p, false), 0, 20));
+    }
+
+    #[test]
+    fn loop_exit_reading_scc_keeps_exchange_inside_loop() {
+        // loop: v_cmp s[20:21]; s_and_b64 vcc, s[20:21], s[22:23]; v_cndmask; s_branch loop; s_cbranch_scc1
+        let p = asm(&[
+            CMP_S20,
+            ("S_AND_B64", "ENC_SOP2", &[("SDST", 106), ("SSRC0", 20), ("SSRC1", 22)]),
+            CNDMASK,
+            ("S_BRANCH", "ENC_SOPP", &[("SIMM16", 0xFFFC)]),
+            ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]),
+            ENDPGM,
+        ]);
+        assert!(mask_needed(&whole_live_out(&p, false), 0, 20));
     }
 }
