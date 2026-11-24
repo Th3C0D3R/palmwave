@@ -715,6 +715,11 @@ pub(super) fn on_queue_release(queue: usize) {
             }
         }
     }
+    if let Some(graph) = SYNC_GRAPH.lock().unwrap().as_mut() {
+        for cell in graph.cells.values_mut() {
+            cell.completion_fences.remove(&queue);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1066,6 +1071,14 @@ struct SyncCell {
     /// Highest value explicitly released on CPU (cycle-break or watchdog). Protects against
     /// vkd3d-proton rewinding `fence->virtual_value` when an older in-flight GPU signal retires.
     cpu_signaled_max: u64,
+    /// Highest proven producer completion. Signals on rotating queues can retire out of order
+    /// and rewind the native fence; new waits must retain proof that their producer finished.
+    completed_max: u64,
+    /// Private monotonic markers per producer queue (the shared bridge fence can rewind).
+    completion_fences: HashMap<usize, (ID3D12Fence, u64)>,
+    /// (Write64 value, private marker fence, marker value). Kept until the producer completes,
+    /// including when cycle breaking removes its shared-fence signal from the graph.
+    completions: Vec<(u64, ID3D12Fence, u64)>,
     /// Set once a strictly decreasing write (`value < submitted_max`) is observed at this VA,
     /// disabling GPU-fence bridging and falling back to CPU polling.
     non_monotonic: bool,
@@ -1131,11 +1144,26 @@ unsafe fn prune_completed_waits(cell: &mut SyncCell) -> u64 {
         let removed = cell.armed_waits.len();
         cell.armed_waits.clear();
         cell.submitted_signals.clear();
+        cell.completions.clear();
         if removed > 0 {
             ARMED_GPU_WAITS.fetch_sub(removed, Ordering::AcqRel);
         }
         return completed;
     }
+    cell.completed_max = cell.completed_max.max(completed);
+    let mut proven = cell.completed_max;
+    cell.completions.retain(|(val, fence, point)| {
+        let done = fence.GetCompletedValue();
+        if done == u64::MAX {
+            return false;
+        }
+        if done >= *point {
+            proven = proven.max(*val);
+            return false;
+        }
+        true
+    });
+    cell.completed_max = proven;
     if !cell.armed_waits.is_empty() {
         let before = cell.armed_waits.len();
         cell.armed_waits.retain(|aw| aw.val > completed);
@@ -1652,6 +1680,23 @@ fn note_write64_recorded(list: *mut c_void, va: u64, value: u64) {
     }
 }
 
+/// Prove producer work independently of the shared fence's transient value. The marker precedes
+/// the bridge signal, so a wait interleaved after that signal cannot hide its completed producer.
+unsafe fn mark_write64_completion(queue: &ID3D12CommandQueue, dev: &ID3D12Device, va: u64, val: u64) -> windows::core::Result<()> {
+    let mut g = SYNC_GRAPH.lock().unwrap();
+    let Some(cell) = g.as_mut().and_then(|graph| graph.cells.get_mut(&va)) else { return Ok(()) };
+    let q = queue.as_raw() as usize;
+    if !cell.completion_fences.contains_key(&q) {
+        cell.completion_fences.insert(q, (dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?, 0));
+    }
+    let (fence, point) = cell.completion_fences.get_mut(&q).unwrap();
+    *point += 1;
+    // Serialize marker submissions so even concurrent callers cannot rewind this private fence.
+    queue.Signal(&*fence, *point)?;
+    cell.completions.push((val, fence.clone(), *point));
+    Ok(())
+}
+
 unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
     if queue.is_null() || pairs.is_empty() {
         return;
@@ -1743,6 +1788,9 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
         match action {
             SignalAction::Skip => {}
             SignalAction::GpuSignal => {
+                if let Err(e) = mark_write64_completion(q, &dev, va, val) {
+                    crate::xlog_warn!("D3D12.X: Write64 completion marker({va:#x}, {val:#x}) failed ({e})");
+                }
                 if let Err(e) = q.Signal(&fence, val) {
                     crate::xlog_warn!("D3D12.X: Write64 fence Signal({va:#x}, {val:#x}) failed ({e}) – signalling on CPU");
                     let _ = fence.Signal(val);
@@ -1874,8 +1922,16 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
                     return GpuWaitOutcome::Handled;
                 }
                 let completed = prune_completed_waits(cell);
-                if completed >= w.value {
-                    // Fence already reached `w.value`: trust it if CPU memory agrees (not reset).
+                if completed.max(cell.completed_max) >= w.value {
+                    // This value already completed, even if an older GPU signal rewound the fence.
+                    // No future signal is owed for it. Keep CPU polling for a reset/stale memory view
+                    // instead of arming an orphaned GPU wait that only the watchdog could release.
+                    if completed < w.value {
+                        static COMPLETED: AtomicU64 = AtomicU64::new(0);
+                        if once(&COMPLETED, 16) {
+                            crate::xlog_info!("D3D12.X: Wait64 at {:#x} >= {:#x}: producer completed {:#x}, native fence {completed:#x} – not arming an orphaned GPU wait", w.va, w.value, cell.completed_max);
+                        }
+                    }
                     return if w.is_satisfied() { GpuWaitOutcome::Handled } else { GpuWaitOutcome::FallbackCpu };
                 }
                 if cell.submitted_max >= w.value && cell.submitted_queue == Some(q_raw) {
@@ -5777,6 +5833,93 @@ mod tests {
         }
     }
 
+    /// A Write64 closes a three-queue cycle while a fourth queue waits on the same cell.
+    /// Both consumers must pass the released wait without releasing the other GPU dependencies.
+    #[test]
+    fn write64_cycle_with_four_queues_and_two_waiters_completes() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                };
+                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                    crate::gpu::recomp::runner::skip_test("no GPU");
+                    return;
+                }
+            }
+            let dev = dev.unwrap();
+            let queues: Vec<ID3D12CommandQueue> = (0..4).map(|_| dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap()).collect();
+            let done: Vec<ID3D12Fence> = (0..4).map(|_| dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap()).collect();
+            let bridges: Vec<ID3D12Fence> = (0..3).map(|_| dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap()).collect();
+            let cells = [Box::new(AtomicU64::new(0)), Box::new(AtomicU64::new(0)), Box::new(AtomicU64::new(0))];
+            let vas = cells.each_ref().map(|cell| &**cell as *const AtomicU64 as u64);
+            let value = 0x6f3;
+            {
+                let mut g = SYNC_GRAPH.lock().unwrap();
+                let graph = g.get_or_insert_with(SyncGraph::default);
+                for (i, &va) in vas.iter().enumerate() {
+                    graph.cells.insert(va, SyncCell { fence: Some(bridges[i].clone()), device: dev.as_raw() as usize, recorded_max: value, recorded_list_type: Some(D3D12_COMMAND_LIST_TYPE_COMPUTE), ..Default::default() });
+                }
+            }
+            let wait = |va| PendingWait { va, width: 8, comparison: D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, value, mask: u64::MAX, after_write64: false };
+            // A keeps B and C pending while the graph is built: q0 -> q2 -> q1 -> q0.
+            let mut handled = try_gpu_wait(queues[0].as_raw(), &wait(vas[0]), &[]) == GpuWaitOutcome::Handled;
+            signal_write64_pairs(queues[0].as_raw(), &[(vas[1], value)]);
+            handled &= try_gpu_wait(queues[1].as_raw(), &wait(vas[1]), &[]) == GpuWaitOutcome::Handled;
+            signal_write64_pairs(queues[1].as_raw(), &[(vas[2], value)]);
+            handled &= try_gpu_wait(queues[2].as_raw(), &wait(vas[2]), &[]) == GpuWaitOutcome::Handled;
+            handled &= try_gpu_wait(queues[3].as_raw(), &wait(vas[0]), &[]) == GpuWaitOutcome::Handled;
+            let two_waiters = SYNC_GRAPH.lock().unwrap().as_ref().unwrap().cells[&vas[0]].armed_waits.len() == 2;
+            signal_write64_pairs(queues[2].as_raw(), &[(vas[0], value)]);
+            let (released, gpu_ordered) = {
+                let g = SYNC_GRAPH.lock().unwrap();
+                let graph = g.as_ref().unwrap();
+                let a = &graph.cells[&vas[0]];
+                (a.cpu_signaled_max == value && a.armed_waits.is_empty(), (1..3).all(|i| {
+                    let cell = &graph.cells[&vas[i]];
+                    cell.cpu_signaled_max == 0 && cell.submitted_queue == Some(queues[i - 1].as_raw() as usize)
+                }))
+            };
+            let submitted = queues.iter().zip(&done).map(|(q, f)| q.Signal(f, 1).is_ok()).collect::<Vec<_>>();
+            let started = Instant::now();
+            while done.iter().any(|f| f.GetCompletedValue() < 1) && started.elapsed() < Duration::from_millis(1500) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let completed: Vec<bool> = done.iter().map(|f| f.GetCompletedValue() == 1).collect();
+
+            // Rescue even a failed regression before assertions so no queue or tracked wait leaks.
+            for f in &bridges {
+                let _ = f.Signal(value);
+            }
+            for f in &done {
+                let _ = crate::gpu::fence::wait(f, 1, &dev, None, 1500);
+            }
+            if let Some(graph) = SYNC_GRAPH.lock().unwrap().as_mut() {
+                for va in vas {
+                    if let Some(cell) = graph.cells.remove(&va) {
+                        ARMED_GPU_WAITS.fetch_sub(cell.armed_waits.len(), Ordering::AcqRel);
+                    }
+                }
+                for q in &queues {
+                    graph.queue_seq.remove(&(q.as_raw() as usize));
+                }
+            }
+            assert!(handled && submitted.iter().all(|&ok| ok), "all queue operations must succeed");
+            assert!(two_waiters && released, "the closing Write64 must release both A waiters");
+            assert!(gpu_ordered, "B and C must stay GPU ordered");
+            assert!(completed.iter().all(|&ok| ok), "all four queues must finish within 1500 ms without the watchdog: {completed:?}");
+        }
+    }
+
     /// Exact `(queue, seq)` cycle detection must catch k=1 self-deadlocks, k=2 and k=3 transitive
     /// cycles (including mixed title-fence + Wait64 cycles) while NEVER false-positiving on
     /// pipelined frame N/N+1 or back-to-back cross-queue handshakes (`wait_seq > prod_sig_seq`).
@@ -6648,6 +6791,140 @@ mod tests {
             assert_eq!(released, vec![0; QUEUES], "frame 2: a cell's new writer still waiting for the last writer's value is no cycle – nothing is signalled on the CPU");
             assert!(ordered[1], "frame 2: each queue's Write64 signal goes to the GPU before its waits");
             assert_eq!(finished, vec![true; QUEUES], "both frames run on the GPU without the watchdog");
+        }
+    }
+
+    #[test]
+    fn write64_cycle_releases_two_new_waiters_after_an_older_gpu_signal() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+        unsafe {
+            let mut dev = None;
+            if D3D12CreateDevice::<_, ID3D12Device>(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            for observe_completion in [true, false] {
+                let queues: [ID3D12CommandQueue; 4] = std::array::from_fn(|i| {
+                    dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                        Type: if i == 0 { D3D12_COMMAND_LIST_TYPE_DIRECT } else { D3D12_COMMAND_LIST_TYPE_COMPUTE },
+                        ..Default::default()
+                    }).unwrap()
+                });
+                let fences: [ID3D12Fence; 2] = std::array::from_fn(|_| dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap());
+                let done: [ID3D12Fence; 4] = std::array::from_fn(|_| dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap());
+                let cells = Box::new([AtomicU64::new(0), AtomicU64::new(0)]);
+                let vas = std::array::from_fn::<_, 2, _>(|i| &cells[i] as *const AtomicU64 as u64);
+                {
+                    let mut g = SYNC_GRAPH.lock().unwrap();
+                    let graph = g.get_or_insert_with(SyncGraph::default);
+                    for (i, &va) in vas.iter().enumerate() {
+                        graph.cells.insert(va, SyncCell {
+                            fence: Some(fences[i].clone()),
+                            device: dev.as_raw() as usize,
+                            recorded_max: 10,
+                            ..Default::default()
+                        });
+                    }
+                }
+                let wait = |q: usize, cell: usize, value| {
+                    try_gpu_wait(queues[q].as_raw(), &PendingWait {
+                        va: vas[cell], width: 8, comparison: D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32,
+                        value, mask: u64::MAX, after_write64: false,
+                    }, &[])
+                };
+
+                // q0's A=9 signal is blocked behind C. q1 completes A=10 first;
+                // Either pruning observes the high value, or it is missed entirely.
+                let mut bridged = wait(0, 1, 1) == GpuWaitOutcome::Handled;
+                signal_write64_pairs(queues[0].as_raw(), &[(vas[0], 9)]);
+                signal_write64_pairs(queues[1].as_raw(), &[(vas[0], 10)]);
+                let mut signaled = queues[1].Signal(&done[1], 1).is_ok();
+                let newer_done = crate::gpu::fence::wait(&done[1], 1, &dev, None, 1500).is_ok();
+                let observed = if observe_completion {
+                    let mut g = SYNC_GRAPH.lock().unwrap();
+                    Some(prune_completed_waits(g.as_mut().unwrap().cells.get_mut(&vas[0]).unwrap()))
+                } else {
+                    None
+                };
+
+                // This Write64 closes q0's self-cycle and releases C on the CPU.
+                // The old GPU A=9 signal then retires AFTER the completed A=10.
+                signal_write64_pairs(queues[0].as_raw(), &[(vas[1], 1)]);
+                signaled &= queues[0].Signal(&done[0], 1).is_ok();
+                let older_done = crate::gpu::fence::wait(&done[0], 1, &dev, None, 1500).is_ok();
+                let rewound = fences[0].GetCompletedValue();
+
+                // wait_all_on reaches the bridge when memory is still stale or reset.
+                // Preserve its CPU check, but never enqueue an unsatisfiable native wait.
+                let cpu_check = wait(2, 0, 10) == GpuWaitOutcome::FallbackCpu;
+                let no_orphan = SYNC_GRAPH.lock().unwrap().as_ref().unwrap().cells[&vas[0]].armed_waits.is_empty();
+
+                // The title's memory agrees with the newer completed write. These are
+                // NEW waits, so an earlier fence completion does not itself release
+                // them after the older signal has rewound the fence to 9.
+                cells[0].store(10, Ordering::Release);
+                bridged &= wait(2, 0, 10) == GpuWaitOutcome::Handled;
+                bridged &= wait(3, 0, 10) == GpuWaitOutcome::Handled;
+                signaled &= queues[2].Signal(&done[2], 1).is_ok();
+                signaled &= queues[3].Signal(&done[3], 1).is_ok();
+                let start = Instant::now();
+                while done.iter().any(|f| f.GetCompletedValue() == 0) && start.elapsed() < Duration::from_millis(1500) {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                let completed: Vec<u64> = done.iter().map(|f| f.GetCompletedValue()).collect();
+
+                // The remembered completion must not bypass a higher value whose
+                // producer is only recorded. Keep that wait until its GPU signal.
+                {
+                    let mut g = SYNC_GRAPH.lock().unwrap();
+                    g.as_mut().unwrap().cells.get_mut(&vas[0]).unwrap().recorded_max = 11;
+                }
+                let future_bridged = wait(2, 0, 11) == GpuWaitOutcome::Handled;
+                signaled &= queues[2].Signal(&done[2], 2).is_ok();
+                let future_pending = {
+                    let g = SYNC_GRAPH.lock().unwrap();
+                    let cell = &g.as_ref().unwrap().cells[&vas[0]];
+                    cell.submitted_max == 10 && cell.cpu_signaled_max < 11
+                        && cell.armed_waits.iter().any(|aw| aw.val == 11 && aw.waiting_queue == queues[2].as_raw() as usize)
+                        && done[2].GetCompletedValue() < 2
+                };
+                signal_write64_pairs(queues[1].as_raw(), &[(vas[0], 11)]);
+                let future_done = crate::gpu::fence::wait(&done[2], 2, &dev, None, 1500).is_ok();
+
+                // Always rescue and drain the queues before reporting a regression, so a
+                // failed assertion cannot leave GPU work waiting for the watchdog.
+                for fence in &fences {
+                    let _ = fence.Signal(11);
+                }
+                for fence in &done {
+                    let _ = crate::gpu::fence::wait(fence, 1, &dev, None, 1500);
+                }
+                let _ = crate::gpu::fence::wait(&done[2], 2, &dev, None, 1500);
+                {
+                    let mut g = SYNC_GRAPH.lock().unwrap();
+                    if let Some(graph) = g.as_mut() {
+                        for va in vas {
+                            if let Some(cell) = graph.cells.remove(&va) {
+                                ARMED_GPU_WAITS.fetch_sub(cell.armed_waits.len(), Ordering::AcqRel);
+                            }
+                        }
+                        for q in &queues {
+                            graph.queue_seq.remove(&(q.as_raw() as usize));
+                        }
+                    }
+                }
+                assert!(newer_done && older_done, "both GPU signal producers must complete");
+                assert_eq!(observed, observe_completion.then_some(10), "the observed case must sample the newer GPU completion");
+                assert_eq!(rewound, 9, "the late GPU signal must rewind the native fence");
+                assert!(cpu_check && no_orphan, "stale/reset memory must use CPU checking without arming an orphaned GPU wait");
+                assert!(bridged, "the cycle and both new waits must be handled without CPU polling");
+                assert!(signaled, "completion markers must be submitted");
+                assert_eq!(completed, vec![1; 4], "all four queues must complete without the watchdog (observed={observe_completion})");
+                assert!(future_bridged && future_pending, "a higher unsubmitted value must remain armed");
+                assert!(future_done, "the higher wait must complete after its actual GPU signal");
+            }
         }
     }
 }
