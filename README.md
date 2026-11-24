@@ -66,6 +66,8 @@ Shader compilation does not block the start. Before it loads its world, the titl
 
 On a GPU with 32-lane waves, including the RTX 5080, the recompiler implements wave64 compute and mesh operations with two cooperating halves. Vertex and pixel shaders that read lanes 32–63 still have accuracy limits. [Wave64 implementation notes](docs/wave64-on-wave32.md)
 
+The 64 KiB pages of video memory that hold the title's textures keep to a budget: what is left of 90 % of the video memory Windows grants the process, or `XCL_VRAM_POOL_MB=<MiB>`. Past it, further pages are in system memory, which the GPU reads more slowly, and page heaps left without a texture are released. This is tested on an RTX 5080 with the unit tests only, not yet with the retail title.
+
 ## Build and run
 
 Use Windows 10/11 x64, stable Rust with the MSVC toolchain, Visual Studio C++ build tools, the Windows SDK with DXC, and Windows Gaming Services. The graphics path targets Direct3D 12, Shader Model 6.6 and mesh shaders. Windows 10 may also need the D3D12 Agility SDK.
