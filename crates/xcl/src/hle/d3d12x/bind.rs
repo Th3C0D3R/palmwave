@@ -38,6 +38,10 @@ struct State {
     arena: crate::gpu::uma::Arena,
     res_buf: Option<(ID3D12Resource, u64, usize)>,
     res_retired: Vec<(ID3D12Resource, u64, usize)>,
+    /// the next two-pass draw takes the upper half of `res_buf` (`res_region`)
+    res_upper: bool,
+    /// the last two-pass draw alternated: its mesh pass may still read its half
+    res_open: bool,
 }
 
 static ALLOC_RES: Mutex<Option<HashMap<usize, Vec<(ID3D12Resource, u64, usize)>>>> = Mutex::new(None);
@@ -112,6 +116,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         if let Some(b) = s.res_buf.take() {
             res_bufs.push(b);
         }
+        (s.res_upper, s.res_open) = (false, false);
         (old, std::mem::take(&mut s.uma), res_bufs)
     });
     console_list::hold_until_reset(old, blocks);
@@ -365,11 +370,76 @@ unsafe fn default_uav_buffer(dev: &ID3D12Device, bytes: u64, what: &str) -> Resu
     res.ok_or_else(|| format!("null {what}"))
 }
 
-unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D12Resource, u64), String> {
-    let need = need_bytes.max(4 << 20).next_multiple_of(1 << 20).min(128 << 20);
-    if let Some((buf, _cap, _dev)) = with(this, |s| s.res_buf.as_ref().filter(|(_, cap, _)| *cap >= need).cloned()) {
+/// The capacity `ensure_res_buffer` gives a need of `need_bytes`.
+fn res_capacity(need_bytes: u64) -> u64 {
+    need_bytes.max(4 << 20).next_multiple_of(1 << 20).min(RES_MAX)
+}
+
+/// largest two-pass record buffer
+const RES_MAX: u64 = 128 << 20;
+
+/// The bytes to ask `ensure_res_buffer` for when two-pass draws needing `need_bytes` of records
+/// alternate between the halves of the record buffer (`res_region`): each half holds the need.
+/// None: twice the need is more than a record buffer holds.
+fn res_halves(need_bytes: u64) -> Option<u64> {
+    need_bytes.checked_mul(2).filter(|&b| b <= RES_MAX)
+}
+
+/// `XCL_TWO_PASS_HALVES=0`: two-pass draws write their records from the start of the record
+/// buffer and wait after their mesh pass, as before `res_region`.
+fn two_pass_halves() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_TWO_PASS_HALVES").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Where a two-pass draw's records go (`res_region`).
+struct Region {
+    buf: ID3D12Resource,
+    /// GPU address of the draw's records
+    va: u64,
+    /// the draw took a half of the buffer: no UAV barrier after its mesh pass
+    alternating: bool,
+    /// a UAV barrier first: the draw writes from the buffer's start, where the previous draw's
+    /// mesh pass may still be reading (it alternated)
+    wait_first: bool,
+}
+
+/// The record memory of a two-pass draw on `this` (`need_bytes`). Consecutive draws take the two
+/// halves of the list's record buffer in turn, so a draw's compute pass (writing records) need
+/// not wait for the previous draw's mesh pass (reading its own): the UAV barrier after each mesh
+/// pass goes. The one between a draw's passes stays; it also waits for the previous draw's mesh
+/// pass (an access to the same buffer) before the next draw's compute pass writes that half
+/// again. On an RTX 5080 a two-pass draw of little work cost 3.2 µs of GPU with both barriers,
+/// 1.6 with one (`bench_two_pass_commands`); a retail game's world frames make about 5,800, nine
+/// in ten of them indirect with no thread groups. From the buffer's start with both barriers, as
+/// before: a record dump due (`mesh_dump` reads the buffer from its start), a need over half of
+/// `RES_MAX`, or `XCL_TWO_PASS_HALVES=0`.
+unsafe fn res_region(this: *mut c_void, need_bytes: u64) -> Result<Region, String> {
+    match res_halves(need_bytes).filter(|_| two_pass_halves() && !super::mesh_dump::due()) {
+        Some(both) => {
+            // the halves of the buffer the draw gets – the same for every draw on that buffer
+            let (buf, va, cap) = ensure_res_buffer(this, both)?;
+            let upper = with(this, |s| {
+                s.res_open = true;
+                s.res_upper = !s.res_upper;
+                !s.res_upper
+            });
+            Ok(Region { buf, va: if upper { va + cap / 2 } else { va }, alternating: true, wait_first: false })
+        }
+        None => {
+            let (buf, va, _) = ensure_res_buffer(this, need_bytes)?;
+            let wait_first = with(this, |s| std::mem::take(&mut s.res_open));
+            Ok(Region { buf, va, alternating: false, wait_first })
+        }
+    }
+}
+
+/// The list's record buffer with room for `need_bytes`: (buffer, its GPU address, its capacity).
+unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D12Resource, u64, u64), String> {
+    let need = res_capacity(need_bytes);
+    if let Some((buf, cap, _dev)) = with(this, |s| s.res_buf.as_ref().filter(|(_, cap, _)| *cap >= need).cloned()) {
         let va = buf.GetGPUVirtualAddress();
-        return Ok((buf, va));
+        return Ok((buf, va, cap));
     }
     let dev = super::real::list_device(this).ok_or("no device for two-pass buffer")?;
     let dev_key = dev.as_raw() as usize;
@@ -381,14 +451,14 @@ unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D1
         Some(e) => e,
         None => (default_uav_buffer(&dev, need, "two-pass res buffer")?, need, dev_key),
     };
-    let buf = entry.0.clone();
+    let (buf, cap) = (entry.0.clone(), entry.1);
     let va = buf.GetGPUVirtualAddress();
     with(this, |s| {
         if let Some(old) = s.res_buf.replace(entry) {
             s.res_retired.push(old);
         }
     });
-    Ok((buf, va))
+    Ok((buf, va, cap))
 }
 
 unsafe fn bind_two_pass_stage(
@@ -582,7 +652,10 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
         let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
         let need = (groups as u64).saturating_mul(tp.record.record_dwords() as u64).saturating_mul(4);
         let run = (|| -> Result<(), String> {
-            let (res_buf, res_va) = ensure_res_buffer(this, need)?;
+            let Region { buf: res_buf, va: res_va, alternating, wait_first } = res_region(this, need)?;
+            if wait_first {
+                emit_uav_barrier(list, Some(&res_buf));
+            }
             let io = bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
             {
                 let _timed = gpu_profile::scope(this, Kind::MeshCompute, [groups, 1, 1], false, || pso);
@@ -592,7 +665,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
             if super::mesh_input_dump::due() {
                 super::mesh_input_dump::capture(this, list, format!("DispatchMesh({x}, {y}, {z}), pipeline {pso:#x}"), &io, &root_arguments(this));
             }
-            if super::mesh_dump::due() {
+            if !alternating && super::mesh_dump::due() {
                 let what = format!("DispatchMesh({x}, {y}, {z}), pipeline {pso:#x} ({}), {} mesh group(s) a record", tp.kind, tp.mesh_groups_per_record);
                 super::mesh_dump::capture(this, list, &res_buf, &tp.record, what, &io, None);
             }
@@ -602,7 +675,9 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
                 let _timed = gpu_profile::scope(this, Kind::MeshDraw, [mesh_groups, 1, 1], false, || pso);
                 pc_dm(this, mesh_groups, 1, 1);
             }
-            emit_uav_barrier(list, Some(&res_buf));
+            if !alternating {
+                emit_uav_barrier(list, Some(&res_buf));
+            }
             Ok(())
         })();
         census(this, frame_census::Kind::DispatchMesh, [x, y, z], run.as_ref().err().map(|_| "two-pass bind failed"));
@@ -654,7 +729,12 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         if let Some(msig) = dispatch_mesh_sig_of(sig) {
             let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
             let run = (|| -> Result<(), String> {
-                let (res_buf, res_va) = ensure_res_buffer(this, 32 << 20)?;
+                // the group count is the GPU's: room for 16 MB of records (a retail game's largest
+                // in its world frames: 196 groups, under 4 MB; 32 MB before the halves)
+                let Region { buf: res_buf, va: res_va, alternating, wait_first } = res_region(this, 16 << 20)?;
+                if wait_first {
+                    emit_uav_barrier(list, Some(&res_buf));
+                }
                 let io = bind_two_pass_stage(this, list, pso, &tp, res_va, true)?;
                 {
                     let _timed = gpu_profile::scope(this, Kind::MeshIndirectCompute, [max, 0, 0], count_buf != 0, || pso);
@@ -664,7 +744,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 if super::mesh_input_dump::due() {
                     super::mesh_input_dump::capture(this, list, format!("ExecuteIndirect(DispatchMesh, {max} at most), pipeline {pso:#x}"), &io, &root_arguments(this));
                 }
-                if super::mesh_dump::due() {
+                if !alternating && super::mesh_dump::due() {
                     let what = format!("ExecuteIndirect(DispatchMesh, {max} at most{}), pipeline {pso:#x} ({}), {} mesh group(s) a record", if count_buf != 0 { ", count buffer" } else { "" }, tp.kind, tp.mesh_groups_per_record);
                     super::mesh_dump::capture(this, list, &res_buf, &tp.record, what, &io, (args != 0).then_some((args, args_off + msig.mesh_offset as u64)));
                 }
@@ -678,7 +758,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     let _timed = gpu_profile::scope(this, Kind::MeshIndirectDraw, [max, 0, 0], count_buf != 0, || pso);
                     pc(this, sig, max, args, args_off, count_buf, count_off);
                 }
-                emit_uav_barrier(list, Some(&res_buf));
+                if !alternating {
+                    emit_uav_barrier(list, Some(&res_buf));
+                }
                 Ok(())
             })();
             census_indirect(this, sig, max, args, args_off, count_buf, count_off, run.as_ref().err().map(|_| "two-pass bind failed"));
@@ -1448,6 +1530,46 @@ mod tests {
     use super::super::{device_x, list_x, pso_async, real, title_list};
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    /// Consecutive two-pass draws take the two halves of the list's record buffer in turn – split
+    /// at half its capacity whatever each needs, so a draw's records never meet those of the draw
+    /// before, whose mesh pass has no UAV barrier after it – and a draw that cannot (twice its
+    /// records over a record buffer) takes the buffer from its start, and waits first only after
+    /// a draw that alternated.
+    #[test]
+    fn two_pass_draws_alternate_halves_of_the_record_buffer() {
+        use crate::gpu::recomp::runner::skip_test;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        assert_eq!(res_halves(16 << 20), Some(32 << 20));
+        assert_eq!(res_halves(64 << 20), Some(RES_MAX));
+        assert_eq!(res_halves((64 << 20) + 1), None);
+        assert_eq!(res_halves(u64::MAX), None);
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                return skip_test("no GPU");
+            }
+            let dev = dev.unwrap();
+            let buf = default_uav_buffer(&dev, RES_MAX, "test record buffer").unwrap();
+            let base = buf.GetGPUVirtualAddress();
+            let list = 0x7E57_9001usize as *mut c_void;
+            with(list, |s| s.res_buf = Some((buf.clone(), RES_MAX, dev.as_raw() as usize)));
+            let big = (64 << 20) + 1;
+            let mut got = Vec::new();
+            for need in [16u64 << 20, 1 << 10, 16 << 20, big, 1 << 10, big, big] {
+                let r = res_region(list, need).unwrap();
+                assert_eq!(r.buf.as_raw(), buf.as_raw(), "the list's buffer holds every need here");
+                got.push((r.va - base, r.alternating, r.wait_first));
+            }
+            let half = RES_MAX / 2;
+            assert_eq!(got, [(0, true, false), (half, true, false), (0, true, false), (0, false, true), (half, true, false), (0, false, true), (0, false, false)]);
+            // a list reset starts again from the lower half
+            with(list, |s| s.res_buf = None);
+            reset(list, 0, 0);
+            assert!(with(list, |s| !s.res_upper && !s.res_open));
+            forget(list);
+        }
+    }
 
     /// A pipeline with the rect list GS draws its rect lists whole: draw_rects leaves them alone.
     #[test]
