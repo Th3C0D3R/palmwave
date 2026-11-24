@@ -758,12 +758,7 @@ impl Request {
     }
 
     /// What a queue of `source_memory` refuses at enqueue.
-    #[cfg(test)]
     fn check(&self, source_memory: bool) -> Result<(), HRESULT> {
-        self.check_with_bc1(source_memory)
-    }
-
-    fn check_with_bc1(&self, source_memory: bool) -> Result<(), HRESULT> {
         if self.memory_source() != source_memory || (self.source_physical_pages() && !self.memory_source()) {
             return Err(E_SOURCE_TYPE);
         }
@@ -1672,7 +1667,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
         return;
     }
     let r = Request::parse(&*(req as *const [u8; REQUEST_BYTES]));
-    if let Err(hr) = r.check_with_bc1(q.source_memory) {
+    if let Err(hr) = r.check(q.source_memory) {
         warn_once("EnqueueRequest", format_args!("refused ({hr:#x}): {r:x?}"));
         let mut fill = None;
         if hr == E_DECOMPRESSION && r.bcpack() != 0 {
