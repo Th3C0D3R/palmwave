@@ -262,6 +262,42 @@ fn scripted() -> u32 {
     at.iter().filter(|&&(s, _)| t >= s && t < s + 0.2).fold(0, |b, &(_, g)| b | g)
 }
 
+/// `XCL_STICK_AT=s:x,y,d;…` ("130:0,1,8"): the left stick held at (x, y), each from -1 to 1,
+/// for d seconds from second s after the host started (the log's times) – a title's character
+/// walked without a person at the controls. A later entry wins where two overlap.
+fn parse_sticks(script: &str) -> Vec<(f64, f32, f32, f64)> {
+    let mut v = Vec::new();
+    for item in script.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        let parsed = item.split_once(':').and_then(|(s, rest)| {
+            let mut it = rest.split(',').map(|p| p.trim().parse::<f64>().ok());
+            let (x, y, d) = (it.next()??, it.next()??, it.next()??);
+            if it.next().is_some() {
+                return None;
+            }
+            Some((s.trim().parse::<f64>().ok()?, x.clamp(-1.0, 1.0) as f32, y.clamp(-1.0, 1.0) as f32, d.max(0.0)))
+        });
+        match parsed {
+            Some(p) => v.push(p),
+            None => crate::xlog_warn!("GameInput: XCL_STICK_AT entry {item:?} not understood (seconds:x,y,duration)"),
+        }
+    }
+    v
+}
+
+/// The left stick `XCL_STICK_AT` holds now, if any.
+fn scripted_stick() -> Option<(f32, f32)> {
+    static AT: OnceLock<Vec<(f64, f32, f32, f64)>> = OnceLock::new();
+    let at = AT.get_or_init(|| parse_sticks(&std::env::var("XCL_STICK_AT").unwrap_or_default()));
+    if at.is_empty() {
+        return None;
+    }
+    stick_at(at, crate::log::uptime())
+}
+
+fn stick_at(at: &[(f64, f32, f32, f64)], t: f64) -> Option<(f32, f32)> {
+    at.iter().rev().find(|&&(s, _, _, d)| t >= s && t < s + d).map(|&(_, x, y, _)| (x, y))
+}
+
 #[link(name = "user32")]
 extern "system" {
     fn GetAsyncKeyState(key: i32) -> i16;
@@ -312,6 +348,14 @@ pub fn poll() -> GamepadState {
         super::kbm::apply,
         scripted,
     );
+    if let Some((x, y)) = scripted_stick() {
+        static ONCE: AtomicU32 = AtomicU32::new(0);
+        if ONCE.swap(1, Ordering::Relaxed) == 0 {
+            crate::xlog_info!("GameInput: XCL_STICK_AT holds the left stick at ({x}, {y})");
+        }
+        s.left_x = x;
+        s.left_y = y;
+    }
     {
         // the first presses of each button: worth a line (is input arriving at all?)
         static SEEN: AtomicU32 = AtomicU32::new(0);
@@ -1025,6 +1069,18 @@ mod tests {
             assert_eq!(reading_release(r), 0);
             assert_eq!(get_current_reading(g, 0x10, std::ptr::null_mut(), &mut r), GAMEINPUT_E_READING_NOT_FOUND, "keyboard kind");
         }
+    }
+
+    #[test]
+    fn stick_script_parses_and_holds_for_its_duration() {
+        let v = parse_sticks("130:0,1,8; 140:-0.5,2,3;junk;5:1,1;6:1,1,1,1");
+        assert_eq!(v, vec![(130.0, 0.0, 1.0, 8.0), (140.0, -0.5, 1.0, 3.0)]);
+        assert_eq!(stick_at(&v, 129.9), None);
+        assert_eq!(stick_at(&v, 130.0), Some((0.0, 1.0)));
+        assert_eq!(stick_at(&v, 137.9), Some((0.0, 1.0)));
+        assert_eq!(stick_at(&v, 138.0), None);
+        assert_eq!(stick_at(&v, 141.0), Some((-0.5, 1.0)));
+        assert!(parse_sticks("").is_empty());
     }
 
     #[test]
