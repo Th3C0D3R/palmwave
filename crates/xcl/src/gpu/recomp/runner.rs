@@ -65,6 +65,8 @@ struct Gpu {
     wave32: bool,
     /// mesh shader tier 1 or higher (`mesh_draw`)
     mesh: bool,
+    /// `pso::image_atomics64_for_device`
+    image_atomics64: bool,
 }
 
 // D3D12 objects are free-threaded; access is serialised by the mutex.
@@ -118,7 +120,8 @@ fn init() -> Result<Gpu, String> {
             dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e)?;
         let rs = root_signature(&dev, false)?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
-        Ok(Gpu { dev, queue, rs, fence, value: 0, adapter: name, wave64, wave32, mesh })
+        let image_atomics64 = super::pso::image_atomics64_for_device(&dev);
+        Ok(Gpu { dev, queue, rs, fence, value: 0, adapter: name, wave64, wave32, mesh, image_atomics64 })
     }
 }
 
@@ -359,6 +362,13 @@ pub fn wave64_supported() -> Result<bool, String> {
     gpu.as_ref().map(|x| x.wave64).map_err(|x| x.clone())
 }
 
+/// Whether the adapter runs 64-bit image atomics (`Options::image_atomics64`).
+pub fn image_atomics64_supported() -> Result<bool, String> {
+    let mut g = GPU.lock().unwrap();
+    let gpu = g.get_or_insert_with(init);
+    gpu.as_ref().map(|x| x.image_atomics64).map_err(|x| x.clone())
+}
+
 /// Whether wave64 programs need the split form here (`Options::split_wave64`): the
 /// adapter runs only 32-lane waves. False without a usable GPU.
 pub fn split_wave64() -> bool {
@@ -392,9 +402,10 @@ pub fn split_for(mode: &super::Mode) -> bool {
     }
 }
 
-/// `Options` for programs run on this adapter: the split wave64 form where it is needed.
+/// `Options` for programs run on this adapter: the split wave64 form where it is needed, and
+/// 64-bit image atomics unless the adapter lacks them.
 pub fn options(mode: super::Mode) -> super::Options {
-    super::Options { split_wave64: split_for(&mode), mode, ..Default::default() }
+    super::Options { split_wave64: split_for(&mode), image_atomics64: image_atomics64_supported() != Ok(false), mode, ..Default::default() }
 }
 
 /// A split wave64 kernel stores the upper half's SGPRs too: both halves must end with the
@@ -421,7 +432,7 @@ pub fn mesh_shaders_supported() -> Result<bool, String> {
 }
 
 /// A GPU test (or a part of one) that cannot run here, `reason` one of "no GPU", "no DXC",
-/// "no wave64", "no mesh shaders": `SKIPPED <test>: <reason>` written to stderr itself, so the
+/// "no wave64", "no mesh shaders", "no 64-bit image atomics": `SKIPPED <test>: <reason>` written to stderr itself, so the
 /// line shows without `--nocapture` (libtest captures only `print!` / `eprint!`), and
 /// `scripts/test.ps1` counts them. `XCL_REQUIRE_GPU=wave64` or `=mesh` (or both, comma-separated)
 /// turns a skip that leaves that coverage out into a failure.
@@ -431,8 +442,8 @@ pub fn skip_test(reason: &str) {
     let test = thread.name().unwrap_or("?");
     let required = std::env::var("XCL_REQUIRE_GPU").unwrap_or_default();
     let fails = required.split(',').map(str::trim).any(|r| match r {
-        "wave64" => reason != "no mesh shaders",
-        "mesh" => reason != "no wave64",
+        "wave64" => reason != "no mesh shaders" && reason != "no 64-bit image atomics",
+        "mesh" => reason != "no wave64" && reason != "no 64-bit image atomics",
         _ => false,
     });
     if fails {

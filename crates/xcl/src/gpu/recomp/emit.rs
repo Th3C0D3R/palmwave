@@ -2363,6 +2363,24 @@ impl Em {
                     uav("float")
                 ));
             }
+            _ if base.starts_with("atomic_") && !d16 && image_atomic_x2(&base[7..], dmask) => {
+                // a 64-bit texel (an R32G32_UINT view: red is the low dword) – the value in two
+                // VGPRs, a compare-swap's compare value in the two after them; GLC returns the
+                // old texel in the first two
+                let op = &base[7..];
+                let (vt, body) = image_rmw64(op, self.opt.image_atomics64, &format!("{t}_U[{icoord}]"), &t).ok_or("image_atomic 64-bit")?;
+                let (lo, hi) = (self.vreg(vdata), self.vreg(vdata + 1));
+                self.line(&format!("uint64_t {t}_v = (uint64_t){lo} | ((uint64_t){hi} << 32); uint64_t {t}_old = 0;"));
+                if matches!(op, "cmpswap" | "fcmpswap") {
+                    let (clo, chi) = (self.vreg(vdata + 2), self.vreg(vdata + 3));
+                    self.line(&format!("uint64_t {t}_cmp = (uint64_t){clo} | ((uint64_t){chi} << 32);"));
+                }
+                self.line(&format!("RWTexture{rty}<{vt}> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];"));
+                self.line(&format!("if ({act}) {{ {body} }}"));
+                if f("GLC") == 1 {
+                    self.line(&format!("if ({act}) {{ {lo} = (uint){t}_old; {hi} = (uint)({t}_old >> 32); }}"));
+                }
+            }
             _ if base.starts_with("atomic_") && matches!(&base[7..], "cmpswap" | "sub" | "inc" | "dec" | "fcmpswap" | "fmin" | "fmax") => {
                 // the operations without an int view: on the uint texel (CAS loops where needed)
                 let (v, cmp) = (self.vreg(vdata), self.vreg(vdata + 1));
@@ -4873,6 +4891,70 @@ fn rmw32(op: &str, at: &At, v: &str, v2: &str, old: &str, t: &str) -> Option<Str
         "mskor_b32" => cas(format!("({c} & ~{v}) | {v2}")),
         _ => return None,
     })
+}
+
+/// Whether an image atomic (`op` without `image_atomic_`) works on 64-bit texels: its data is
+/// two dwords (DMASK 0x3), or two each for the value and the compare value of a compare-swap
+/// (0xF) – the 32-bit forms have 0x1 and 0x3. Float min / max stay on the 32-bit path (no
+/// 64-bit form here).
+fn image_atomic_x2(op: &str, dmask: u64) -> bool {
+    match op {
+        "fmin" | "fmax" => false,
+        "cmpswap" | "fcmpswap" => dmask == 0xF,
+        _ => dmask == 0x3,
+    }
+}
+
+/// A 64-bit image atomic on the texel `r` (`{t}_U[coordinates]`): the texture's element type
+/// and HLSL statements that leave the old texel in `{t}_old`; the value is `{t}_v`, a
+/// compare-swap's compare value `{t}_cmp` (uint64_t variables). `atomic`: SM 6.6 64-bit
+/// atomics on a `uint64_t` view of the R32G32_UINT texel (`Options::image_atomics64`), the
+/// operations without an intrinsic as a bounded compare-exchange loop – signed min / max too:
+/// their intrinsics would need an `int64_t` declaration of a UINT view. Its first guess is 0,
+/// so no typed load of the texel is needed. Otherwise a load and a store of the two dwords,
+/// which is not atomic.
+fn image_rmw64(op: &str, atomic: bool, r: &str, t: &str) -> Option<(&'static str, String)> {
+    let (v, cmp, old, c) = (format!("{t}_v"), format!("{t}_cmp"), format!("{t}_old"), format!("{t}_c"));
+    // the new texel from the current one
+    let new = match op {
+        "add" => format!("{c} + {v}"),
+        "sub" => format!("{c} - {v}"),
+        "and" => format!("{c} & {v}"),
+        "or" => format!("{c} | {v}"),
+        "xor" => format!("{c} ^ {v}"),
+        "swap" => v.clone(),
+        "umin" => format!("({c} < {v}) ? {c} : {v}"),
+        "umax" => format!("({c} > {v}) ? {c} : {v}"),
+        "smin" => format!("((int64_t){c} < (int64_t){v}) ? {c} : {v}"),
+        "smax" => format!("((int64_t){c} > (int64_t){v}) ? {c} : {v}"),
+        // float compare-swap compares the bits, as in `rmw64`
+        "cmpswap" | "fcmpswap" => format!("({c} == {cmp}) ? {v} : {c}"),
+        "inc" => format!("({c} >= {v}) ? (uint64_t)0 : {c} + (uint64_t)1"),
+        "dec" => format!("({c} == (uint64_t)0 || {c} > {v}) ? {v} : {c} - (uint64_t)1"),
+        _ => return None,
+    };
+    if !atomic {
+        return Some((
+            "uint2",
+            format!("uint2 {t}_l = {r}; uint64_t {c} = (uint64_t){t}_l.x | ((uint64_t){t}_l.y << 32); uint64_t {t}_n = {new}; {r} = uint2((uint){t}_n, (uint)({t}_n >> 32)); {old} = {c};"),
+        ));
+    }
+    let direct = |f: &str, val: &str| format!("{f}({r}, {val}, {old});");
+    let body = match op {
+        "add" => direct("InterlockedAdd", &v),
+        "sub" => direct("InterlockedAdd", &format!("((uint64_t)0 - {v})")),
+        "and" => direct("InterlockedAnd", &v),
+        "or" => direct("InterlockedOr", &v),
+        "xor" => direct("InterlockedXor", &v),
+        "swap" => direct("InterlockedExchange", &v),
+        "umin" => direct("InterlockedMin", &v),
+        "umax" => direct("InterlockedMax", &v),
+        "cmpswap" | "fcmpswap" => format!("InterlockedCompareExchange({r}, {cmp}, {v}, {old});"),
+        _ => format!(
+            "uint64_t {c} = 0; [allow_uav_condition] for (uint {t}_i = 0u; {t}_i < 4096u; {t}_i++) {{ uint64_t {t}_n = {new}; uint64_t {t}_p = 0; InterlockedCompareExchange({r}, {c}, {t}_n, {t}_p); if ({t}_p == {c}) break; {c} = {t}_p; }} {old} = {c};"
+        ),
+    };
+    Some(("uint64_t", body))
 }
 
 /// A 64-bit atomic at byte address `a` of the flat memory (SM 6.6 InterlockedXxx64);

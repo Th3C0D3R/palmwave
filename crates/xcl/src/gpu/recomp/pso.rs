@@ -74,14 +74,58 @@ pub fn fspx(blob: &[u8]) -> Option<Fspx<'_>> {
 }
 
 /// Memory windows of the title's unified memory (1 without it), with `HEAP_WINDOWS` when
-/// shaders take them from the descriptor heap (`heap_windows`).
+/// shaders take them from the descriptor heap (`heap_windows`) and `NO_IMAGE_ATOMICS64` when
+/// the title's device has no 64-bit image atomics (`image_atomics64`).
 pub fn mem_windows() -> u32 {
     let n = crate::gpu::uma::get().map_or(1, |u| u.shader_windows() as u32);
-    if n > 1 && heap_windows() && !SWITCH_FORM.with(|s| s.get()) {
+    let n = if n > 1 && heap_windows() && !SWITCH_FORM.with(|s| s.get()) {
         n | super::HEAP_WINDOWS
     } else {
         n
+    };
+    if image_atomics64() {
+        n
+    } else {
+        n | super::NO_IMAGE_ATOMICS64
     }
+}
+
+/// `note_image_atomics64`'s answer: 0 = no device asked, 1 = supported, 2 = missing
+static IMAGE_ATOMICS64: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Whether `dev` runs SM 6.6 64-bit atomics on typed resources taken from the descriptor heap
+/// (`Options::image_atomics64`): `D3D12_FEATURE_DATA_D3D12_OPTIONS9::AtomicInt64OnTypedResourceSupported`
+/// and, as translated shaders index `ResourceDescriptorHeap`,
+/// `D3D12_FEATURE_DATA_D3D12_OPTIONS11::AtomicInt64OnDescriptorHeapResourceSupported`. A
+/// pipeline whose shader needs a feature the device lacks is refused.
+pub fn image_atomics64_for_device(dev: &ID3D12Device) -> bool {
+    let mut o9 = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
+    let mut o11 = D3D12_FEATURE_DATA_D3D12_OPTIONS11::default();
+    unsafe {
+        dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS9, &mut o9 as *mut _ as _, std::mem::size_of_val(&o9) as u32).is_ok()
+            && o9.AtomicInt64OnTypedResourceSupported.as_bool()
+            && dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS11, &mut o11 as *mut _ as _, std::mem::size_of_val(&o11) as u32).is_ok()
+            && o11.AtomicInt64OnDescriptorHeapResourceSupported.as_bool()
+    }
+}
+
+/// The title's device: whether its shaders get 64-bit image atomics (`image_atomics64`).
+pub fn note_image_atomics64(dev: &ID3D12Device) {
+    let supported = image_atomics64_for_device(dev);
+    IMAGE_ATOMICS64.store(if supported { 1 } else { 2 }, std::sync::atomic::Ordering::Release);
+    if supported {
+        crate::xlog_info!("D3D12.X: 64-bit image atomics (OPTIONS9 / OPTIONS11): supported");
+    } else {
+        crate::xlog_warn!(
+            "D3D12.X: no 64-bit atomics on typed resources from the descriptor heap (OPTIONS9 AtomicInt64OnTypedResourceSupported / OPTIONS11 AtomicInt64OnDescriptorHeapResourceSupported): 64-bit image atomics are translated as a load and a store, which is not atomic"
+        );
+    }
+}
+
+/// Whether translated shaders use 64-bit image atomics: unless the title's device lacks them
+/// (`note_image_atomics64`; no device asked – tools, tests: they do).
+pub fn image_atomics64() -> bool {
+    IMAGE_ATOMICS64.load(std::sync::atomic::Ordering::Acquire) != 2
 }
 
 thread_local! {

@@ -71,6 +71,11 @@ pub const MEM_HEAP_BASE: u32 = 0;
 /// Flag in a memory-windows count (`pso::mem_windows`, the translation caches' keys):
 /// `Options::heap_windows`. `translate` takes it out of `mem_windows`.
 pub const HEAP_WINDOWS: u32 = 0x100;
+
+/// Flag in a memory-windows count, like `HEAP_WINDOWS`: `Options::image_atomics64` off (the
+/// device lacks them, `pso::image_atomics64`). Never set where it has them, so the keys of
+/// the translation caches are the same as before there.
+pub const NO_IMAGE_ATOMICS64: u32 = 0x200;
 pub mod upper_lanes;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -511,11 +516,17 @@ pub struct Options {
     /// the loop iterations a lane may run (`LOOP_GUARD`); 0: `XCL_LOOP_BUDGET`'s, else 65 536
     /// (the HLSL as it always was)
     pub loop_budget: u32,
+    /// 64-bit image atomics (`image_atomic_*` with two data dwords, on R32G32_UINT images) as
+    /// SM 6.6 64-bit atomics on a `uint64_t` view of the texel. False for a device without
+    /// `AtomicInt64OnTypedResourceSupported` / `AtomicInt64OnDescriptorHeapResourceSupported`
+    /// (its pipelines would be refused): a load and a store of the two dwords, not atomic.
+    /// Only programs with such an instruction differ.
+    pub image_atomics64: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true, loop_budget: 0 }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true, loop_budget: 0, image_atomics64: true }
     }
 }
 
@@ -1313,8 +1324,13 @@ fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64
 
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     let normalized;
-    let opt = if opt.mem_windows & HEAP_WINDOWS != 0 {
-        normalized = Options { mem_windows: opt.mem_windows & !HEAP_WINDOWS, heap_windows: true, ..opt.clone() };
+    let opt = if opt.mem_windows & (HEAP_WINDOWS | NO_IMAGE_ATOMICS64) != 0 {
+        normalized = Options {
+            mem_windows: opt.mem_windows & !(HEAP_WINDOWS | NO_IMAGE_ATOMICS64),
+            heap_windows: opt.heap_windows || opt.mem_windows & HEAP_WINDOWS != 0,
+            image_atomics64: opt.image_atomics64 && opt.mem_windows & NO_IMAGE_ATOMICS64 == 0,
+            ..opt.clone()
+        };
         &normalized
     } else {
         opt

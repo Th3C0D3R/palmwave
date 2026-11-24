@@ -718,6 +718,8 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         // the runtime's key: heap windows unless `XCL_HEAP_WINDOWS=0` (`pso::mem_windows`)
         let windows = opt("--windows").unwrap_or(4) as u32;
         let windows = if windows > 1 && recomp::pso::heap_windows() { windows | recomp::HEAP_WINDOWS } else { windows };
+        // and the load / store form of 64-bit image atomics on a GPU without them (`pso::image_atomics64`)
+        let windows = if recomp::runner::image_atomics64_supported() == Ok(false) { windows | recomp::NO_IMAGE_ATOMICS64 } else { windows };
         return precompile(&input, opt("--limit").unwrap_or(usize::MAX), windows, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, t0);
     }
     let agg = analyze(&input, recomp_on, compile, iface_on);
@@ -907,7 +909,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         "precompiling {n} shaders into {} ({} compile threads; {} memory windows{}{})",
         recomp::dxc::cache_dir().display(),
         recomp::dxc::compile_threads(),
-        windows & !recomp::HEAP_WINDOWS,
+        windows & !(recomp::HEAP_WINDOWS | recomp::NO_IMAGE_ATOMICS64),
         if windows & recomp::HEAP_WINDOWS != 0 { " from the descriptor heap" } else { "" },
         if split { ", split wave64 for a GPU with 32-lane waves" } else { "" }
     );

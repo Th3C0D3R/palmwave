@@ -2379,6 +2379,217 @@ fn gpu_images_sample_load_store_atomic() {
     assert_eq!(u32::from_le_bytes(r.textures[2][..4].try_into().unwrap()), 64, "image_atomic_inc (64 lanes, limit 100)");
 }
 
+/// The 64-bit image atomics: every operation that has a 64-bit form here.
+const IMAGE_ATOMICS64: [&str; 14] = ["add", "sub", "umin", "umax", "smin", "smax", "and", "or", "xor", "swap", "cmpswap", "fcmpswap", "inc", "dec"];
+
+/// One 64-bit image atomic: T# in s[4 · srsrc ..], coordinates in v[vaddr], v[vaddr + 1], the
+/// value in v[vdata], v[vdata + 1] (a compare-swap's compare value in the two after), GLC.
+fn image_atomic64(op: &str, vdata: u64, vaddr: u64, srsrc: u64) -> Vec<u8> {
+    let dmask = if op.ends_with("cmpswap") { 0xF } else { 0x3 };
+    let name = format!("IMAGE_ATOMIC_{}", op.to_uppercase());
+    encode(&name, "ENC_MIMG", &[("VDATA", vdata), ("VADDR", vaddr), ("SRSRC", srsrc), ("DMASK", dmask), ("DIM", 1), ("UNORM", 1), ("GLC", 1)], None).unwrap()
+}
+
+/// What a 64-bit image atomic leaves in a texel holding `c` (value `v`, compare value `cmp`).
+fn image_atomic64_ref(op: &str, c: u64, v: u64, cmp: u64) -> u64 {
+    match op {
+        "add" => c.wrapping_add(v),
+        "sub" => c.wrapping_sub(v),
+        "umin" => c.min(v),
+        "umax" => c.max(v),
+        "smin" => (c as i64).min(v as i64) as u64,
+        "smax" => (c as i64).max(v as i64) as u64,
+        "and" => c & v,
+        "or" => c | v,
+        "xor" => c ^ v,
+        "swap" => v,
+        "cmpswap" | "fcmpswap" => if c == cmp { v } else { c },
+        "inc" => if c >= v { 0 } else { c + 1 },
+        "dec" => if c == 0 || c > v { v } else { c - 1 },
+        _ => panic!("{op}"),
+    }
+}
+
+/// image_atomic_* with two data dwords (DMASK 0x3; a compare-swap: 0xF) works on a 64-bit
+/// texel: a `uint64_t` view and one SM 6.6 atomic, the old texel returned in two VGPRs. It
+/// was translated as the 32-bit operation on the first dword. The 32-bit forms (DMASK 0x1,
+/// compare-swap 0x3) are as before, whatever the device has.
+#[test]
+fn image_atomics_with_two_data_dwords_are_64_bit() {
+    let end = || encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap();
+    let one = |name: &str, dmask: u64| {
+        let mut c = encode(name, "ENC_MIMG", &[("VDATA", 10), ("VADDR", 3), ("SRSRC", 4), ("DMASK", dmask), ("DIM", 1), ("UNORM", 1), ("GLC", 1)], None).unwrap();
+        c.extend(end());
+        c
+    };
+    let hlsl = |code: &[u8], o: &Options| {
+        let t = translate(code, o).unwrap();
+        assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+        t.hlsl
+    };
+    let fallback = Options { image_atomics64: false, ..Default::default() };
+    let flagged = Options { mem_windows: 1 | super::NO_IMAGE_ATOMICS64, ..Default::default() };
+
+    let h = hlsl(&one("IMAGE_ATOMIC_UMAX", 0x3), &Options::default());
+    assert!(h.contains("RWTexture2D<uint64_t> ") && !h.contains("RWTexture2D<uint> "), "{h}");
+    assert!(h.contains("_v = (uint64_t)v10 | ((uint64_t)v11 << 32);"), "{h}");
+    assert!(h.contains("InterlockedMax(") && h.contains("_v, ") && h.contains("_old);"), "{h}");
+    assert!(h.contains("v10 = (uint)t") && h.contains("v11 = (uint)(t") && h.contains("_old >> 32"), "{h}");
+
+    let h = hlsl(&one("IMAGE_ATOMIC_CMPSWAP", 0xF), &Options::default());
+    assert!(h.contains("RWTexture2D<uint64_t> ") && h.contains("_cmp = (uint64_t)v12 | ((uint64_t)v13 << 32);"), "{h}");
+    assert!(h.contains("InterlockedCompareExchange(") && h.contains("_cmp, ") && h.contains("_v, "), "{h}");
+
+    // a device without the atomics: the two dwords loaded and stored
+    let h = hlsl(&one("IMAGE_ATOMIC_UMAX", 0x3), &fallback);
+    assert!(h.contains("RWTexture2D<uint2> ") && !h.contains("RWTexture2D<uint64_t> ") && !h.contains("RWTexture2D<uint> "), "{h}");
+    assert_eq!(h, hlsl(&one("IMAGE_ATOMIC_UMAX", 0x3), &flagged), "the flag in the windows count is the option");
+
+    // the 32-bit forms, and float min / max (no 64-bit form): the same text for either device
+    for (name, dmask) in [("IMAGE_ATOMIC_UMAX", 0x1), ("IMAGE_ATOMIC_CMPSWAP", 0x3), ("IMAGE_ATOMIC_INC", 0x1), ("IMAGE_ATOMIC_FMAX", 0x3), ("IMAGE_ATOMIC_UMAX", 0xF)] {
+        let h = hlsl(&one(name, dmask), &Options::default());
+        assert!(h.contains("RWTexture2D<uint> ") && !h.contains("RWTexture2D<uint64_t> ") && !h.contains("RWTexture2D<uint2> "), "{name} {dmask:#x}\n{h}");
+        assert_eq!(h, hlsl(&one(name, dmask), &fallback), "{name} {dmask:#x}");
+        assert_eq!(h, hlsl(&one(name, dmask), &flagged), "{name} {dmask:#x}");
+    }
+
+    // every operation, both forms, through DXC
+    let mut all = Vec::new();
+    for op in IMAGE_ATOMICS64 {
+        all.extend(image_atomic64(op, 10, 3, 4));
+    }
+    all.extend(end());
+    let (native, loaded) = (hlsl(&all, &Options::default()), hlsl(&all, &fallback));
+    assert_eq!(native.matches("RWTexture2D<uint64_t> ").count(), IMAGE_ATOMICS64.len(), "{native}");
+    assert_eq!(loaded.matches("RWTexture2D<uint2> ").count(), IMAGE_ATOMICS64.len(), "{loaded}");
+    if super::dxc::location().is_ok() {
+        for h in [&native, &loaded] {
+            super::dxc::compile(h, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{h}"));
+        }
+    }
+}
+
+/// 64-bit image atomics on the GPU, each operation against `image_atomic64_ref`. Every lane
+/// works on its own texel of an 8x8 R32G32_UINT image (the texel after it and the old texel
+/// in two VGPRs are exact), then all 64 lanes on one texel (lost updates would show). The
+/// values differ in their high dwords, so the 32-bit operation gives other results. The load /
+/// store form for a device without the atomics is checked on the per-lane texels only.
+#[test]
+fn gpu_image_atomics_64_bit() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestTexture, TexDim};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_UINT;
+    let native = runner::image_atomics64_supported() == Ok(true);
+    if !native {
+        println!("no 64-bit atomics on typed resources from the descriptor heap – only the load / store form runs");
+        runner::skip_test("no 64-bit image atomics");
+    }
+    // splitmix64
+    let mix = |x: u64| {
+        let mut z = x.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let texels = |t: &[u8]| -> Vec<u64> { t.chunks(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect() };
+    for op in IMAGE_ATOMICS64 {
+        let counter = matches!(op, "inc" | "dec");
+        // per lane: (texel, value, compare value)
+        let own: Vec<(u64, u64, u64)> = (0..64u64)
+            .map(|l| {
+                if counter {
+                    // the limit is passed from lane 31 on; both differ from their low dwords
+                    ((1 << 32) + l, (1 << 32) + 31, 0)
+                } else {
+                    let c = mix(l);
+                    // odd lanes: a compare value that differs in the high dword only
+                    (c, mix(100 + l), if l % 2 == 0 { c } else { c ^ (1 << 32) })
+                }
+            })
+            .collect();
+        // all lanes on one texel: (its content, each lane's value)
+        let (start, shared): (u64, Vec<u64>) = match op {
+            "and" => (u64::MAX, (0..64).map(|l| if l % 2 == 0 { !(1u64 << l) } else { u64::MAX }).collect()),
+            "or" => (0, (0..64).map(|l| 1u64 << l).collect()),
+            "xor" => (0x0123_4567_89AB_CDEF, (0..64).map(|l| 1u64 << l).collect()),
+            "inc" | "dec" => (0, vec![10; 64]),
+            _ => (mix(1000), (0..64).map(|l| mix(200 + l)).collect()),
+        };
+        for atomic in [true, false] {
+            if atomic && !native {
+                continue;
+            }
+            let mut code = image_atomic64(op, 10, 3, 4);
+            if atomic {
+                code.extend(image_atomic64(op, 20, 5, 8));
+            }
+            code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+            let mut st = KernelState::default();
+            st.sgpr[16..24].copy_from_slice(&tsharp(0, 62, 9));
+            st.sgpr[32..40].copy_from_slice(&tsharp(2, 62, 9));
+            for (l, r) in st.vgpr.iter_mut().enumerate() {
+                let (_, v, cmp) = own[l];
+                r[3] = l as u32 % 8;
+                r[4] = l as u32 / 8;
+                r[10..14].copy_from_slice(&[v as u32, (v >> 32) as u32, cmp as u32, (cmp >> 32) as u32]);
+                r[20..24].copy_from_slice(&[shared[l] as u32, (shared[l] >> 32) as u32, start as u32, (start >> 32) as u32]);
+            }
+            let tex = [
+                TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32_UINT, width: 8, height: 8, depth: 1, texel_bytes: 8, data: own.iter().flat_map(|e| e.0.to_le_bytes()).collect(), uav: true },
+                TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32_UINT, width: 1, height: 1, depth: 1, texel_bytes: 8, data: start.to_le_bytes().to_vec(), uav: true },
+            ];
+            let t = translate(&code, &Options { image_atomics64: atomic, ..runner::options(Mode::Kernel) }).unwrap();
+            assert!(t.complete(), "{op}: {:?}", t.unsupported_why);
+            let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{op}: {e}\n{}", t.hlsl));
+            let r = runner::run_with(&dxil, &st, &[], &tex, &[]).unwrap_or_else(|e| panic!("{op} (atomic: {atomic}): {e}"));
+            let form = if atomic { "atomic" } else { "load / store" };
+            let after = texels(&r.textures[0]);
+            for (l, &(c, v, cmp)) in own.iter().enumerate() {
+                assert_eq!(after[l], image_atomic64_ref(op, c, v, cmp), "image_atomic_{op} ({form}) lane {l}: texel {c:#x}, value {v:#x}, compare {cmp:#x}");
+                let old = r.vgpr[l][10] as u64 | (r.vgpr[l][11] as u64) << 32;
+                assert_eq!(old, c, "image_atomic_{op} ({form}) lane {l}: the old texel in v10, v11");
+                // (the kernel returns only the registers its program names)
+                if op.ends_with("cmpswap") {
+                    assert_eq!(r.vgpr[l][12] as u64 | (r.vgpr[l][13] as u64) << 32, cmp, "image_atomic_{op} ({form}) lane {l}: the compare value in v12, v13 is kept");
+                }
+            }
+            if !atomic {
+                continue;
+            }
+            let end = texels(&r.textures[1])[0];
+            let olds: Vec<u64> = (0..64).map(|l| r.vgpr[l][20] as u64 | (r.vgpr[l][21] as u64) << 32).collect();
+            match op {
+                "swap" => {
+                    // every value was in the texel once: the old ones and the last are the values and the start
+                    let mut seen: Vec<u64> = olds.iter().copied().chain([end]).collect();
+                    let mut put: Vec<u64> = shared.iter().copied().chain([start]).collect();
+                    seen.sort_unstable();
+                    put.sort_unstable();
+                    assert_eq!(seen, put, "image_atomic_swap, 64 lanes on one texel");
+                }
+                "cmpswap" | "fcmpswap" => {
+                    // every lane compares with the start: one of them swaps, the others see its value
+                    let won: Vec<usize> = (0..64).filter(|&l| olds[l] == start).collect();
+                    assert_eq!(won.len(), 1, "image_atomic_{op}, 64 lanes on one texel: one lane swaps ({olds:x?})");
+                    assert_eq!(end, shared[won[0]], "image_atomic_{op}: the winner's value stays");
+                    assert!((0..64).all(|l| l == won[0] || olds[l] == end), "image_atomic_{op}: the other lanes see the winner's value ({olds:x?})");
+                }
+                _ => {
+                    // commutative, or the same value in every lane: any order gives this
+                    let want = shared.iter().fold(start, |c, &v| image_atomic64_ref(op, c, v, 0));
+                    assert_eq!(end, want, "image_atomic_{op}, 64 lanes on one texel");
+                    if op == "add" {
+                        let distinct: std::collections::BTreeSet<u64> = olds.iter().copied().collect();
+                        assert_eq!(distinct.len(), 64, "image_atomic_add with GLC returns 64 distinct old texels");
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Static samplers: the program builds two S# from constants (point / linear, clamp) – as
 /// the console compiler places a root signature's static samplers – and samples the same
 /// texel boundary with each; they become static samplers of the root signature.
