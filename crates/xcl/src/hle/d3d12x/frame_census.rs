@@ -25,11 +25,18 @@
 //! states, clear values, viewports and scissors seen, and writes one row an operation to
 //! `census_<frame>.csv` in the logs folder.
 //!
+//! `XCL_FRAME_CENSUS_MIN_OPS=m`: the frame where a title's world starts is not the same from
+//! run to run. With it, every frame from n on is recorded, one with fewer than m operations
+//! is dropped at its present (nothing logged, nothing written, its records freed and its
+//! READBACK buffers given to the next recordings), and the census ends with the first frame
+//! that has m (`XCL_FRAME_CENSUS`) or the first three (`XCL_FRAME_CENSUS_FROM`).
+//!
 //! Unset, `recording` returns at its first test and nothing else here has anything to do.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -54,39 +61,54 @@ const CSV_COMMANDS: usize = 64;
 const PC_GET_TYPE: usize = 8;
 const PC_COPY_BUFFER_REGION: usize = 15;
 
-/// The frames recorded: `count` from `first`.
+/// The frames recorded: `count` from `first` – with `min_ops`, the first `count` from `first`
+/// that have that many operations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Settings {
     first: u64,
     count: u64,
+    min_ops: u64,
 }
 
 impl Settings {
-    fn wants(&self, frame: u64) -> bool {
-        frame >= self.first && frame - self.first < self.count
+    /// Whether frame `frame` is recorded, `kept` frames having been reported so far.
+    fn wants(&self, frame: u64, kept: u64) -> bool {
+        frame >= self.first && if self.min_ops == 0 { frame - self.first < self.count } else { kept < self.count }
     }
 
     /// Whether operations are kept while `presents` frames have been shown: during a frame
     /// that is wanted, and the one before (a list recorded then may be submitted in it).
-    fn records(&self, presents: u64) -> bool {
-        presents + 1 >= self.first && presents < self.first.saturating_add(self.count)
+    fn records(&self, presents: u64, kept: u64) -> bool {
+        presents + 1 >= self.first && if self.min_ops == 0 { presents < self.first.saturating_add(self.count) } else { kept < self.count }
+    }
+
+    /// Whether a frame that recorded `ops` operations is reported (not: dropped).
+    fn keeps(&self, ops: u64) -> bool {
+        ops >= self.min_ops
     }
 }
 
 /// None: the census is off. `one`: `XCL_FRAME_CENSUS` (0 or not a number: off), `from`:
-/// `XCL_FRAME_CENSUS_FROM`, which comes first.
-fn schedule(one: Option<&str>, from: Option<&str>) -> Option<Settings> {
+/// `XCL_FRAME_CENSUS_FROM`, which comes first; `min_ops`: `XCL_FRAME_CENSUS_MIN_OPS`.
+fn schedule(one: Option<&str>, from: Option<&str>, min_ops: Option<&str>) -> Option<Settings> {
     let number = |v: Option<&str>| v.and_then(|v| v.trim().parse::<u64>().ok());
+    let min_ops = number(min_ops).unwrap_or(0);
     if let Some(first) = number(from) {
-        return Some(Settings { first, count: MAX_FRAMES });
+        return Some(Settings { first, count: MAX_FRAMES, min_ops });
     }
-    number(one).filter(|&n| n > 0).map(|first| Settings { first, count: 1 })
+    number(one).filter(|&n| n > 0).map(|first| Settings { first, count: 1, min_ops })
 }
 
 fn settings() -> Option<Settings> {
     static S: OnceLock<Option<Settings>> = OnceLock::new();
-    *S.get_or_init(|| schedule(std::env::var("XCL_FRAME_CENSUS").ok().as_deref(), std::env::var("XCL_FRAME_CENSUS_FROM").ok().as_deref()))
+    *S.get_or_init(|| {
+        let var = |name: &str| std::env::var(name).ok();
+        schedule(var("XCL_FRAME_CENSUS").as_deref(), var("XCL_FRAME_CENSUS_FROM").as_deref(), var("XCL_FRAME_CENSUS_MIN_OPS").as_deref())
+    })
 }
+
+/// frames reported so far (those `Settings::keeps`)
+static KEPT: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn enabled() -> bool {
     settings().is_some()
@@ -94,7 +116,7 @@ pub(super) fn enabled() -> bool {
 
 /// Whether operations recorded now are kept.
 pub(super) fn recording() -> bool {
-    settings().is_some_and(|s| s.records(super::present::presents()))
+    settings().is_some_and(|s| s.records(super::present::presents(), KEPT.load(Ordering::Relaxed)))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -871,7 +893,7 @@ pub(super) unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
         b.take(&lists)
     };
     let frame = super::present::presents();
-    if recordings.is_empty() || !settings.wants(frame) {
+    if recordings.is_empty() || !settings.wants(frame, KEPT.load(Ordering::Relaxed)) {
         return;
     }
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
@@ -902,10 +924,17 @@ unsafe fn signal(queue: *mut c_void, q: &ID3D12CommandQueue) -> Option<Done> {
 /// Frame `n` was presented: what was submitted for it is read, logged and written once the
 /// GPU has run it.
 pub(super) fn presented(n: u64) {
-    if !settings().is_some_and(|s| s.wants(n)) {
+    let Some(s) = settings().filter(|s| n >= s.first) else { return };
+    // (also of a frame not wanted any more: lists were submitted for it before the last
+    // frame kept was presented)
+    let subs = FRAMES.lock().unwrap().as_mut().and_then(|m| m.remove(&n)).unwrap_or_default();
+    let ops: usize = subs.iter().map(|s| s.recording.ops.len()).sum();
+    // a frame with too few operations goes here: its records are freed, its buffers are the
+    // next recordings' (`SPARE`)
+    if !s.wants(n, KEPT.load(Ordering::Relaxed)) || !s.keeps(ops as u64) {
         return;
     }
-    let subs = FRAMES.lock().unwrap().as_mut().and_then(|m| m.remove(&n)).unwrap_or_default();
+    KEPT.fetch_add(1, Ordering::Relaxed);
     let spawned = std::thread::Builder::new().name("xcl-frame-census".into()).spawn(move || unsafe { finish(n, subs) });
     if let Err(e) = spawned {
         crate::xlog_error!("frame census: frame {n}: no thread to read it back: {e}");
@@ -1254,17 +1283,44 @@ mod tests {
 
     #[test]
     fn the_variables_choose_one_frame_or_three() {
-        assert_eq!(schedule(None, None), None);
-        assert_eq!(schedule(Some("0"), None), None);
-        assert_eq!(schedule(Some("yes"), None), None);
-        assert_eq!(schedule(Some(" 412 "), None), Some(Settings { first: 412, count: 1 }));
-        assert_eq!(schedule(None, Some("0")), Some(Settings { first: 0, count: 3 }));
-        assert_eq!(schedule(Some("7"), Some("400")), Some(Settings { first: 400, count: 3 }));
-        let s = Settings { first: 400, count: 3 };
-        assert_eq!([399, 400, 402, 403].map(|n| s.wants(n)), [false, true, true, false]);
+        assert_eq!(schedule(None, None, None), None);
+        assert_eq!(schedule(Some("0"), None, None), None);
+        assert_eq!(schedule(Some("yes"), None, None), None);
+        assert_eq!(schedule(None, None, Some("1000")), None);
+        assert_eq!(schedule(Some(" 412 "), None, None), Some(Settings { first: 412, count: 1, min_ops: 0 }));
+        assert_eq!(schedule(None, Some("0"), None), Some(Settings { first: 0, count: 3, min_ops: 0 }));
+        assert_eq!(schedule(Some("7"), Some("400"), Some("x")), Some(Settings { first: 400, count: 3, min_ops: 0 }));
+        assert_eq!(schedule(None, Some("1700"), Some(" 1000 ")), Some(Settings { first: 1700, count: 3, min_ops: 1000 }));
+        assert_eq!(schedule(Some("1700"), None, Some("1000")), Some(Settings { first: 1700, count: 1, min_ops: 1000 }));
+        let s = Settings { first: 400, count: 3, min_ops: 0 };
+        assert_eq!([399, 400, 402, 403].map(|n| s.wants(n, 0)), [false, true, true, false]);
         // operations are kept from the frame before (399 presents: frame 399 is being made)
-        assert_eq!([398, 399, 400, 402, 403].map(|n| s.records(n)), [false, true, true, true, false]);
-        assert!(Settings { first: 0, count: 1 }.records(0));
+        assert_eq!([398, 399, 400, 402, 403].map(|n| s.records(n, 0)), [false, true, true, true, false]);
+        assert!(Settings { first: 0, count: 1, min_ops: 0 }.records(0, 0));
+        // (every frame is reported, whatever it recorded)
+        assert!(s.keeps(0));
+    }
+
+    #[test]
+    fn with_a_minimum_frames_are_recorded_until_three_have_it() {
+        let s = Settings { first: 1700, count: 3, min_ops: 1000 };
+        assert_eq!([0, 16, 300, 999].map(|ops| s.keeps(ops)), [false; 4]);
+        assert!(s.keeps(1000) && s.keeps(14_000));
+        // any frame from the first, however late, while fewer than three were kept
+        assert_eq!([1699, 1700, 1852, 90_000].map(|n| s.wants(n, 0)), [false, true, true, true]);
+        assert_eq!([1698, 1699, 1700, 1852].map(|n| s.records(n, 2)), [false, true, true, true]);
+        assert!(!s.wants(1855, 3) && !s.records(1855, 3));
+        // a run as the retail title's: loading frames of 16 to 300 operations, then the world
+        let mut kept = Vec::new();
+        for (frame, ops) in [(1700u64, 16u64), (1701, 300), (1852, 14_000), (1853, 16), (1854, 13_900), (1855, 14_100), (1856, 14_000)] {
+            if s.wants(frame, kept.len() as u64) && s.keeps(ops) {
+                kept.push(frame);
+            }
+        }
+        assert_eq!(kept, vec![1852, 1854, 1855]);
+        // `XCL_FRAME_CENSUS=n`: the first frame from n that has the minimum
+        let one = Settings { first: 1700, count: 1, min_ops: 1000 };
+        assert!(one.wants(1852, 0) && !one.wants(1853, 1));
     }
 
     #[test]
