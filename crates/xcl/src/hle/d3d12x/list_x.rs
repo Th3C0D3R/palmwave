@@ -1369,6 +1369,50 @@ pub(super) unsafe fn break_cycles_before_title_signal(sig_q: usize, title_fence:
     }
 }
 
+/// What each queue still has in the exact sync graph, for the log of a wait that timed out: its
+/// armed GPU waits (`cell>=value@seq`) and the fence signals it was given that the GPU has not
+/// passed (`cell=value@seq`; `fence …` for a title's own fence), in the queue's order and cut
+/// at 12 each. A queue with signals pending and no wait of its own is held by something this
+/// graph does not know (its GPU work, or a wait of XCL's own).
+fn sync_graph_summary(graph: &SyncGraph) -> String {
+    const ITEMS: usize = 12;
+    // queue → (waits, signals) as (seq, text)
+    let mut queues: std::collections::BTreeMap<usize, [Vec<(u64, String)>; 2]> = Default::default();
+    for (&va, cell) in &graph.cells {
+        for aw in &cell.armed_waits {
+            queues.entry(queue_id(aw.waiting_queue)).or_default()[0].push((aw.wait_seq, format!("{va:#x}>={:#x}@{}", aw.val, aw.wait_seq)));
+        }
+        for s in &cell.submitted_signals {
+            queues.entry(queue_id(s.queue)).or_default()[1].push((s.seq, format!("{va:#x}={:#x}@{}", s.val, s.seq)));
+        }
+    }
+    for (&f, tf) in &graph.title_fences {
+        for &(val, q, seq) in &tf.waits {
+            queues.entry(queue_id(q)).or_default()[0].push((seq, format!("fence {f:#x}>={val:#x}@{seq}")));
+        }
+        for s in &tf.signals {
+            queues.entry(queue_id(s.queue)).or_default()[1].push((s.seq, format!("fence {f:#x}={:#x}@{}", s.val, s.seq)));
+        }
+    }
+    if queues.is_empty() {
+        return "empty".into();
+    }
+    let list = |items: &mut Vec<(u64, String)>| {
+        items.sort();
+        let more = items.len().saturating_sub(ITEMS);
+        let mut text = items.iter().take(ITEMS).map(|(_, t)| t.as_str()).collect::<Vec<_>>().join(", ");
+        if more > 0 {
+            text.push_str(&format!(", +{more} more"));
+        }
+        text
+    };
+    queues
+        .iter_mut()
+        .map(|(q, [waits, signals])| format!("q{q}: waits [{}]; signals [{}]", list(waits), list(signals)))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 /// A cell's fence was signalled from the CPU: the watchdog guards it against rewinds from now on
 /// (`CPU_RELEASED`), also when this release disarmed the last GPU wait.
 fn note_cpu_release() {
@@ -1387,11 +1431,24 @@ fn wake_sync_watchdog() {
                 continue;
             }
             let _ = cv.wait_timeout(guard, Duration::from_millis(50)).unwrap();
-            let (expired, rewinds) = {
+            let (expired, rewinds, graph_at_timeout) = {
                 let mut g = SYNC_GRAPH.lock().unwrap();
                 let mut out: Vec<(u64, u64, ID3D12Fence, usize, i32, Option<usize>, Option<i32>, u64, u64, u64)> = Vec::new();
                 let mut rew: Vec<(ID3D12Fence, u64)> = Vec::new();
+                let mut summary = None;
                 if let Some(graph) = g.as_mut() {
+                    // the graph as it stands when a wait is about to be released (before the
+                    // release takes it out)
+                    let limit = gpu_wait_watchdog();
+                    if graph.cells.values().any(|c| c.armed_waits.iter().any(|aw| aw.armed_at.elapsed() >= limit)) {
+                        for cell in graph.cells.values_mut() {
+                            unsafe { prune_completed_waits(cell) };
+                        }
+                        for (&f, tf) in graph.title_fences.iter_mut() {
+                            unsafe { prune_title_fence(f, tf) };
+                        }
+                        summary = Some(sync_graph_summary(graph));
+                    }
                     for (&va, cell) in graph.cells.iter_mut() {
                         if cell.armed_waits.is_empty() && cell.cpu_signaled_max == 0 {
                             continue;
@@ -1450,7 +1507,7 @@ fn wake_sync_watchdog() {
                         }
                     }
                 }
-                (out, rew)
+                (out, rew, summary)
             };
             for (fence, val) in rewinds {
                 unsafe {
@@ -1471,6 +1528,10 @@ fn wake_sync_watchdog() {
             }
             if had_expired {
                 crate::xlog_warn!("D3D12.X: pending title ID3D12Fences during GPU wait timeout: {}", super::fence_x::pending_summary());
+                static GRAPHS: AtomicU64 = AtomicU64::new(0);
+                if let Some(summary) = graph_at_timeout.filter(|_| once(&GRAPHS, 4)) {
+                    crate::xlog_warn!("D3D12.X: sync graph at GPU wait timeout (per queue: armed waits cell>=value@seq, fence signals the GPU has not passed cell=value@seq): {summary}");
+                }
             }
         });
         pair
@@ -5780,6 +5841,31 @@ mod tests {
             crate::gpu::fence::wait(&done1, 1, &dev, None, 2000).expect("q1 must complete after watchdog CPU signal");
             crate::gpu::fence::wait(&done2, 1, &dev, None, 2000).expect("q2 must complete after watchdog CPU signal");
         }
+    }
+
+    /// The timeout log's graph: each queue's armed waits and pending signals in its own order,
+    /// a title fence named as one, a long list cut – and a queue that only signals shown with
+    /// no wait (what tells a queue held outside the graph).
+    #[test]
+    fn sync_graph_summary_lists_each_queues_waits_and_pending_signals() {
+        let (qa, qb) = (0x51A0_0000_0010usize, 0x51A0_0000_0020usize);
+        let (a, b) = (queue_id(qa), queue_id(qb));
+        let wait = |val, q, wait_seq| ArmedGpuWait { val, waiting_queue: q, waiting_queue_ty: 2, wait_seq, armed_at: Instant::now(), after_write64: false };
+        let mut g = SyncGraph::default();
+        assert_eq!(sync_graph_summary(&g), "empty");
+        g.cells.insert(0x1000, SyncCell { armed_waits: vec![wait(0x73d, qa, 7)], submitted_signals: vec![SubmittedSignal { val: 0x73d, queue: qb, seq: 4 }], ..Default::default() });
+        g.cells.insert(0x1008, SyncCell { armed_waits: vec![wait(0x73d, qa, 3)], ..Default::default() });
+        g.title_fences.insert(0xF00, TitleFenceSync { waits: Vec::new(), signals: vec![SubmittedSignal { val: 0xea3, queue: qb, seq: 9 }] });
+        let s = sync_graph_summary(&g);
+        let qa_part = format!("q{a}: waits [0x1008>=0x73d@3, 0x1000>=0x73d@7]; signals []");
+        let qb_part = format!("q{b}: waits []; signals [0x1000=0x73d@4, fence 0xf00=0xea3@9]");
+        assert_eq!(s, if a < b { format!("{qa_part} | {qb_part}") } else { format!("{qb_part} | {qa_part}") });
+
+        let cell = g.cells.get_mut(&0x1008).unwrap();
+        cell.armed_waits = (0..15).map(|k| wait(0x73d, qa, 100 + k)).collect();
+        let s = sync_graph_summary(&g);
+        assert!(s.contains("0x1008>=0x73d@110, +4 more]"), "{s}");
+        assert!(!s.contains("@111"), "{s}");
     }
 
     /// A cycle break signals a cell's fence on the CPU and disarms the last GPU wait; a
