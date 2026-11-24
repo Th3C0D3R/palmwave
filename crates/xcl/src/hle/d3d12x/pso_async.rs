@@ -26,6 +26,10 @@ struct Pending {
     compute: bool,
     /// the stand-in was released before the real pipeline was built
     orphan: std::sync::atomic::AtomicBool,
+    /// creation order (`ahead`)
+    seq: u64,
+    /// built by an `ahead` thread and not asked for by the title since
+    ahead: std::sync::atomic::AtomicBool,
 }
 
 /// stand-in handed to the title → its real pipeline
@@ -122,8 +126,14 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool) {
         cv: Condvar::new(),
         compute,
         orphan: Default::default(),
+        seq: NEXT_SEQ.fetch_add(1, Ordering::Relaxed),
+        ahead: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
+    if compute && !send && ahead_threads() > 0 {
+        LAZY_COMPUTE.lock().unwrap().insert(p.seq, Arc::downgrade(&p));
+        start_ahead();
+    }
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
@@ -140,6 +150,7 @@ fn entry(pso: usize) -> Option<Arc<Pending>> {
 /// The pipeline to use for `pso` now: the real one once built, else `pso` itself.
 pub fn resolve(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
+    asked(&p);
     match p.real.load(Ordering::Acquire) {
         0 => {
             // a lazy one is wanted now: to the workers
@@ -160,7 +171,9 @@ pub fn resolve_wait(pso: usize) -> usize {
 }
 
 fn wait_unbounded(pso: usize, p: &Pending, budget: &FrameBudget) -> usize {
+    asked(p);
     let start = Instant::now();
+    let _waiting = TitleWait::new();
     let job = p.job.lock().unwrap().take();
     let here = job.is_some();
     if let Some(job) = job {
@@ -354,6 +367,7 @@ pub fn resolve_for_draw(pso: usize) -> usize {
 fn wait_built(p: &Pending, limit: Option<Duration>, budget: &FrameBudget) -> (bool, Duration) {
     const SLICE: Duration = Duration::from_millis(50);
     let start = Instant::now();
+    let _waiting = TitleWait::new();
     let mut charged = start;
     let mut done = p.done.lock().unwrap();
     while !*done {
@@ -380,6 +394,7 @@ fn wait_built(p: &Pending, limit: Option<Duration>, budget: &FrameBudget) -> (bo
 
 fn resolve_within(pso: usize, limit: Option<Duration>, budget: &FrameBudget, lost: bool) -> usize {
     let Some(p) = entry(pso) else { return pso };
+    asked(&p);
     // a compute pipeline has no limit of its own, only the frame's budget
     let limit = limit.filter(|_| !p.compute);
     let bounded = if p.compute { budget.limit.is_some() && budget.compute } else { limit.is_some() || budget.limit.is_some() };
@@ -435,10 +450,202 @@ pub fn is_pending(pso: usize) -> bool {
     entry(pso).is_some_and(|p| !*p.done.lock().unwrap())
 }
 
+// ---------------------------------------------------------------------------------------
+// Building ahead while the title waits
+//
+// When a retail title loads its world it binds hundreds of compute pipelines one after another
+// from one thread, each built at its first bind (DXC, then the driver: seconds, up to many
+// minutes for its biggest programs on an NVIDIA GPU), and presents nothing meanwhile. Its
+// pipelines of one family are made one after another, so while its thread waits for one,
+// `ahead_threads` threads build the compute pipelines made after it, at a lower priority. They
+// run only while no frame is held up but the title's: from a title thread's wait of 3 s for a
+// pipeline, or 5 s of such waits since the last present, to the next present.
+// ---------------------------------------------------------------------------------------
+
+/// creation order of pipelines (`Pending::seq`)
+static NEXT_SEQ: AtomicU64 = AtomicU64::new(0);
+/// lazy compute pipelines not sent to a worker yet, in the order they were made (dead and sent
+/// ones are dropped as `next_after` passes them)
+static LAZY_COMPUTE: Mutex<std::collections::BTreeMap<u64, std::sync::Weak<Pending>>> = Mutex::new(std::collections::BTreeMap::new());
+/// creation order of the compute pipeline the title asked for last
+static CURSOR: AtomicU64 = AtomicU64::new(0);
+/// compute pipelines built ahead, and those of them the title asked for later
+static AHEAD_BUILT: AtomicUsize = AtomicUsize::new(0);
+static AHEAD_USED: AtomicUsize = AtomicUsize::new(0);
+/// title threads in a pipeline wait, and when the first of them started (µs from `epoch`)
+static IN_WAIT: AtomicUsize = AtomicUsize::new(0);
+static WAIT_SINCE_US: AtomicU64 = AtomicU64::new(0);
+
+fn epoch() -> Instant {
+    static E: OnceLock<Instant> = OnceLock::new();
+    *E.get_or_init(Instant::now)
+}
+
+/// A title thread waits for a pipeline while this lives.
+struct TitleWait;
+
+impl TitleWait {
+    fn new() -> Self {
+        if IN_WAIT.fetch_add(1, Ordering::AcqRel) == 0 {
+            WAIT_SINCE_US.store(epoch().elapsed().as_micros() as u64, Ordering::Release);
+        }
+        TitleWait
+    }
+}
+
+impl Drop for TitleWait {
+    fn drop(&mut self) {
+        IN_WAIT.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// `XCL_PSO_AHEAD=n`: n threads build compute pipelines ahead while the title waits (default 0:
+/// none). Each of a retail title's biggest programs takes 1.5 – 4 GB in an NVIDIA driver while
+/// it compiles, and the big ones of the background share one slot (`BIG_COMPILES`): in a first
+/// run of a retail title's world loading (RTX 5080) the one thread that got it spent 700 s on a
+/// single program, so nothing built ahead was used yet.
+fn ahead_threads() -> usize {
+    if cfg!(test) {
+        return 0;
+    }
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("XCL_PSO_AHEAD").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0).min(16))
+}
+
+/// The title asks for `p` (bind, draw, dispatch): building ahead goes on from it.
+fn asked(p: &Pending) {
+    if !p.compute {
+        return;
+    }
+    CURSOR.store(p.seq, Ordering::Relaxed);
+    if p.ahead.swap(false, Ordering::AcqRel) {
+        AHEAD_USED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Only the title's own waits hold up its frames now.
+fn stalled() -> bool {
+    if frame_budget().waited() >= Duration::from_secs(5) {
+        return true;
+    }
+    IN_WAIT.load(Ordering::Acquire) > 0
+        && epoch().elapsed().as_micros() as u64 >= WAIT_SINCE_US.load(Ordering::Acquire) + Duration::from_secs(3).as_micros() as u64
+}
+
+/// The first pipeline of `m` not sent yet after `cursor`, else from the start; the dead and sent
+/// ones it passes are dropped, and so is the one returned.
+fn next_after(m: &mut std::collections::BTreeMap<u64, std::sync::Weak<Pending>>, cursor: u64) -> Option<Arc<Pending>> {
+    let mut drop_keys = Vec::new();
+    let mut found = None;
+    for (&k, w) in m.range(cursor.saturating_add(1)..).chain(m.range(..=cursor)) {
+        drop_keys.push(k);
+        if let Some(p) = w.upgrade() {
+            if !p.sent.load(Ordering::Acquire) {
+                found = Some(p);
+                break;
+            }
+        }
+    }
+    for k in drop_keys {
+        m.remove(&k);
+    }
+    found
+}
+
+fn start_ahead() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        for k in 0..ahead_threads() {
+            let _ = std::thread::Builder::new().name(format!("xcl-pso-ahead-{k}")).stack_size(64 << 20).spawn(ahead_loop);
+        }
+    });
+}
+
+fn ahead_loop() {
+    unsafe {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+    loop {
+        if !stalled() {
+            std::thread::sleep(Duration::from_millis(250));
+            continue;
+        }
+        let next = next_after(&mut LAZY_COMPUTE.lock().unwrap(), CURSOR.load(Ordering::Relaxed));
+        let Some(p) = next else {
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        };
+        if p.sent.swap(true, Ordering::AcqRel) {
+            continue;
+        }
+        let Some(job) = p.job.lock().unwrap().take() else { continue };
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            crate::xlog_info!(
+                "D3D12.X: the title waits for pipelines and presents nothing – {} threads build the compute pipelines made after the one it waits for (XCL_PSO_AHEAD)",
+                ahead_threads()
+            );
+        });
+        let start = Instant::now();
+        let real = job();
+        p.ahead.store(real != 0, Ordering::Release);
+        complete(&p, real);
+        let n = AHEAD_BUILT.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() || n % 64 == 0 || start.elapsed() >= Duration::from_secs(30) {
+            crate::xlog_info!(
+                "D3D12.X: {n} compute pipelines built ahead of the title, {} of them asked for since (this one {:.1} s)",
+                AHEAD_USED.load(Ordering::Relaxed),
+                start.elapsed().as_secs_f32()
+            );
+        }
+    }
+}
+
 /// (built in the background, failed, still building)
 pub fn counts() -> (usize, usize, usize) {
     let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
     (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
+}
+
+#[cfg(test)]
+mod ahead_tests {
+    use super::*;
+
+    fn pending(seq: u64, sent: bool) -> Arc<Pending> {
+        Arc::new(Pending {
+            job: Mutex::new(Some(Box::new(|| 0))),
+            sent: std::sync::atomic::AtomicBool::new(sent),
+            real: AtomicUsize::new(0),
+            done: Mutex::new(false),
+            cv: Condvar::new(),
+            compute: true,
+            orphan: Default::default(),
+            seq,
+            ahead: Default::default(),
+        })
+    }
+
+    /// Building ahead takes the pipelines made after the one the title asks for, in order, then
+    /// wraps around to the earlier ones; sent and released ones are passed and forgotten.
+    #[test]
+    fn the_pipelines_made_after_the_asked_one_come_first_then_the_earlier_ones() {
+        let kept: Vec<Arc<Pending>> = [(1, false), (2, false), (5, true), (6, false), (9, false)].iter().map(|&(s, sent)| pending(s, sent)).collect();
+        let released = pending(7, false);
+        let mut m = std::collections::BTreeMap::new();
+        for p in kept.iter().chain([&released]) {
+            m.insert(p.seq, Arc::downgrade(p));
+        }
+        drop(released);
+        let mut order = Vec::new();
+        while let Some(p) = next_after(&mut m, 4) {
+            order.push(p.seq);
+            p.sent.store(true, Ordering::Release);
+        }
+        // 5 was sent already, 7 is gone; 6 and 9 come before 1 and 2
+        assert_eq!(order, [6, 9, 1, 2]);
+        assert!(m.is_empty());
+    }
 }
 
 #[cfg(test)]
