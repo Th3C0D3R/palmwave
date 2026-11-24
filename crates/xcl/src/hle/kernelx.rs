@@ -884,6 +884,19 @@ fn page_home(page: usize) -> Option<usize> {
     block.is_live(offset).then(|| block.home.checked_add(offset.checked_mul(PHYS_PAGE)?)).flatten()
 }
 
+/// Whether `page` is the number of a physical page that is allocated now.
+pub fn physical_page_live(page: usize) -> bool {
+    page_home(page).is_some()
+}
+
+/// Where the bytes of `page` are now and whether that is an address the title mapped it at
+/// (false: its home) – for diagnostics; None if the page is not allocated.
+pub fn physical_page_address(page: usize) -> Option<(usize, bool)> {
+    let g = AWAY.lock().unwrap();
+    let home = page_home(page)?;
+    Some(g.as_ref().and_then(|a| a.page.get(&page).copied()).map_or((home, false), |at| (at, true)))
+}
+
 /// Whether a home is only reserved until it is used (a sparse window's, or plain memory's –
 /// the coherent window is committed as a whole).
 fn lazy_home(home: usize) -> bool {
@@ -1283,6 +1296,7 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
                 crate::hle::d3d12x::sparse::committed(at, PHYS_PAGE);
             }
+            lazy::unmark(at);
             away.at.remove(&old);
             decommit_away(old);
             away.at.insert(at, p);
@@ -1309,6 +1323,9 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
             return std::ptr::null_mut();
         }
+        // committed and filled here: not a page waiting for its first use, whatever was mapped at
+        // this address before (a page freed while it was mapped there lazily leaves its mark)
+        lazy::unmark(at);
         if committed_page(home) {
             std::ptr::copy_nonoverlapping(home as *const u8, at as *mut u8, PHYS_PAGE);
             move_home_away(away, home);
@@ -2234,6 +2251,42 @@ mod tests {
             assert_eq!((out[0], out[PHYS_PAGE - 1]), (0x67, 0x89));
             assert!(returned);
             assert!(unused);
+        }
+    }
+
+    /// A page freed while it is mapped and was never used there leaves the address marked as
+    /// waiting for its first use. The next page mapped there with contents (DirectStorage wrote
+    /// them through a page array) is not such a page: it keeps them when it is unmapped, and the
+    /// address is given back.
+    #[test]
+    fn a_page_mapped_where_a_freed_unused_page_was_keeps_its_contents() {
+        unsafe {
+            let (mut one, mut first, mut second) = (1usize, 0usize, 0usize);
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut one, &mut first), 1);
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut one, &mut second), 1);
+            let base = mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE);
+            assert!(!base.is_null());
+            assert_eq!(MapTitlePhysicalPages(base, 1, 0, 4, &mut first), base);
+            assert!(lazy::marked(base as usize) && !committed_page(base as usize), "never used: only reserved");
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, &mut first), 1);
+
+            let data: Vec<u8> = (0..PHYS_PAGE).map(|i| (i * 31 + 7) as u8).collect();
+            assert!(write_physical_pages(&[second], 0, &data));
+            assert_eq!(MapTitlePhysicalPages(base, 1, 0, 4, &mut second), base);
+            assert!(!lazy::marked(base as usize), "a page with contents is not waiting for its first use");
+            assert!(std::slice::from_raw_parts(base as *const u8, PHYS_PAGE) == &data[..]);
+            assert_eq!(physical_page_address(second), Some((base as usize, true)));
+
+            assert_eq!(MapTitlePhysicalPages(base, 1, 0, 4, std::ptr::null_mut()), base);
+            assert!(!committed_page(base as usize), "the address is given back");
+            assert_eq!(physical_page_address(second).map(|a| a.1), Some(false));
+            let mut out = vec![0u8; PHYS_PAGE];
+            assert!(read_physical_pages(&[second], 0, &mut out));
+            assert!(out == data, "the page kept its contents");
+
+            assert!(physical_page_live(second) && !physical_page_live(first) && !physical_page_live(0));
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, &mut second), 1);
+            assert_eq!(mem::VirtualFree(base, 0, mem::MEM_RELEASE), 1);
         }
     }
 
