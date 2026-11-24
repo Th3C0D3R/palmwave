@@ -310,6 +310,7 @@ pub fn on_queue_console_method(_info: &StubInfo, _caller: usize) {
 // ---------------------------------------------------------------------------------------
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if super::overlay::key_message(msg, wp.0, lp.0) { return LRESULT(0); }
     // keyboard and mouse as the gamepad: raw mouse input, the cursor held in the window
     if crate::hle::kbm::on_message(hwnd.0, msg, wp.0, lp.0) {
         return LRESULT(0);
@@ -420,6 +421,8 @@ fn window_thread() {
         HWND_RAW.store(hwnd.0 as isize, Ordering::Release);
         crate::xlog_info!("XCL window created ({}x{})", cfg.window_width, cfg.window_height);
         crate::hle::kbm::attach(hwnd.0);
+        crate::log::position_console(hwnd.0 as isize);
+        if super::overlay::enabled() { super::overlay_stats::start_sampling(); }
         SetTimer(Some(hwnd), COMPILE_TIMER, 500, None);
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -503,6 +506,11 @@ struct Presenter {
     value: u64,
     event: HANDLE,
     last: Instant,
+    overlay: Option<super::overlay::Overlay>,
+    overlay_init: Option<std::sync::mpsc::Receiver<Result<super::overlay::Overlay, String>>>,
+    overlay_format: DXGI_FORMAT,
+    timing: Option<super::overlay_timing::Timing>,
+    frame_stats: super::overlay_stats::FrameStats,
 }
 
 struct FrameDump {
@@ -519,7 +527,7 @@ unsafe impl Send for Presenter {}
 
 static PRESENTER: Mutex<Option<Presenter>> = Mutex::new(None);
 
-unsafe fn transition(res: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
+pub(super) unsafe fn transition(res: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -542,10 +550,16 @@ unsafe fn new_presenter(queue: usize) -> Option<Presenter> {
     list.Close().ok()?;
     let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
     let event = CreateEventW(None, false, false, None).ok()?;
+    let qraw = queue as *mut c_void;
+    let timing = if super::overlay::enabled() {
+        ID3D12CommandQueue::from_raw_borrowed(&qraw).and_then(|q| super::overlay_timing::Timing::new(dev, q))
+    } else { None };
     Some(Presenter {
         queue, dev: dev.clone(), sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN, alloc, list, fence,
         copy_source: None, dumps: Vec::new(), disabled: false, value: 0, event,
         last: Instant::now() - Duration::from_secs(1),
+        overlay: None, overlay_init: None, overlay_format: DXGI_FORMAT_UNKNOWN, timing,
+        frame_stats: super::overlay_stats::FrameStats::default(),
     })
 }
 
@@ -655,6 +669,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         return;
     }
     p.copy_source = None;
+    if let Some(timing) = &mut p.timing { timing.completed(); }
     p.dumps.clear();
     // `XCL_MESH_RECORD_DUMP`: the queue is past the frame before this one
     super::mesh_dump::flush();
@@ -665,12 +680,55 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     }
     let Some(sc) = p.sc.clone() else { return };
     let Ok(bb) = sc.GetBuffer::<ID3D12Resource>(sc.GetCurrentBackBufferIndex()) else { return };
+    if super::overlay::enabled() && p.overlay_format != fmt {
+        p.overlay_format = fmt; // do not retry failed initialization on every frame
+        p.overlay = None;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let dev = p.dev.clone();
+        match std::thread::Builder::new().name("xcl-overlay-init".into()).spawn(move || {
+            let _ = sender.send(super::overlay::Overlay::new(&dev, fmt));
+        }) {
+            Ok(_) => p.overlay_init = Some(receiver),
+            Err(e) => { p.overlay_init = None; crate::xlog_warn!("overlay disabled: {e}"); }
+        }
+    }
+    if let Some(receiver) = &p.overlay_init {
+        match receiver.try_recv() {
+            Ok(result) => {
+                p.overlay_init = None;
+                match result {
+                    Ok(overlay) => p.overlay = Some(overlay),
+                    Err(e) => crate::xlog_warn!("overlay disabled: {e}"),
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                p.overlay_init = None;
+                crate::xlog_warn!("overlay initialization thread stopped");
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
     if p.alloc.Reset().is_err() || p.list.Reset(&p.alloc, None).is_err() {
         return;
     }
     let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
     p.list.ResourceBarrier(&b1);
+    if let Some(timing) = &p.timing { timing.stamp(&p.list, 0); }
     p.list.CopyResource(&bb, &src);
+    if let Some(timing) = &p.timing { timing.stamp(&p.list, 1); }
+    if super::overlay::enabled() { p.frame_stats.record_frame(Instant::now()); }
+    if let Some(timing) = &p.timing { timing.stamp(&p.list, 2); }
+    let mut overlay_drawn = false;
+    if super::overlay::visible() {
+        if let Some(overlay) = &mut p.overlay {
+            let lines = p.frame_stats.lines(p.timing.as_ref().and_then(|t| t.copy_ms), p.timing.as_ref().and_then(|t| t.overlay_ms));
+            overlay_drawn = overlay.draw(&p.dev, &p.list, &bb, &lines);
+        }
+    }
+    if let Some(timing) = &mut p.timing {
+        timing.stamp(&p.list, 3);
+        timing.resolve(&p.list);
+    }
     let due = frame_dump_due();
     let mut dumps = Vec::new();
     if due {
@@ -742,6 +800,10 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         let e = fence::api_error(&p.dev, "Signal", e);
         crate::xlog_error!("present: submit copy: {e}");
         return;
+    }
+    if let Some(timing) = &mut p.timing { timing.submitted(); }
+    if overlay_drawn {
+        if let Some(overlay) = &mut p.overlay { overlay.submitted(); }
     }
     if let Err(e) = sc.Present(0, DXGI_PRESENT(0)).ok() {
         let e = fence::api_error(&p.dev, "Present", e);

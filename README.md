@@ -96,6 +96,10 @@ $env:XCL_NETWORK = "0"
 
 The runtime directs title writes to an overlay. Each run records GPU activity, unsupported calls and crash information in `%LOCALAPPDATA%\XCL\<title>\logs\report.json`. For a rendering report, include the GPU, driver, commit and what appeared on screen. A present count alone cannot tell a black frame from a menu.
 
+`XCL_OVERLAY=1` draws performance statistics over the game image; F10 hides or shows them. It shows last-frame FPS/ms and the mean of frame intervals ending in the last second, CPU use (100% means all logical processors), process RAM commit, local video memory use/budget, and the busiest GPU engine on XCL's adapter. GPU timings cover XCL's frame copy and overlay pass, not the title's whole frame. Unsupported counters show `N/A`; the display updates when the title presents. Off by default.
+
+`XCL_CONSOLE=1` opens or reuses a live, level-coloured log console and places it beside the game window where Windows allows. Its bounded queue drops and counts lines when output cannot keep up; file logging is unaffected. Off by default.
+
 ## Development
 
 Run the workspace tests with `.\scripts\test.ps1`. The script reports GPU tests skipped on the selected adapter. The repository includes a synthetic title for end-to-end checks. [Test title](tests/testtitle) · [Contributor guide](CONTRIBUTING.md) · [Runtime design](docs/specs/2026-11-20-xcl-design.md)
