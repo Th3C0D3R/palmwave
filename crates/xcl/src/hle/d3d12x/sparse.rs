@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use windows::core::Interface;
@@ -445,10 +445,38 @@ unsafe impl Send for State {}
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
+/// Placed buffers whose last reference went while another thread held the sparse lock, for the
+/// lock's next holder to forget (`locked`). `forget_buffer` runs inside a resource's Release,
+/// which D3D12 also makes itself while it holds a lock of its own, resetting a command list; a
+/// thread under the sparse lock that resets one of its lists (`begin_slot`) waits for that lock.
+/// Waiting there for the sparse lock deadlocked both threads, and every thread after them: a
+/// retail title stopped at 6 s, before its first movie (run P65).
+static FORGOTTEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static QUEUED: AtomicBool = AtomicBool::new(false);
+
+/// The sparse lock, the buffers released while another thread held it forgotten first.
+fn locked() -> std::sync::MutexGuard<'static, Option<State>> {
+    let mut g = STATE.lock().unwrap();
+    forget_queued(&mut g);
+    g
+}
+
+fn forget_queued(g: &mut Option<State>) {
+    if !QUEUED.swap(false, Ordering::Acquire) {
+        return;
+    }
+    let queued = std::mem::take(&mut *FORGOTTEN.lock().unwrap());
+    if let Some(s) = g.as_mut() {
+        for res in queued {
+            s.forget_buffer(res);
+        }
+    }
+}
+
 /// (pool heaps, bytes of the UPLOAD staging ring and zero buffer made, bytes of the READBACK
 /// staging buffer made) – `XCL_ACTIVITY`
 pub fn buffer_counts() -> (usize, usize, usize) {
-    let g = STATE.lock().unwrap();
+    let g = locked();
     let Some(s) = g.as_ref() else { return (0, 0, 0) };
     let upload = if s.staging.is_some() { STAGING } else { 0 } + if s.zero_buf.is_some() { ZERO_BUF } else { 0 };
     (s.pools.iter().filter(|p| p.is_some()).count(), upload, if s.readback.is_some() { READBACK_STAGING } else { 0 })
@@ -456,7 +484,7 @@ pub fn buffer_counts() -> (usize, usize, usize) {
 
 /// (bytes of video memory in pool heaps, of those mapped) – `XCL_ACTIVITY`
 pub fn pool_bytes() -> (usize, usize) {
-    let g = STATE.lock().unwrap();
+    let g = locked();
     let Some(s) = g.as_ref() else { return (0, 0) };
     let pools = s.pools.iter().filter(|p| p.is_some()).count() * POOL_TILES as usize * TILE;
     (pools, pools.saturating_sub(s.free.len() * TILE))
@@ -617,7 +645,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             crate::xlog_info!("D3D12.X: {} sparse window(s) for the title's own memory (tiled buffers on video memory)", out.len());
             // a state this replaces (the windows set up again) goes after the lock: the release of
             // its last buffers reaches `forget_buffer`, which takes the lock (#344)
-            let old = STATE.lock().unwrap().replace(s);
+            let old = locked().replace(s);
             drop(old);
             IN_USE.store(true, Ordering::Release);
             for (a, b) in std::mem::take(&mut *EARLY.lock().unwrap()) {
@@ -1313,7 +1341,7 @@ pub unsafe fn free(p: usize) -> bool {
 
 /// The queue tile mappings go out on, once there is one.
 pub fn queue() -> Option<ID3D12CommandQueue> {
-    STATE.lock().unwrap().as_ref().map(|s| s.queue.clone())
+    locked().as_ref().map(|s| s.queue.clone())
 }
 
 /// After `queue.ExecuteCommandLists`: copy GPU-written sparse ranges (e.g. `Write32/64`,
@@ -1340,7 +1368,7 @@ pub unsafe fn readback_after(queue: &ID3D12CommandQueue, ranges: &[(usize, usize
     // (a queue's fence values are signalled in the order they were given out)
     let mut order = RB.lock().unwrap();
     let copy = {
-        let mut g = STATE.lock().unwrap();
+        let mut g = locked();
         let Some(s) = g.as_mut() else { return };
         let mut filtered: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, n)| n > 0 && s.window_index(a).is_some()).collect();
         if filtered.is_empty() {
@@ -1615,7 +1643,7 @@ impl Job {
                 let mut p = std::ptr::null_mut();
                 // (u64::MAX: the device is gone)
                 if self.fence.GetCompletedValue() != u64::MAX && c.buf.Map(0, None, Some(&mut p)).is_ok() {
-                    if let Some(s) = STATE.lock().unwrap().as_mut() {
+                    if let Some(s) = locked().as_mut() {
                         s.copy_back(p as *const u8, &c.parts);
                     }
                     c.buf.Unmap(0, None);
@@ -1718,7 +1746,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     if len == 0 {
         return;
     }
-    let mut g = STATE.lock().unwrap();
+    let mut g = locked();
     let Some(s) = g.as_mut() else { return };
     if s.window_index(va).is_none() {
         return;
@@ -1762,7 +1790,7 @@ pub unsafe fn committed(a: usize, n: usize) {
     if n == 0 {
         return;
     }
-    let mut g = STATE.lock().unwrap();
+    let mut g = locked();
     let Some(s) = g.as_mut() else {
         let (start, end) = page_span(a, n);
         early_add(&mut EARLY.lock().unwrap(), start, end);
@@ -1778,7 +1806,7 @@ pub unsafe fn decommitted(a: usize, n: usize) {
     if n == 0 {
         return;
     }
-    let mut g = STATE.lock().unwrap();
+    let mut g = locked();
     let Some(s) = g.as_mut() else {
         let (start, end) = page_span(a, n);
         early_remove(&mut EARLY.lock().unwrap(), start, end);
@@ -2043,7 +2071,7 @@ pub fn target_placed(res: usize, va: usize, bytes: usize) {
     if !under_targets() {
         return;
     }
-    if let Some(s) = STATE.lock().unwrap().as_mut() {
+    if let Some(s) = locked().as_mut() {
         s.target_placed(res, va, bytes, std::time::Instant::now());
     }
 }
@@ -2053,7 +2081,7 @@ pub fn target_gone(res: usize) {
     if !under_targets() {
         return;
     }
-    if let Some(s) = STATE.lock().unwrap().as_mut() {
+    if let Some(s) = locked().as_mut() {
         s.target_gone(res);
     }
 }
@@ -2063,7 +2091,7 @@ pub fn target_gone(res: usize) {
 #[cfg(test)]
 pub(crate) fn test_target_placed_long_ago(res: usize, va: usize, bytes: usize) {
     let now = std::time::Instant::now();
-    if let Some(s) = STATE.lock().unwrap().as_mut() {
+    if let Some(s) = locked().as_mut() {
         s.target_placed(res, va, bytes, now.checked_sub(UNBACK_AFTER).unwrap_or(now));
     }
 }
@@ -2071,7 +2099,7 @@ pub(crate) fn test_target_placed_long_ago(res: usize, va: usize, bytes: usize) {
 /// (tests) `target_gone`, whatever the switch says.
 #[cfg(test)]
 pub(crate) fn test_target_gone(res: usize) {
-    if let Some(s) = STATE.lock().unwrap().as_mut() {
+    if let Some(s) = locked().as_mut() {
         s.target_gone(res);
     }
 }
@@ -2079,7 +2107,7 @@ pub(crate) fn test_target_gone(res: usize) {
 /// (bytes of tiles under GPU-owned textures that hold no video memory now, tiles that gave
 /// theirs back so far, tiles that took some again) – `XCL_ACTIVITY`
 pub fn under_target_counts() -> (usize, u64, u64) {
-    let g = STATE.lock().unwrap();
+    let g = locked();
     let Some(s) = g.as_ref() else { return (0, 0, 0) };
     (s.under.unbacked * TILE, s.under.counts[0], s.under.counts[1])
 }
@@ -2099,7 +2127,7 @@ pub fn known_writable(p: usize, n: usize) -> bool {
         return false;
     }
     {
-        let g = STATE.lock().unwrap();
+        let g = locked();
         let Some(s) = g.as_ref() else { return false };
         if !recorded_committed(&s.mapped, p, end) {
             return false;
@@ -2158,7 +2186,7 @@ fn resident_pages_writable(p: usize, end: usize) -> bool {
 /// The sparse windows' tiles with video memory as sorted (start, end) runs: where a CPU write
 /// has to reach the GPU.
 pub fn mapped_ranges() -> Vec<(usize, usize)> {
-    let mut g = STATE.lock().unwrap();
+    let mut g = locked();
     let Some(s) = g.as_mut() else { return Vec::new() };
     if s.runs.is_none() {
         let mut tiles: Vec<usize> = s.mapped.keys().copied().collect();
@@ -2190,7 +2218,7 @@ pub fn note_watch(t: std::time::Duration, pages: usize) {
 /// memory, and `queue` GPU-waits for that and for new tile mappings.
 pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
     let t0 = std::time::Instant::now();
-    let mut g = STATE.lock().unwrap();
+    let mut g = locked();
     let Some(s) = g.as_mut() else { return };
     // the title's work sees what was decommitted unmapped, as it was
     if s.flush_parked() {
@@ -2288,7 +2316,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
 /// description): a reserved resource over the window's tiles there, starting at the 64 KiB
 /// below `va` (returned: its distance from there).
 pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, state: u32, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void) -> Option<(crate::util::HRESULT, usize)> {
-    let mut g = STATE.lock().unwrap();
+    let mut g = locked();
     let s = g.as_mut()?;
     let start = va & !(TILE - 1);
     let delta = va - start;
@@ -2331,17 +2359,36 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     Some((hr, delta))
 }
 
-/// A placed buffer is gone: its tiles are not pinned by it any more.
+/// A placed buffer is gone: its tiles are not pinned by it any more. Never waits for the sparse
+/// lock: with another thread holding it, the buffer is left to the lock's next holder
+/// (`FORGOTTEN`).
 pub fn forget_buffer(res: usize) {
-    let mut g = STATE.lock().unwrap();
-    let Some(s) = g.as_mut() else { return };
-    let Some(tiles) = s.buffers.remove(&res) else { return };
-    for tile in tiles {
-        if let Some(c) = s.pinned.get_mut(&tile) {
-            *c -= 1;
-            if *c == 0 {
-                s.pinned.remove(&tile);
-                s.release_if_unused(tile);
+    let mut g = match STATE.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::WouldBlock) => {
+            FORGOTTEN.lock().unwrap().push(res);
+            QUEUED.store(true, Ordering::Release);
+            return;
+        }
+        Err(std::sync::TryLockError::Poisoned(e)) => panic!("{e}"),
+    };
+    forget_queued(&mut g);
+    if let Some(s) = g.as_mut() {
+        s.forget_buffer(res);
+    }
+}
+
+impl State {
+    /// `forget_buffer` under the lock.
+    fn forget_buffer(&mut self, res: usize) {
+        let Some(tiles) = self.buffers.remove(&res) else { return };
+        for tile in tiles {
+            if let Some(c) = self.pinned.get_mut(&tile) {
+                *c -= 1;
+                if *c == 0 {
+                    self.pinned.remove(&tile);
+                    self.release_if_unused(tile);
+                }
             }
         }
     }
@@ -2350,6 +2397,30 @@ pub fn forget_buffer(res: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A buffer's last Release can come inside D3D12 (a command list's Reset) while another
+    /// thread holds the sparse lock and waits for D3D12's own lock: `forget_buffer` must not wait
+    /// for the sparse lock then (run P65 deadlocked so at 6 s). It queues the buffer, and the
+    /// lock's next holder forgets it.
+    #[test]
+    fn forget_buffer_does_not_wait_for_the_sparse_lock() {
+        // no real buffer has this address
+        const RES: usize = 0x7E57_F06E_0000;
+        let held = STATE.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || {
+            forget_buffer(RES);
+            tx.send(()).unwrap();
+        });
+        let returned = rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+        let queued = FORGOTTEN.lock().unwrap().contains(&RES);
+        drop(held);
+        t.join().unwrap();
+        assert!(returned, "forget_buffer waited for the sparse lock another thread held");
+        assert!(queued, "the buffer was not left to the lock's next holder");
+        drop(locked());
+        assert!(!FORGOTTEN.lock().unwrap().contains(&RES), "the lock's next holder did not forget the buffer");
+    }
 
     /// A block freed on one thread while another allocates: its address goes back to the
     /// windows only once it is decommitted (released first, the decommit came after another
@@ -3156,7 +3227,7 @@ mod tests {
     #[test]
     #[ignore]
     fn early_commit_timing() {
-        if STATE.lock().unwrap().is_some() {
+        if locked().is_some() {
             return eprintln!("early_commit_timing: a sparse state exists – run it alone");
         }
         let sizes: Vec<usize> = std::env::var("XCL_EARLY_PAGES").ok().map_or(vec![4096, 8192, 16384, 32768], |v| v.split(',').map(|s| s.trim().parse().unwrap()).collect());
