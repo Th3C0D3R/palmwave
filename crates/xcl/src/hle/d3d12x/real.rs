@@ -6386,7 +6386,7 @@ mod stencil_view_tests {
                 let srv_heap = heaps(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE);
                 let sampler_heap = heaps(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE);
                 let dsv = dsv_heap.GetCPUDescriptorHandleForHeapStart();
-                dev.CreateDepthStencilView(&depth, default_dsv(&d).as_ref(), dsv);
+                dev.CreateDepthStencilView(&depth, default_dsv(&d).as_ref().map(|v| v as *const _), dsv);
                 let v = pc_srv(&d, Some(&stencil_srv(DXGI_FORMAT_R8_UINT, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, false))).unwrap();
                 dev.CreateShaderResourceView(&depth, Some(&v), srv_heap.GetCPUDescriptorHandleForHeapStart());
                 let (fmt, ty, w, h, z, m) = view_shape(&depth, v.Format, v.ViewDimension.0, 1, 1).unwrap();
