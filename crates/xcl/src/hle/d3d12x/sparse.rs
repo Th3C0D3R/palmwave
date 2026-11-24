@@ -645,7 +645,9 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             crate::xlog_info!("D3D12.X: {} sparse window(s) for the title's own memory (tiled buffers on video memory)", out.len());
             // a state this replaces (the windows set up again) goes after the lock: the release of
             // its last buffers reaches `forget_buffer`, which takes the lock (#344)
+            let q = s.queue.clone();
             let old = locked().replace(s);
+            *QUEUE.lock().unwrap() = Some(q);
             drop(old);
             IN_USE.store(true, Ordering::Release);
             for (a, b) in std::mem::take(&mut *EARLY.lock().unwrap()) {
@@ -1339,10 +1341,15 @@ pub unsafe fn free(p: usize) -> bool {
     u.sparse_release(p).is_some()
 }
 
-/// The queue tile mappings go out on, once there is one.
+/// The queue tile mappings go out on, once there is one. Without the sparse lock: a resource's
+/// last Release asks for it (`late_release::hold` → `drain_known`), also inside D3D12 while
+/// another thread waits there under the sparse lock (`FORGOTTEN`; run P66 deadlocked so).
 pub fn queue() -> Option<ID3D12CommandQueue> {
-    locked().as_ref().map(|s| s.queue.clone())
+    QUEUE.lock().unwrap().clone()
 }
+
+/// `queue`: the sparse state's queue, set with the state.
+static QUEUE: Mutex<Option<ID3D12CommandQueue>> = Mutex::new(None);
 
 /// After `queue.ExecuteCommandLists`: copy GPU-written sparse ranges (e.g. `Write32/64`,
 /// `FillMemoryWith32BitValueX`, `CopyMemoryToMemoryX`) back to their CPU view so CPU reads

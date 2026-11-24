@@ -86,6 +86,42 @@ impl Held {
 
 static HELD: Mutex<Option<Held>> = Mutex::new(None);
 
+/// Resources whose last reference came while another thread held `HELD`, for its next holder
+/// (`held`). `hold` runs inside a resource's Release, which D3D12 also makes itself while it
+/// holds a lock of its own (resetting a command list), and the holder of `HELD` can be inside
+/// D3D12 (`Held::drain` makes fences and signals the queues): waiting there for `HELD` could
+/// deadlock both threads, as the sparse lock did (run P66).
+static WAITING: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// `HELD`, with the resources left in `WAITING` taken in.
+fn held() -> std::sync::MutexGuard<'static, Option<Held>> {
+    let mut g = HELD.lock().unwrap();
+    take_waiting(&mut g);
+    g
+}
+
+fn take_waiting(g: &mut Option<Held>) {
+    let waiting = std::mem::take(&mut *WAITING.lock().unwrap());
+    if !waiting.is_empty() {
+        g.get_or_insert_with(Held::default).open.extend(waiting);
+    }
+}
+
+/// Whether resources are held. `wait` false: never waits for `HELD`, and says yes when another
+/// thread holds it.
+fn pending(wait: bool) -> bool {
+    if !WAITING.lock().unwrap().is_empty() {
+        return true;
+    }
+    if wait {
+        return held().as_ref().is_some_and(|h| !h.is_empty());
+    }
+    match HELD.try_lock() {
+        Ok(g) => g.as_ref().is_some_and(|h| !h.is_empty()),
+        Err(_) => true,
+    }
+}
+
 /// Whether last releases are held (`XCL_LATE_RELEASE=0` turns it off).
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -98,16 +134,24 @@ const IDLE_WAIT: Duration = Duration::from_micros(300);
 /// `res` (an adopted resource) holds one reference that is now this module's. With no work in
 /// flight it goes before this returns (the queues pass a fence value at once): a title that
 /// frees the memory under a resource right after its last `Release` finds it unpinned, as
-/// before. Otherwise the thread here lets it go.
+/// before. Otherwise the thread here lets it go. Never waits for a lock another thread holds
+/// (`WAITING`): what it cannot do now, the thread here does.
 pub unsafe fn hold(res: usize) {
-    HELD.lock().unwrap().get_or_insert_with(Held::default).open.push(res);
-    let start = Instant::now();
-    drain_known(true);
-    while start.elapsed() < IDLE_WAIT && HELD.lock().unwrap().as_ref().is_some_and(|h| !h.is_empty()) {
-        std::hint::spin_loop();
-        drain_known(false);
+    match HELD.try_lock() {
+        Ok(mut g) => {
+            take_waiting(&mut g);
+            g.get_or_insert_with(Held::default).open.push(res);
+        }
+        Err(std::sync::TryLockError::WouldBlock) => WAITING.lock().unwrap().push(res),
+        Err(std::sync::TryLockError::Poisoned(e)) => panic!("{e}"),
     }
-    if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
+    let start = Instant::now();
+    drain(true, false);
+    while start.elapsed() < IDLE_WAIT && pending(false) {
+        std::hint::spin_loop();
+        drain(false, false);
+    }
+    if !pending(false) {
         return;
     }
     // A thread of its own lets the held ones go: the title may release a resource and then
@@ -125,7 +169,13 @@ pub unsafe fn hold(res: usize) {
 /// Release what every queue XCL knows of is past: the title's, the tile-mapping one, the
 /// upload ones.
 pub unsafe fn drain_known(seal_now: bool) {
-    if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
+    drain(seal_now, true);
+}
+
+/// `drain_known`. `wait` false (inside a Release, `hold`): no lock another thread holds is
+/// waited for – the held resources then wait for the next drain.
+unsafe fn drain(seal_now: bool, wait: bool) {
+    if !pending(wait) {
         return;
     }
     let mut queues: Vec<ID3D12CommandQueue> = Vec::new();
@@ -136,11 +186,20 @@ pub unsafe fn drain_known(seal_now: bool) {
         }
     }
     queues.extend(super::sparse::queue());
-    queues.extend(super::title_textures::upload_queues());
-    let gone = match HELD.lock().unwrap().as_mut() {
+    let Some(uploads) = super::title_textures::upload_queues(wait) else { return };
+    queues.extend(uploads);
+    let mut g = if wait {
+        held()
+    } else {
+        let Ok(mut g) = HELD.try_lock() else { return };
+        take_waiting(&mut g);
+        g
+    };
+    let gone = match g.as_mut() {
         Some(h) => h.drain(&queues, seal_now),
         None => return,
     };
+    drop(g);
     // (outside the lock: a release may end other objects, whose releases come back here)
     for res in gone {
         let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(res as *mut c_void, 2));
@@ -152,6 +211,33 @@ pub unsafe fn drain_known(seal_now: bool) {
 mod tests {
     use super::*;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+
+    /// A resource's last Release can come inside D3D12 while another thread holds `HELD` and is
+    /// inside D3D12 itself: `hold` must not wait for `HELD` then (run P66 deadlocked so, through
+    /// the sparse lock). It leaves the resource for the lock's next holder.
+    #[test]
+    fn hold_does_not_wait_for_the_held_lock() {
+        // no real resource has this address: it is taken out again before anything can drain it
+        // (only a holder of `HELD` takes `WAITING` in)
+        const RES: usize = 0x7E57_401D_0000;
+        let held = HELD.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || {
+            unsafe { hold(RES) };
+            tx.send(()).unwrap();
+        });
+        let returned = rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        let waiting = {
+            let mut w = WAITING.lock().unwrap();
+            let had = w.contains(&RES);
+            w.retain(|&r| r != RES);
+            had
+        };
+        drop(held);
+        assert!(returned, "hold waited for the lock another thread held");
+        t.join().unwrap();
+        assert!(waiting, "the resource was not left for the lock's next holder");
+    }
 
     /// A held resource stays while a queue has not got past the work submitted before it was
     /// released, and goes once the queue has.
