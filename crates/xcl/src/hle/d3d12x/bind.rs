@@ -512,7 +512,10 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
     type PcDm = unsafe extern "system" fn(*mut c_void, u32, u32, u32);
     let pc_dm: PcDm = std::mem::transmute(super::real::orig_fn(this, 79));
     let raw_pso = with(this, |s| s.pso);
-    let pso = super::pso_async::resolve_wait(raw_pso);
+    // waited for as a draw's pipeline is (`resolve_for_draw`): built on a worker within the
+    // frame's budget, not in the title's thread without a limit – past it the stand-in is
+    // pending and the dispatch is skipped below
+    let pso = super::pso_async::resolve_for_draw(raw_pso);
     if let Some(tp) = super::real::two_pass_of(pso) {
         let groups = x.saturating_mul(y.max(1)).saturating_mul(z.max(1));
         if groups == 0 {
