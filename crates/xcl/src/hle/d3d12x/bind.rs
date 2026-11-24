@@ -17,6 +17,7 @@ use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 
 use super::console_list::{self, Layout, Param};
+use super::frame_census;
 use super::gpu_profile::{self, Kind};
 
 #[derive(Default)]
@@ -97,6 +98,7 @@ fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
 /// and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
 pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
     gpu_profile::discard(list);
+    frame_census::discard(list);
     let (old, blocks, res_bufs) = with(list, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
@@ -153,6 +155,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
 /// The list is gone.
 pub(super) fn forget(list: *mut c_void) {
     gpu_profile::discard(list);
+    frame_census::discard(list);
     if let Some(mut s) = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize))) {
         console_list::hold_until_reset(s.allocator, s.uma);
         if let Some(b) = s.res_buf.take() {
@@ -514,6 +517,22 @@ unsafe fn make_scaled_args_buffer(this: *mut c_void, list: &ID3D12GraphicsComman
     Ok(dst)
 }
 
+/// `XCL_FRAME_CENSUS`: a draw or dispatch of console code on `this`, as the title asked for it
+/// (`skipped`: XCL left it out, and why).
+unsafe fn census(this: *mut c_void, kind: frame_census::Kind, counts: [u32; 3], skipped: Option<&'static str>) {
+    if frame_census::recording() {
+        frame_census::note(this, kind, counts, with(this, |s| s.pso), skipped);
+    }
+}
+
+/// … an ExecuteIndirect, right after the PC list recorded it (the offsets are the PC buffers').
+#[allow(clippy::too_many_arguments)]
+unsafe fn census_indirect(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64, skipped: Option<&'static str>) {
+    if frame_census::recording() {
+        frame_census::note_indirect(this, with(this, |s| s.pso), sig, max, args, args_off, count_buf, count_off, skipped);
+    }
+}
+
 pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y: u32, z: u32) {
     type PcDm = unsafe extern "system" fn(*mut c_void, u32, u32, u32);
     let pc_dm: PcDm = std::mem::transmute(super::real::orig_fn(this, 79));
@@ -525,6 +544,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
     if let Some(tp) = super::real::two_pass_of(pso) {
         let groups = x.saturating_mul(y.max(1)).saturating_mul(z.max(1));
         if groups == 0 {
+            census(this, frame_census::Kind::DispatchMesh, [x, y, z], Some("no thread groups"));
             return;
         }
         let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
@@ -546,6 +566,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
             emit_uav_barrier(list, Some(&res_buf));
             Ok(())
         })();
+        census(this, frame_census::Kind::DispatchMesh, [x, y, z], run.as_ref().err().map(|_| "two-pass bind failed"));
         match run {
             Ok(()) => {
                 count(DRAWS);
@@ -567,6 +588,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
     }
     if super::pso_async::is_pending(raw_pso) {
         count(DRAWS_SKIPPED);
+        census(this, frame_census::Kind::DispatchMesh, [x, y, z], Some("pipeline still being built"));
         return;
     }
     let rs = with(this, |s| s.rs_gfx) as *mut c_void;
@@ -574,8 +596,11 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
         list.SetGraphicsRootSignature(r);
     }
     count(DRAWS_PC);
-    let _timed = gpu_profile::scope(this, Kind::DispatchMesh, [x, y, z], false, || pso);
-    pc_dm(this, x, y, z);
+    {
+        let _timed = gpu_profile::scope(this, Kind::DispatchMesh, [x, y, z], false, || pso);
+        pc_dm(this, x, y, z);
+    }
+    census(this, frame_census::Kind::DispatchMesh, [x, y, z], None);
 }
 
 /// #59 ExecuteIndirect(signature, max count, arguments, offset, count buffer, offset): with a
@@ -610,6 +635,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 emit_uav_barrier(list, Some(&res_buf));
                 Ok(())
             })();
+            census_indirect(this, sig, max, args, args_off, count_buf, count_off, run.as_ref().err().map(|_| "two-pass bind failed"));
             match run {
                 Ok(()) => {
                     count(DRAWS);
@@ -646,6 +672,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: ExecuteIndirect with a pipeline that is still being built skipped");
             }
+            census_indirect(this, sig, max, args, args_off, count_buf, count_off, Some("pipeline still being built"));
             return;
         }
         // a PC pipeline (also a stand-in whose build failed): the title's root signature
@@ -654,14 +681,18 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
             list.SetGraphicsRootSignature(r);
         }
-        let _timed = gpu_profile::scope(this, Kind::ExecuteIndirect, [max, 0, 0], count_buf != 0, || pso);
-        return pc(this, sig, max, args, args_off, count_buf, count_off);
+        {
+            let _timed = gpu_profile::scope(this, Kind::ExecuteIndirect, [max, 0, 0], count_buf != 0, || pso);
+            pc(this, sig, max, args, args_off, count_buf, count_off);
+        }
+        return census_indirect(this, sig, max, args, args_off, count_buf, count_off, None);
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
             crate::xlog_warn!("D3D12.X: ExecuteIndirect that changes root arguments with a translated pipeline skipped");
         }
+        census_indirect(this, sig, max, args, args_off, count_buf, count_off, Some("its signature changes root arguments"));
         return;
     }
     // its arguments may be those a dispatch skipped for its pipeline was there to write
@@ -672,16 +703,21 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         if n <= 4 || n.is_power_of_two() {
             crate::xlog_warn!("D3D12.X: ExecuteIndirect left out: compute dispatches were skipped for pipelines still being built, and its arguments may be theirs to write ({n} so far, XCL_PSO_SKIP_INDIRECT=0: issued all the same)");
         }
+        census_indirect(this, sig, max, args, args_off, count_buf, count_off, Some("dispatches that may write its arguments were skipped"));
         return;
     }
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
             count(if gfx { DRAWS } else { DISPATCHES });
-            let _timed = gpu_profile::scope(this, Kind::ExecuteIndirect, [max, 0, 0], count_buf != 0, || pso);
-            pc(this, sig, max, args, args_off, count_buf, count_off)
+            {
+                let _timed = gpu_profile::scope(this, Kind::ExecuteIndirect, [max, 0, 0], count_buf != 0, || pso);
+                pc(this, sig, max, args, args_off, count_buf, count_off);
+            }
+            census_indirect(this, sig, max, args, args_off, count_buf, count_off, None)
         }
         Err(e) => {
+            census_indirect(this, sig, max, args, args_off, count_buf, count_off, Some("ABI bind failed"));
             count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -744,6 +780,7 @@ unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertic
         let _timed = gpu_profile::scope(this, Kind::Draw, [rects as u32 * 6, instances, 0], false, || bound_pipeline(this));
         list.DrawInstanced(rects as u32 * 6, instances, 0, first_instance);
     }
+    census(this, frame_census::Kind::Draw, [vertices, instances, 0], None);
     for &(slot, _, pc) in &vbs {
         if let Some(v) = pc {
             list.IASetVertexBuffers(slot, Some(&[v]));
@@ -773,6 +810,7 @@ pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices:
         super::list_x::sync_title_buffers(this, None, first_vertex, vertices, if first_instance != 0 { instances.max(2) } else { instances });
         let _timed = gpu_profile::scope(this, Kind::Draw, [vertices, instances, 0], false, || bound_pipeline(this));
         list.DrawInstanced(vertices, instances, first_vertex, first_instance);
+        census(this, frame_census::Kind::Draw, [vertices, instances, 0], None);
     }
 }
 
@@ -813,6 +851,7 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
     let this = list.as_raw();
     let _timed = gpu_profile::scope(this, Kind::DrawIndexed, [indices, instances, 0], false, || bound_pipeline(this));
     list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
+    census(this, frame_census::Kind::DrawIndexed, [indices, instances, 0], None);
 }
 
 /// The pipeline state a draw on `this` runs with (a stand-in as its real pipeline) – for the
@@ -865,6 +904,8 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
         }
         Err(e) => {
             count(DRAWS_SKIPPED);
+            let (indexed, n, instances, ..) = DRAW_ARGS.with(|d| d.get());
+            census(this, if indexed { frame_census::Kind::DrawIndexed } else { frame_census::Kind::Draw }, [n, instances, 0], Some("ABI bind failed"));
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: draw with a translated pipeline skipped: {e}");
@@ -1149,9 +1190,12 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
             crate::xlog_warn!("D3D12.X: Dispatch with a pipeline that has no translated console shader ({pso:#x}) skipped");
         }
         count(DISPATCHES_SKIPPED);
+        census(this, frame_census::Kind::Dispatch, [x, y, z], Some(if super::pso_async::is_pending(pso) { "pipeline still being built" } else { "no translated shader" }));
         return;
     }
-    match translated_dispatch(this, list, pso, x, y, z) {
+    let run = translated_dispatch(this, list, pso, x, y, z);
+    census(this, frame_census::Kind::Dispatch, [x, y, z], run.as_ref().err().map(|_| "ABI bind failed"));
+    match run {
         Ok(()) => count(DISPATCHES),
         Err(e) => {
             count(DISPATCHES_SKIPPED);

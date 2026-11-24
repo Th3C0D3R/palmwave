@@ -766,6 +766,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         }
     }
     let n = PRESENTS.fetch_add(1, Ordering::Relaxed);
+    super::frame_census::presented(n);
     if n == 0 {
         crate::xlog_info!("present: first game frame shown ({}x{})", desc.Width, desc.Height);
     }

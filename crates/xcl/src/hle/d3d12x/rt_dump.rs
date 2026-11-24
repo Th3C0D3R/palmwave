@@ -138,6 +138,12 @@ pub(super) unsafe fn note_dsv_view(handle: usize, res: *mut c_void, read_only: b
     drop(old);
 }
 
+/// The resource of the depth-stencil view `handle`, and whether the view only reads the depth
+/// (`XCL_FRAME_CENSUS`).
+pub(super) fn dsv_resource(handle: usize) -> Option<(usize, bool)> {
+    DSVS.lock().unwrap().as_ref()?.get(&handle).map(|(r, read_only)| (r.as_raw() as usize, *read_only))
+}
+
 /// The title bound `res` as a color render target on PC list `list`.
 pub(super) unsafe fn note_bound(list: usize, res: usize) {
     keep_alive(res);

@@ -56,6 +56,7 @@ Tools used for these measurements:
 - `XCL_GPU_PROFILE=1` times each draw and dispatch on the GPU.
 - `XCL_FRAME_DUMP_FROM=n` writes every presented frame from frame n.
 - `XCL_RT_DUMP=1` writes the frame's render targets and depth.
+- `XCL_FRAME_CENSUS=n` lists frame n's draws and dispatches (pipeline, targets, viewport, depth state, the counts the GPU ran of each ExecuteIndirect) in the log and in `census_<n>.csv`; `XCL_FRAME_CENSUS_FROM=n` does so for frames n to n+2.
 
 Sound: the title's Opus sound is decoded. It has not been checked by ear on the test machine yet.
 

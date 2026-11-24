@@ -305,6 +305,16 @@ pub(super) fn pc_va_of(va: u64) -> u64 {
     pc_va(va)
 }
 
+/// `XCL_FRAME_CENSUS`: the first viewport and scissor a list last set, and the handles of the
+/// render-target views and of the depth-stencil view it has bound.
+pub(super) fn census_state(list: *mut c_void) -> (Option<D3D12_VIEWPORT>, Option<windows::Win32::Foundation::RECT>, Vec<usize>, Option<usize>) {
+    let g = LISTS.lock().unwrap();
+    let Some(b) = g.as_ref().and_then(|m| m.get(&(list as usize))).map(|s| &s.bindings) else { return (None, None, Vec::new(), None) };
+    let rt = b.render_targets.as_ref();
+    let rtvs = rt.map_or(Vec::new(), |rt| (0..rt.num_targets as usize).filter_map(|k| if rt.single != 0 { rt.handles.first().map(|h| h + k * 32) } else { rt.handles.get(k).copied() }).collect());
+    (b.viewports.first().copied(), b.scissors.first().copied(), rtvs, rt.and_then(|rt| rt.dsv))
+}
+
 /// `XCL_TRACE_FRAME`: the fixed-function state a list last set (topology, first viewport and
 /// scissor, render targets) as text.
 pub(super) fn state_summary(list: *mut c_void) -> String {
@@ -2872,6 +2882,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             execute_with_waits_on(q_raw, prior, |chunk| {
                 exec(q_raw, chunk.len() as u32, chunk.as_ptr());
                 super::gpu_profile::executed(q_raw, chunk);
+                super::frame_census::executed(q_raw, chunk);
                 super::alloc_pool::executed(q_raw, chunk);
                 signal_write64_fences(q_raw, chunk);
                 readback_sparse_writes(q_raw, chunk);
@@ -2891,6 +2902,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let one = [this];
     exec(q_raw, 1, one.as_ptr());
     super::gpu_profile::executed(q_raw, &one);
+    super::frame_census::executed(q_raw, &one);
     super::alloc_pool::executed(q_raw, &one);
     signal_write64_pairs(q_raw, &write64_signals);
     // what ran is in the textures' states; the list records anew after its Reset below
@@ -3817,6 +3829,7 @@ const PC_CLEAR_DEPTH_STENCIL_VIEW: usize = 47;
 
 /// command list #51 ClearDepthStencilView(dsv, flags, depth, stencil, rects, rect list) (PC #47)
 pub(super) unsafe extern "system" fn clear_depth_stencil_x(this: *mut c_void, dsv: usize, flags: u32, depth: f32, stencil: u8, n: u32, rects: *const windows::Win32::Foundation::RECT) {
+    super::frame_census::clear_depth(this, dsv, flags, depth, stencil);
     if super::present::trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
         static W: AtomicU64 = AtomicU64::new(0);

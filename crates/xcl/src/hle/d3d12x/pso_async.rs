@@ -891,6 +891,14 @@ pub fn released(pso: usize) -> usize {
     }
 }
 
+/// `XCL_FRAME_CENSUS`: what the stand-in `pso` stands for, without asking for it to be built –
+/// its real pipeline (0: none) and whether that is still being built. None: not a stand-in.
+pub fn standin_state(pso: usize) -> Option<(usize, bool)> {
+    let p = entry(pso)?;
+    let building = !*p.done.lock().unwrap();
+    Some((p.real.load(Ordering::Acquire), building))
+}
+
 /// `pso` is a stand-in whose real pipeline is still being built.
 pub fn is_pending(pso: usize) -> bool {
     entry(pso).is_some_and(|p| !*p.done.lock().unwrap())
