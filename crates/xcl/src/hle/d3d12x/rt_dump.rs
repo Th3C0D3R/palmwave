@@ -378,6 +378,31 @@ fn word(t: &[u8]) -> u32 {
     u32::from_le_bytes([t[0], t[1], t[2], t[3]])
 }
 
+/// The color of one texel of an HDR format (None: not one)
+fn hdr(kind: Kind, t: &[u8]) -> Option<[f32; 3]> {
+    let h = |k: usize| half(u16::from_le_bytes([t[2 * k], t[2 * k + 1]]));
+    let f = super::present::small_float;
+    match kind {
+        Kind::R11G11B10Float => Some([f(word(t) & 0x7FF, 6), f(word(t) >> 11 & 0x7FF, 6), f(word(t) >> 22, 5)]),
+        Kind::Rgba16Float => Some([h(0), h(1), h(2)]),
+        _ => None,
+    }
+}
+
+/// Of the texels `convert` takes of an HDR target: how many have a channel above 0, and the
+/// brightest channel (numbers only) – what its tone-mapped image does not tell apart: a dark
+/// lit target and one nothing was written to (None: not an HDR format).
+fn hdr_stats(kind: Kind, data: &[u8], w: usize, h: usize, pitch: usize, step: usize) -> Option<(usize, f32)> {
+    let bytes = texel_bytes(kind);
+    let texels = (0..h).step_by(step).flat_map(|y| (0..w).step_by(step).map(move |x| &data[y * pitch + x * bytes..][..bytes]));
+    let mut stats = (0, 0f32);
+    for t in texels {
+        let top = hdr(kind, t)?.into_iter().filter(|v| v.is_finite()).fold(0f32, f32::max);
+        stats = (stats.0 + (top > 0.0) as usize, stats.1.max(top));
+    }
+    Some(stats)
+}
+
 /// one texel (`texel_bytes` bytes) of a color format → 8-bit RGB
 fn texel(kind: Kind, t: &[u8]) -> [u8; 3] {
     let h = |k: usize| u16::from_le_bytes([t[2 * k], t[2 * k + 1]]);
@@ -387,11 +412,7 @@ fn texel(kind: Kind, t: &[u8]) -> [u8; 3] {
         Kind::R8 => [t[0]; 3],
         Kind::Rg8 => [t[0], t[1], 0],
         Kind::Rgb10A2 => [(word(t) >> 2) as u8, (word(t) >> 12) as u8, (word(t) >> 22) as u8],
-        Kind::R11G11B10Float => {
-            let f = super::present::small_float;
-            [tonemap(f(word(t) & 0x7FF, 6)), tonemap(f(word(t) >> 11 & 0x7FF, 6)), tonemap(f(word(t) >> 22, 5))]
-        }
-        Kind::Rgba16Float => [tonemap(half(h(0))), tonemap(half(h(1))), tonemap(half(h(2)))],
+        Kind::R11G11B10Float | Kind::Rgba16Float => hdr(kind, t).unwrap_or_default().map(tonemap),
         Kind::Rg16Float => normal(half(h(0)), half(h(1))),
         Kind::Rg16Unorm => normal(h(0) as f32 / 65535.0 * 2.0 - 1.0, h(1) as f32 / 65535.0 * 2.0 - 1.0),
         // (shown as IDs and greys: `panels`)
@@ -536,12 +557,13 @@ pub(super) unsafe fn write(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FO
     let data = std::slice::from_raw_parts((p as *const u8).add(fp.Offset as usize), pitch * (h - 1) + w * texel_bytes(kind));
     let step = if std::env::var_os("XCL_FRAME_DUMP_FULL").is_some() { 1 } else { w.div_ceil(960) };
     let (ow, oh, rgb) = convert(kind, data, w, h, pitch, step);
+    let hdr = hdr_stats(kind, data, w, h, pitch, step).map_or(String::new(), |(above, top)| format!(", {above} above 0, the brightest {top}"));
     rb.Unmap(0, None);
     let lit = rgb.chunks_exact(3).filter(|c| c.iter().map(|&v| v as u32).sum::<u32>() > 30).count();
     let Some(boot) = crate::state::boot() else { return };
     let path = boot.logs_dir().join(format!("rt_{n}_{k}_{}_{name}_{w}x{h}.png", view.name()));
     match std::fs::write(&path, png(ow, oh, &rgb)) {
-        Ok(()) => crate::xlog_info!("rt dump: frame {n} target {k} written to {} ({ow}x{oh}) – {lit} of {} pixels not black", path.display(), ow * oh),
+        Ok(()) => crate::xlog_info!("rt dump: frame {n} target {k} written to {} ({ow}x{oh}) – {lit} of {} pixels not black{hdr}", path.display(), ow * oh),
         Err(e) => crate::xlog_error!("rt dump: {}: {e}", path.display()),
     }
 }
@@ -664,6 +686,21 @@ mod tests {
         // R11G11B10: r and g 1.0 (exponent 15, 6 mantissa bits), b 2.0 (exponent 16, 5 mantissa bits)
         let t = (15u32 << 6 | (15 << 6) << 11 | (16 << 5) << 22).to_le_bytes();
         assert_eq!(texel(Kind::R11G11B10Float, &t), [180, 180, 208]);
+    }
+
+    /// A dark lit HDR target shows black once tone-mapped; its texels above 0 and its brightest
+    /// value tell it from an empty one (infinities and NaN are no numbers to count).
+    #[test]
+    fn hdr_targets_count_their_texels_above_0_and_the_brightest() {
+        // 4×1 RGBA16F texels: 0, (0.001, 0, 0), (2, 1, 0), (inf, NaN, 0)
+        let data: Vec<u8> = [0u16, 0, 0, 0, 0x1419, 0, 0, 0, 0x4000, 0x3C00, 0, 0, 0x7C00, 0x7E00, 0, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(convert(Kind::Rgba16Float, &data, 4, 1, 32, 1).2[3..6], [8, 0, 0], "0.001: black once tone-mapped");
+        let (above, top) = hdr_stats(Kind::Rgba16Float, &data, 4, 1, 32, 1).unwrap();
+        assert_eq!((above, top), (2, 2.0));
+        assert_eq!(hdr_stats(Kind::Rgba16Float, &data, 4, 1, 32, 2), Some((1, 2.0)), "every other texel");
+        // R11G11B10: r 1.0
+        assert_eq!(hdr_stats(Kind::R11G11B10Float, &(15u32 << 6).to_le_bytes(), 1, 1, 4, 1), Some((1, 1.0)));
+        assert_eq!(hdr_stats(Kind::Rgba8, &[9, 9, 9, 9], 1, 1, 4, 1), None);
     }
 
     #[test]

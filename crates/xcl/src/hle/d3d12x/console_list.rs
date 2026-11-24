@@ -849,9 +849,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 at += 35;
             } else if w0 == TWIN_COPY_MARKER {
                 let res = get(1) as usize | (get(2) as usize) << 32;
-                let barrier = |b: &[D3D12_RESOURCE_BARRIER]| list.ResourceBarrier(b);
-                let copy = |dst: &ID3D12Resource, src: &ID3D12Resource| list.CopyResource(dst, src);
-                super::depth_twin::sync(res, get(3) != 0, &barrier, &copy);
+                super::depth_twin::sync(res, get(3) != 0, &list);
                 at += 4;
             } else if w0 == BARRIER_MARKER {
                 list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
