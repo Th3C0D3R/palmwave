@@ -4291,9 +4291,11 @@ fn gpu_sparse_tiles_under_a_target_are_backed_again_when_written_or_released() {
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
         let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, Some(&pso)).unwrap();
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
-        // user SGPRs: s4 = the descriptor table's offset in window 0 (the program clears s5)
+        // user SGPRs: s4 = the descriptor table's offset in window 0 (the program clears s5);
+        // the UMA base, which the memory windows are now range-checked against (f9e5ee9)
         let mut io = vec![0u32; crate::gpu::recomp::KERNEL_SGPRS];
         io[4] = (heap_va - u.base()) as u32;
+        io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
         std::ptr::copy_nonoverlapping(io.as_ptr() as *const u8, io_buf as *mut u8, io.len() * 4);
         // one submit through q_execute_command_lists (-> sparse::before_execute), waited for:
         // what the program wrote, read back from video memory
