@@ -175,7 +175,8 @@ unsafe fn make_twin(res: &ID3D12Resource) -> Option<ID3D12Resource> {
     let twin = twin?;
     res.SetPrivateDataInterface(&TWIN, &twin).ok()?;
     let n = N.fetch_add(1, Ordering::Relaxed) + 1;
-    if n <= 4 || n.is_power_of_two() {
+    // (depth-stencil buffers that shaders write are few next to the shadow maps: each one)
+    if n <= 4 || n.is_power_of_two() || stencil_plane(d.Format) {
         crate::xlog_info!("D3D12.X: a depth buffer that shaders write ({}x{}x{}, format {}) has a twin for its UAVs ({n} so far)", d.Width, d.Height, d.DepthOrArraySize, d.Format.0);
     }
     Some(twin)
@@ -427,10 +428,11 @@ pub unsafe fn sync(res: usize, into_uav: bool, rec: &dyn Recorder) -> bool {
     true
 }
 
-/// A copy between depth buffer `d` and its twin: counted, the first 4 and every power of two logged.
+/// A copy between depth buffer `d` and its twin: counted, the first 4 and every power of two
+/// logged – those of depth planes on their own (the shadow maps' would hide them).
 fn note_copy(d: &D3D12_RESOURCE_DESC, into_uav: bool) {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    static N: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    let n = N[stencil_plane(d.Format) as usize].fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 4 || n.is_power_of_two() {
         let what = if into_uav { "copied to the twin" } else { "the twin copied back" };
         crate::xlog_info!("D3D12.X: a depth buffer and its twin ({}x{}x{}, format {}): {what} ({n} copies so far)", d.Width, d.Height, d.DepthOrArraySize, d.Format.0);

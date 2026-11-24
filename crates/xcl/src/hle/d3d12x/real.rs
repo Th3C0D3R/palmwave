@@ -2333,7 +2333,9 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
             static N: AtomicU64 = AtomicU64::new(0);
             let n = N.fetch_add(1, Ordering::Relaxed) + 1;
             if n <= 4 || n.is_power_of_two() {
-                crate::xlog_warn!("D3D12.X: a UAV of a resource that cannot have one on the PC (a depth buffer) – a null view ({n} so far)");
+                let d = depth.map(|r| r.GetDesc()).unwrap_or_default();
+                let view = desc.as_ref().map_or(0, |v| v.Format.0);
+                crate::xlog_warn!("D3D12.X: a UAV (format {view}) of a resource that cannot have one on the PC (a depth buffer, {}x{}x{}, format {}, {} mips) – a null view ({n} so far)", d.Width, d.Height, d.DepthOrArraySize, d.Format.0, d.MipLevels);
             }
             f(this, std::ptr::null_mut(), std::ptr::null_mut(), &null_desc, at)
         } else {
