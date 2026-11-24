@@ -2312,7 +2312,10 @@ pub unsafe extern "system" fn write32_bottom_x(this: *mut c_void, va: u64, value
 }
 
 /// command list #70 Write64BitValueBottomOfPipeX(address, value, flush, flags)
-pub(super) unsafe extern "system" fn write64_bottom_x(this: *mut c_void, va: u64, value: u64, _flush: u32, flags: u32) {
+///
+/// # Safety
+/// `this` must be a valid adopted `ID3D12GraphicsCommandList` pointer.
+pub unsafe extern "system" fn write64_bottom_x(this: *mut c_void, va: u64, value: u64, _flush: u32, flags: u32) {
     const W: &str = "Write64BitValueBottomOfPipeX";
     record_write_trace(this, va, value, flags, "W64B");
     if flags & BOTTOM_TIMESTAMPS != 0 {
@@ -2570,7 +2573,10 @@ pub(super) unsafe extern "system" fn wait32_x(this: *mut c_void, va: u64, compar
 /// upper half of the stack slot is whatever was left in it – 0x231_0000_0001), and read as a
 /// mask its waits for a counter at 2 ≥ 1, 4 ≥ 2 … never held: each timed out (2 s a frame, the
 /// game stood still after its first cinematic).
-pub(super) unsafe extern "system" fn wait64_x(this: *mut c_void, va: u64, comparison: u32, value: u64, _flags: u64, _more: u32) {
+///
+/// # Safety
+/// `this` must be a valid adopted `ID3D12GraphicsCommandList` pointer.
+pub unsafe extern "system" fn wait64_x(this: *mut c_void, va: u64, comparison: u32, value: u64, _flags: u64, _more: u32) {
     wait_memory(this, va, 8, comparison, value, u64::MAX, "Wait64BitValueX");
 }
 

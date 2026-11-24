@@ -2474,7 +2474,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("Close", cl_close as usize),
             ("Reset", cl_reset as usize),
         ]),
-        Kind::CommandQueue => v.extend_from_slice(&[("Release", q_release as usize), ("ExecuteCommandLists", q_execute_command_lists as usize)]),
+        Kind::CommandQueue => v.extend_from_slice(&[("Release", q_release as usize), ("Signal", q_signal as usize), ("Wait", q_wait as usize), ("ExecuteCommandLists", q_execute_command_lists as usize)]),
         Kind::CommandAllocator => v.extend_from_slice(&[("Release", alloc_release as usize), ("Reset", alloc_reset as usize)]),
         Kind::Resource => v.extend_from_slice(&[
             ("Release", res_release as usize),
@@ -5538,6 +5538,26 @@ unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
     n
 }
 
+/// Signal: as on the PC, and noted (`sparse::note_queue_signal`: what ends a queue's wait)
+unsafe extern "system" fn q_signal(this: *mut c_void, fence: *mut c_void, value: u64) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, 14));
+    let hr = f(this, fence, value);
+    if hr >= 0 {
+        super::sparse::note_queue_signal(this as usize, fence, value);
+    }
+    hr
+}
+
+/// Wait: as on the PC; a title's wait is noted (`sparse::note_queue_wait`)
+unsafe extern "system" fn q_wait(this: *mut c_void, fence: *mut c_void, value: u64) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, 15));
+    let hr = f(this, fence, value);
+    if hr >= 0 && !super::title_textures::is_own_work() {
+        super::sparse::note_queue_wait(this as usize, fence, value);
+    }
+    hr
+}
+
 unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
@@ -5699,7 +5719,8 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
                 super::list_x::break_cycles_before_title_signal(this as usize, a1, a2 as u64);
             }
             let f: unsafe extern "system" fn(*mut c_void, usize, usize) -> i32 = std::mem::transmute(pc(if older == 14 { PC_SIGNAL } else { PC_WAIT }));
-            let hr = f(this, a1, a2);
+            // (a signal comes after the queue's copies back that have not landed)
+            let hr = if older == 14 { super::sparse::title_signal(this, a1 as *mut c_void, a2 as u64, || f(this, a1, a2)) } else { f(this, a1, a2) };
             if hr >= 0 {
                 if older == 14 {
                     super::fence_x::note_queue_signal(a1, a2 as u64);
@@ -5708,6 +5729,9 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
                     super::fence_x::note_queue_wait(a1, a2 as u64);
                     super::list_x::note_title_queue_wait(this as usize, a1, a2 as u64);
                 }
+            }
+            if older == 15 && hr >= 0 {
+                super::sparse::note_queue_wait(this as usize, a1 as *mut c_void, a2 as u64);
             }
             hr as u32 as usize
         }
@@ -5797,7 +5821,7 @@ unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, valu
     const PC_SIGNAL: usize = 14;
     super::list_x::break_cycles_before_title_signal(this as usize, fence as usize, value);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, PC_SIGNAL));
-    let hr = f(this, fence, value);
+    let hr = super::sparse::title_signal(this, fence, value, || f(this, fence, value));
     if hr >= 0 {
         super::fence_x::note_queue_signal(fence as usize, value);
         super::list_x::note_title_queue_signal(this as usize, fence as usize, value);
