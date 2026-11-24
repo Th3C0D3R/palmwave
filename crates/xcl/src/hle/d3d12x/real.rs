@@ -2321,11 +2321,13 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     let no_uav = ID3D12Resource::from_raw_borrowed(&res).is_some_and(|r| r.GetDesc().Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0);
     let null_desc = D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_FLOAT, ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D, ..Default::default() };
     let pc_uav = |at: u64| {
-        // with `XCL_DEPTH_UAV_TWINS=1` a depth buffer's UAV is a view of its twin (#970)
-        if let Some(twin) = no_uav.then(|| ID3D12Resource::from_raw_borrowed(&res).and_then(|r| super::depth_twin::twin_for_uav(r))).flatten() {
-            // (no description: the typeless twin's view needs its format – the PC refuses a null one)
-            let own = super::depth_twin::default_uav_desc(&twin.GetDesc());
-            return f(this, twin.as_raw(), std::ptr::null_mut(), if desc.is_null() { &own } else { desc }, at);
+        // with `XCL_DEPTH_UAV_TWINS=1` a depth buffer's UAV is a view of its twin (#970) – (no
+        // description: in the typeless twin's format, the PC refuses a null one; of a depth plane:
+        // R32_FLOAT; of a stencil plane: none, a null view)
+        let depth = ID3D12Resource::from_raw_borrowed(&res).filter(|_| no_uav);
+        let twin = depth.and_then(|r| super::depth_twin::twin_for_uav(r).map(|t| (r.GetDesc().Format, t)));
+        if let Some((twin, view)) = twin.and_then(|(format, t)| super::depth_twin::twin_view(format, &t.GetDesc(), desc.as_ref()).map(|v| (t, v))) {
+            return f(this, twin.as_raw(), std::ptr::null_mut(), &view, at);
         }
         if no_uav {
             static N: AtomicU64 = AtomicU64::new(0);

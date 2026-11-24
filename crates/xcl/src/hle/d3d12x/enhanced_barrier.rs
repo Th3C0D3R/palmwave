@@ -538,13 +538,48 @@ pub(super) unsafe extern "system" fn barrier_x(this: *mut c_void, n: u32, groups
     let syncs = super::list_x::note_depth_uav_barrier_groups(n, groups);
     // depth buffers that shaders write: their twins follow the title's layout changes (#970)
     for (res, into) in syncs {
-        let rb: unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER) = std::mem::transmute(super::real::orig_fn(this, PC_RESOURCE_BARRIER));
-        let cr: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(super::real::orig_fn(this, PC_COPY_RESOURCE));
-        let barrier = |b: &[D3D12_RESOURCE_BARRIER]| rb(this, b.len() as u32, b.as_ptr());
-        let copy = |dst: &ID3D12Resource, src: &ID3D12Resource| cr(this, dst.as_raw(), src.as_raw());
-        super::depth_twin::sync(res, into, &barrier, &copy);
+        super::depth_twin::sync(res, into, &Adopted(this));
     }
     record_on_adopted(this, n, groups as usize);
+}
+
+const PC_DISPATCH: usize = 14;
+const PC_COPY_TEXTURE_REGION: usize = 16;
+const PC_SET_PIPELINE_STATE: usize = 25;
+const PC_SET_COMPUTE_ROOT_SIGNATURE: usize = 29;
+const PC_SET_COMPUTE_ROOT_32BIT_CONSTANTS: usize = 35;
+const PC_SET_COMPUTE_ROOT_UAV: usize = 41;
+
+/// An adopted command list that `depth_twin::sync` records into: its PC methods (`real::orig_fn`),
+/// so that XCL's own work goes past what the list's slots do for the title.
+struct Adopted(*mut c_void);
+
+impl super::depth_twin::Recorder for Adopted {
+    unsafe fn barrier(&self, barriers: &[D3D12_RESOURCE_BARRIER]) {
+        let f: unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER) = std::mem::transmute(super::real::orig_fn(self.0, PC_RESOURCE_BARRIER));
+        f(self.0, barriers.len() as u32, barriers.as_ptr());
+    }
+    unsafe fn copy(&self, dst: &ID3D12Resource, src: &ID3D12Resource) {
+        let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(super::real::orig_fn(self.0, PC_COPY_RESOURCE));
+        f(self.0, dst.as_raw(), src.as_raw());
+    }
+    unsafe fn copy_region(&self, dst: &D3D12_TEXTURE_COPY_LOCATION, src: &D3D12_TEXTURE_COPY_LOCATION) {
+        type F = unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX);
+        let f: F = std::mem::transmute(super::real::orig_fn(self.0, PC_COPY_TEXTURE_REGION));
+        f(self.0, dst, 0, 0, 0, src, std::ptr::null());
+    }
+    unsafe fn pass(&self, rs: &ID3D12RootSignature, pso: &ID3D12PipelineState, constants: &[u32; 8], buffer: u64, groups: [u32; 3]) {
+        let set: unsafe extern "system" fn(*mut c_void, *mut c_void) = std::mem::transmute(super::real::orig_fn(self.0, PC_SET_COMPUTE_ROOT_SIGNATURE));
+        set(self.0, rs.as_raw());
+        let set: unsafe extern "system" fn(*mut c_void, *mut c_void) = std::mem::transmute(super::real::orig_fn(self.0, PC_SET_PIPELINE_STATE));
+        set(self.0, pso.as_raw());
+        let set: unsafe extern "system" fn(*mut c_void, u32, u32, *const c_void, u32) = std::mem::transmute(super::real::orig_fn(self.0, PC_SET_COMPUTE_ROOT_32BIT_CONSTANTS));
+        set(self.0, 0, 8, constants.as_ptr() as *const c_void, 0);
+        let set: unsafe extern "system" fn(*mut c_void, u32, u64) = std::mem::transmute(super::real::orig_fn(self.0, PC_SET_COMPUTE_ROOT_UAV));
+        set(self.0, 1, buffer);
+        let dispatch: unsafe extern "system" fn(*mut c_void, u32, u32, u32) = std::mem::transmute(super::real::orig_fn(self.0, PC_DISPATCH));
+        dispatch(self.0, groups[0], groups[1], groups[2]);
+    }
 }
 
 #[cfg(test)]
