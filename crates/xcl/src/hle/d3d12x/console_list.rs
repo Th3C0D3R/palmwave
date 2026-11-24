@@ -815,6 +815,9 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         // root signature onto the stand-in
                         let real = super::pso_async::resolve_for_draw((*p).pc);
                         if !super::real::is_translated_compute(real) {
+                            if super::pso_async::is_pending(real) {
+                                super::pso_async::dispatch_skipped();
+                            }
                             out.skipped_dispatches += 1;
                             continue;
                         }

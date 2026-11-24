@@ -254,6 +254,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // match the currently set Pipeline State Object"; a retail title's world then hung the
         // GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
         if standin_indirect_skipped(with(this, |s| s.pso), pso) {
+            if super::pso_async::is_compute(pso) {
+                super::pso_async::dispatch_skipped();
+            }
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -273,6 +276,16 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
             crate::xlog_warn!("D3D12.X: ExecuteIndirect that changes root arguments with a translated pipeline skipped");
+        }
+        return;
+    }
+    // its arguments may be those a dispatch skipped for its pipeline was there to write
+    if super::pso_async::indirect_unsafe() {
+        count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 4 || n.is_power_of_two() {
+            crate::xlog_warn!("D3D12.X: ExecuteIndirect left out: compute dispatches were skipped for pipelines still being built, and its arguments may be theirs to write ({n} so far, XCL_PSO_SKIP_INDIRECT=0: issued all the same)");
         }
         return;
     }
@@ -732,7 +745,9 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
         // failed, or one not done in time – `pso_async` logged that one): nothing to run
         // (its root arguments were not given to the PC list either)
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if !super::pso_async::is_pending(pso) && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+        if super::pso_async::is_pending(pso) {
+            super::pso_async::dispatch_skipped();
+        } else if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
             crate::xlog_warn!("D3D12.X: Dispatch with a pipeline that has no translated console shader ({pso:#x}) skipped");
         }
         count(DISPATCHES_SKIPPED);

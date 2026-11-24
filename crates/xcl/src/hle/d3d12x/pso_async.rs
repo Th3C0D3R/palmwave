@@ -309,6 +309,41 @@ fn budget_from(ms: Option<&str>, compute: Option<&str>) -> FrameBudget {
 /// PresentX: the pipeline waits of the next frame start from nothing.
 pub fn frame_presented() {
     frame_budget().reset();
+    FRAME.fetch_add(1, Ordering::Relaxed);
+}
+
+/// the frame being made: 1 + the PresentX so far (`frame_presented`)
+static FRAME: AtomicU64 = AtomicU64::new(1);
+/// the frame (`FRAME`) in which a dispatch was last skipped for a pipeline still being built (0: none)
+static DISPATCH_SKIPPED_IN: AtomicU64 = AtomicU64::new(0);
+
+/// A compute dispatch was skipped because its pipeline is still being built (`resolve_for_draw`
+/// past the frame's budget, `XCL_PSO_COMPUTE_BUDGET=1`): what it would have written is missing.
+pub fn dispatch_skipped() {
+    DISPATCH_SKIPPED_IN.store(FRAME.load(Ordering::Relaxed), Ordering::Relaxed);
+}
+
+/// `pso` is the stand-in of a compute pipeline (built, failed or still being built).
+pub fn is_compute(pso: usize) -> bool {
+    entry(pso).is_some_and(|p| p.compute)
+}
+
+/// Whether work that takes its size from GPU memory – an ExecuteIndirect: the counts of its
+/// draws or the groups of its dispatches – is left out: a dispatch of this frame or of the one
+/// before it was skipped for a pipeline still being built, and the arguments it may have been
+/// there to write (a title's GPU culling) are then whatever the memory holds. The PC call has
+/// no bound for them: one draw of 4 billion instances keeps the GPU past the system's 2 s and
+/// the device is removed (0x887a0006). `XCL_PSO_SKIP_INDIRECT=0`: issued all the same.
+pub fn indirect_unsafe() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_PSO_SKIP_INDIRECT").map_or(true, |v| v.trim() != "0"))
+        && skipped_lately(DISPATCH_SKIPPED_IN.load(Ordering::Relaxed), FRAME.load(Ordering::Relaxed))
+}
+
+/// A dispatch skipped in frame `skipped_in` (0: none) still counts in frame `frame`: that frame
+/// and the next (what one frame writes the next may read).
+fn skipped_lately(skipped_in: u64, frame: u64) -> bool {
+    skipped_in != 0 && frame.saturating_sub(skipped_in) <= 1
 }
 
 /// draws and dispatches issued with a stand-in because their pipeline was not built in time
@@ -775,6 +810,24 @@ mod draw_wait_tests {
         assert!(t.elapsed() >= Duration::from_millis(190), "a draw after the present waited only {:?}", t.elapsed());
         go_tx.send(()).unwrap();
         let _ = released(standin);
+    }
+
+    /// An ExecuteIndirect is left out in the frame a dispatch was skipped for its pipeline and
+    /// in the next one (its arguments may be that dispatch's to write), not before any skip and
+    /// not once two frames passed without one. Only compute stand-ins count as producers.
+    #[test]
+    fn indirect_work_is_left_out_for_two_frames_after_a_skipped_dispatch() {
+        assert!(!skipped_lately(0, 1) && !skipped_lately(0, 7), "no dispatch was skipped");
+        assert!(skipped_lately(7, 7), "the frame of the skip");
+        assert!(skipped_lately(7, 8), "the frame after it");
+        assert!(!skipped_lately(7, 9) && !skipped_lately(7, 1000));
+        let (g, c) = (0x7410_0071usize, 0x7410_0073usize);
+        submit_lazy(g, false, Box::new(|| 0));
+        submit_lazy(c, true, Box::new(|| 0));
+        assert!(is_compute(c) && !is_compute(g) && !is_compute(0x7410_0075));
+        for p in [g, c] {
+            let _ = released(p);
+        }
     }
 
     /// Once the frame's budget is spent a compute pipeline still building is not waited for
