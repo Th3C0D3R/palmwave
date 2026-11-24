@@ -104,9 +104,9 @@ pub struct VsInterface {
     pub outputs: Vec<SigElement>,
     /// first attribute VGPR: 4 (hardware VS) or 9 (ES variant)
     pub attr_base: u64,
-    /// the OSG1 register of each `exp param N` from the console's table (`vs_output_table`;
-    /// None: the N-th distinct register)
-    pub params: Option<Vec<u32>>,
+    /// what each `exp param N` writes, from the console's table (`vs_output_table`; None: the
+    /// N-th distinct register)
+    pub params: Option<Vec<OutParam>>,
 }
 
 impl VsInterface {
@@ -151,6 +151,9 @@ pub struct MsInterface {
     pub threads: u32,
     pub max_vertices: u32,
     pub max_primitives: u32,
+    /// what each `exp param N` writes, from the console's table (`vs_output_table`; None: the
+    /// N-th distinct register)
+    pub params: Option<Vec<OutParam>>,
 }
 
 /// dwords before the vertices of a mesh record: vertex count, primitive count, 2 spare
@@ -215,6 +218,7 @@ impl GsInterface {
             threads: 64,
             max_vertices: (GS_PRIMS_PER_GROUP * mvc).clamp(1, 256),
             max_primitives: (GS_PRIMS_PER_GROUP * mvc.saturating_sub(2).max(1)).clamp(1, 256),
+            params: None,
         }
     }
 }
@@ -352,13 +356,20 @@ pub struct PsAttr {
     pub register: u8,
     pub mask: u8,
     pub flat: bool,
+    /// an fp16 attribute (`OutParam::fp16`): the register in the halves of its channels 2 and
+    /// 3 (`register` itself when the attribute holds that one alone)
+    pub second: Option<u8>,
 }
 
 /// The PS input table of an FSSM: SPI_PS_INPUT_ENA and, per `v_interp attrN`, the register it
 /// reads. 32 records of 8 bytes at +0x130 (+ the sub-version shift): kind, register, component
-/// mask, attribute number, 0, 0, register again, 1 flat / 2 interpolated; then the record count
-/// (+0x100) and SPI_PS_INPUT_ENA (+0x110). Checked on every cached PS of three titles (472, 34,
-/// 1): consistent, and covering every attribute the code reads.
+/// mask, attribute number, 0, the second register of an fp16 attribute (else 0), the place of
+/// the attribute in the stage before + 1 (the register, where that stage exports its
+/// registers in order, one param each), flags – 1 flat, 2 interpolated, 0x18 fp16; then the
+/// record count (+0x100) and SPI_PS_INPUT_ENA (+0x110). Checked on every cached PS of three
+/// titles (472, 34, 1): consistent, and covering every attribute the code reads; the fp16 form
+/// on the 47 pixel shaders with float16 inputs of a fourth title's world frame (88 such
+/// attributes: the halves the code reads are those of the components the signature marks read).
 pub fn ps_input_table(fssm: &[u8]) -> Option<(u32, Vec<PsAttr>)> {
     let base = 0x130 + fssm_shift(fssm)?;
     let rd = |o: usize| fssm.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
@@ -369,20 +380,37 @@ pub fn ps_input_table(fssm: &[u8]) -> Option<(u32, Vec<PsAttr>)> {
     let mut out = Vec::with_capacity(n);
     for k in 0..n {
         let r = fssm.get(base + 8 * k..base + 8 * k + 8)?;
-        if r[3] as usize != k || r[4] != 0 || r[5] != 0 || r[6] != r[1] {
+        let fp16 = r[7] & 0x18 != 0;
+        if r[3] as usize != k || r[4] != 0 || !matches!(r[7] & !0x18, 1 | 2) || (!fp16 && r[5] != 0) {
             return None;
         }
-        out.push(PsAttr { kind: r[0], register: r[1], mask: r[2], flat: r[7] == 1 });
+        out.push(PsAttr { kind: r[0], register: r[1], mask: r[2], flat: r[7] & 3 == 1, second: fp16.then_some(r[5]) });
     }
     Some((ena, out))
 }
 
-/// The VS output table of an FSSM: per `exp param N`, the OSG1 register it writes. 32 records
-/// of 6 bytes at +0x1D4 (+ the sub-version shift): kind (6 user, 0 position), register, param
-/// number, 0, 0, 0; the record count after them (+0xC0). Usually param N = the N-th output
-/// register, but not always (a Fortnite VS exports its SV_Position register as a param).
-/// Checked on every cached VS of three titles (984, 13, 1).
-pub fn vs_output_table(fssm: &[u8]) -> Option<Vec<u32>> {
+/// What one `exp param` of a VS or an MS writes (`vs_output_table`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutParam {
+    /// the OSG1 register
+    pub register: u32,
+    /// The console's FP16 parameter form: a channel holds two float16 values, its low and its
+    /// high half, so the param carries eight – the components of `register` in channels 0 and
+    /// 1 (x | y << 16, z | w << 16) and, in channels 2 and 3, those of the float16 register
+    /// after it when the table gives that one no param of its own. The pixel shader reads the
+    /// halves with `v_interp_*_f16` (`high`: the upper one).
+    pub fp16: bool,
+}
+
+/// The VS output table of an FSSM (an MS has it too): per `exp param N`, the OSG1 register it
+/// writes. 32 records of 6 bytes at +0x1D4 (+ the sub-version shift): kind (6 user, 7 a clip
+/// distance, 0 position), register, param number, then 0, 0, 0 or – an fp16 param
+/// (`OutParam::fp16`) – the register again, 0, 3; the record count after them (+0xC0). Usually
+/// param N = the N-th output register, but not always (a Fortnite VS exports its SV_Position
+/// register as a param; a title's mesh programs export the register of SV_ClipDistance as
+/// param 0 and pair their float16 registers). Checked on every cached VS of three titles (984,
+/// 13, 1) and on the 82 mesh programs of a fourth title's world frame (41 with fp16 params).
+pub fn vs_output_table(fssm: &[u8]) -> Option<Vec<OutParam>> {
     let base = 0x1D4 + fssm_shift(fssm)?;
     let n = fssm.get(base + 0xC0..base + 0xC4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))? as usize;
     if n > 32 {
@@ -391,12 +419,37 @@ pub fn vs_output_table(fssm: &[u8]) -> Option<Vec<u32>> {
     let mut out = Vec::with_capacity(n);
     for k in 0..n {
         let r = fssm.get(base + 6 * k..base + 6 * k + 6)?;
-        if r[2] as usize != k || r[3..6] != [0, 0, 0] {
+        let fp16 = r[3..6] == [r[1], 0, 3];
+        if r[2] as usize != k || (!fp16 && r[3..6] != [0, 0, 0]) {
             return None;
         }
-        out.push(r[1] as u32);
+        out.push(OutParam { register: r[1] as u32, fp16 });
     }
     Some(out)
+}
+
+/// What `exp param N` of a program with these outputs writes: the console's table, else the
+/// N-th distinct register.
+pub fn out_param(outputs: &[SigElement], params: Option<&[OutParam]>, n: usize) -> Option<OutParam> {
+    match params {
+        Some(t) => t.get(n).copied(),
+        None => param_registers(outputs, true).get(n).map(|&register| OutParam { register, fp16: false }),
+    }
+}
+
+/// The register in channels 2 and 3 of the fp16 param of `register` (`OutParam::fp16`): the
+/// float16 register after it, unless the table gives that one a param of its own.
+pub fn fp16_second(outputs: &[SigElement], params: Option<&[OutParam]>, register: u32) -> Option<u32> {
+    let next = register + 1;
+    let own = params.is_some_and(|t| t.iter().any(|p| p.register == next));
+    (!own && outputs.iter().any(|e| e.register == next && e.component_type == 6)).then_some(next)
+}
+
+/// Where half `half` (1: the upper one) of channel `chan` of the fp16 param of `register`
+/// goes (`OutParam::fp16`): the elements (places in `ranked(outputs, true)`) and the component.
+pub fn fp16_places(outputs: &[SigElement], params: Option<&[OutParam]>, register: u32, chan: usize, half: usize) -> (Vec<usize>, usize) {
+    let r = if chan < 2 { Some(register) } else { fp16_second(outputs, params, register) };
+    (r.map(|r| elements_at(outputs, true, r)).unwrap_or_default(), 2 * (chan % 2) + half)
 }
 
 /// The register `v_interp attr` reads: the console's table, else the attr-th distinct register.
@@ -415,21 +468,31 @@ pub fn ps_attribute_slot(ps: &PsInterface, attr: usize, chan: usize) -> Option<u
     all.iter().position(|e| e.register == r && e.mask >> chan & 1 == 1).or_else(|| all.iter().position(|e| e.register == r))
 }
 
+/// The place in `ranked(inputs, false)` and the component there of half `high` (1: the upper
+/// one) of channel `chan` of attribute `attr`, as `v_interp_*_f16` reads it: of an fp16
+/// attribute (`OutParam::fp16`) the component of the register the half belongs to; of any
+/// other, channel `chan` (`ps_attribute_slot`).
+pub fn ps_attribute_half(ps: &PsInterface, attr: usize, chan: usize, high: usize) -> Option<(usize, usize)> {
+    let Some((a, second)) = ps.attrs.as_ref().and_then(|t| t.get(attr)).and_then(|a| Some((a, a.second?))) else {
+        return ps_attribute_slot(ps, attr, chan).map(|slot| (slot, chan));
+    };
+    let (r, comp) = (if chan < 2 { a.register } else { second } as u32, 2 * (chan % 2) + high);
+    let all = ranked(&ps.inputs, false);
+    all.iter().position(|e| e.register == r && e.mask >> comp & 1 == 1).or_else(|| all.iter().position(|e| e.register == r)).map(|slot| (slot, comp))
+}
+
 /// The attribute the input at `slot` of `ranked(inputs, false)` belongs to (None: not read).
 pub fn ps_slot_attribute(ps: &PsInterface, slot: usize) -> Option<usize> {
     let r = ranked(&ps.inputs, false).get(slot)?.register;
     match &ps.attrs {
-        Some(t) => t.iter().position(|a| a.register as u32 == r),
+        Some(t) => t.iter().position(|a| a.register as u32 == r || a.second.is_some_and(|s| s as u32 == r)),
         None => param_registers(&ps.inputs, false).iter().position(|&x| x == r),
     }
 }
 
 /// The register `exp param N` of a VS writes: the console's table, else the N-th distinct one.
 pub fn vs_param_register(vs: &VsInterface, n: usize) -> Option<u32> {
-    match &vs.params {
-        Some(t) => t.get(n).copied(),
-        None => param_registers(&vs.outputs, true).get(n).copied(),
-    }
+    out_param(&vs.outputs, vs.params.as_deref(), n).map(|p| p.register)
 }
 
 /// Hardware order and VGPR sizes of the PS inputs enabled in SPI_PS_INPUT_ENA (bit → size):
@@ -476,6 +539,7 @@ pub fn interface(blob: &[u8], sh: &super::xbox::XboxShader, f: &super::xbox::Fss
                 threads,
                 max_vertices: (p.ms_max_vertices as u32).clamp(1, 256),
                 max_primitives: (p.ms_max_primitives as u32).clamp(1, 256),
+                params: vs_output_table(&f.data),
             }))
         }
         _ => None,
@@ -1541,8 +1605,111 @@ mod attribute_tests {
         f[0x10] = 5;
         f[0x1D4..0x1D4 + 18].copy_from_slice(&[6, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 6, 2, 2, 0, 0, 0]);
         f[0x1D4 + 0xC0] = 3;
-        assert_eq!(vs_output_table(&f), Some(vec![0, 1, 2]));
+        assert_eq!(vs_output_table(&f), Some([0, 1, 2].map(|register| OutParam { register, fp16: false }).to_vec()));
         f[0x1D4 + 8] = 7;
         assert_eq!(vs_output_table(&f), None);
+    }
+
+    /// The console's FP16 parameter form, as a title's deferred shaders have it: float16
+    /// registers go two to a param, halves x | y << 16, z | w << 16 of the first in channels 0
+    /// and 1 and of the second in 2 and 3 (one alone: channels 0 and 1). The tables say which:
+    /// the output table repeats the register and ends in 3, the PS input table names the second
+    /// register and has 0x18 in its flags – and after such a pair the attribute numbers and the
+    /// registers no longer run together.
+    #[test]
+    fn fp16_params_and_attributes_from_the_tables() {
+        let f16 = |name: &str, index: u32, register: u32, mask: u8| SigElement { component_type: 6, mask, ..input(name, index, register, mask) };
+        let mut uv = input("TEXCOORD", 0, 3, 3);
+        uv.mask = 3;
+        let mut pos = input("SV_Position", 0, 0, 0);
+        pos.system_value = 1;
+        let sig = vec![pos, input("COLOR", 0, 1, 0xF), input("COLOR", 1, 2, 0xF), uv, f16("TEXCOORD", 1, 4, 7), f16("TEXCOORD", 4, 5, 0xF), input("TEXCOORD", 3, 6, 7), f16("TEXCOORD", 7, 7, 7)];
+        // the output table (sub-version 6): registers 1, 2, 3, the pair 4 + 5, 6, and 7 alone
+        let mut f = vec![0u8; 0x400];
+        f[0x10] = 6;
+        let rows: [[u8; 6]; 6] = [[6, 1, 0, 0, 0, 0], [6, 2, 1, 0, 0, 0], [6, 3, 2, 0, 0, 0], [6, 4, 3, 4, 0, 3], [6, 6, 4, 0, 0, 0], [6, 7, 5, 7, 0, 3]];
+        f[0x1DC..0x1DC + 36].copy_from_slice(&rows.concat());
+        f[0x1DC + 0xC0] = 6;
+        let params = vs_output_table(&f).unwrap();
+        assert_eq!(params.iter().map(|p| (p.register, p.fp16)).collect::<Vec<_>>(), [(1, false), (2, false), (3, false), (4, true), (6, false), (7, true)]);
+        assert_eq!(out_param(&sig, Some(&params), 4), Some(OutParam { register: 6, fp16: false }));
+        // without the table param 4 was the fifth register: TEXCOORD4's, half of the pair
+        assert_eq!(out_param(&sig, None, 4), Some(OutParam { register: 5, fp16: false }));
+        assert_eq!((fp16_second(&sig, Some(&params), 4), fp16_second(&sig, Some(&params), 7), fp16_second(&sig, Some(&params), 6)), (Some(5), None, None));
+        let all = ranked(&sig, true);
+        let place = |register: u32, chan: usize, half: usize| {
+            let (at, comp) = fp16_places(&sig, Some(&params), register, chan, half);
+            (at.iter().map(|&j| all[j].semantic()).collect::<Vec<_>>().join("+"), comp)
+        };
+        assert_eq!((place(4, 0, 0), place(4, 0, 1), place(4, 1, 0), place(4, 1, 1)), (("TEXCOORD1".into(), 0), ("TEXCOORD1".into(), 1), ("TEXCOORD1".into(), 2), ("TEXCOORD1".into(), 3)));
+        assert_eq!((place(4, 2, 0), place(4, 2, 1), place(4, 3, 0), place(4, 3, 1)), (("TEXCOORD4".into(), 0), ("TEXCOORD4".into(), 1), ("TEXCOORD4".into(), 2), ("TEXCOORD4".into(), 3)));
+        assert_eq!((place(7, 1, 0), place(7, 2, 0)), (("TEXCOORD7".into(), 2), (String::new(), 0)));
+        // a row that is neither form: no table
+        f[0x1DC + 4] = 1;
+        assert_eq!(vs_output_table(&f), None);
+
+        // the PS input table of the same registers: attribute 3 is the pair, 4 is register 6
+        let mut f = vec![0u8; 0x400];
+        f[0x10] = 6;
+        let rows: [[u8; 8]; 6] = [[6, 1, 15, 0, 0, 0, 1, 2], [6, 2, 15, 1, 0, 0, 2, 2], [6, 3, 3, 2, 0, 0, 3, 2], [6, 4, 3, 3, 0, 5, 4, 0x1A], [6, 6, 7, 4, 0, 0, 5, 1], [6, 7, 3, 5, 0, 7, 6, 0x1A]];
+        f[0x138..0x138 + 48].copy_from_slice(&rows.concat());
+        f[0x138 + 0x100] = 6;
+        f[0x138 + 0x110] = 2;
+        let (ena, attrs) = ps_input_table(&f).unwrap();
+        assert_eq!((ena, attrs[3].register, attrs[3].second, attrs[4].register, attrs[4].second, attrs[4].flat, attrs[5].second), (2, 4, Some(5), 6, None, true, Some(7)));
+        let ps = PsInterface { inputs: sig.clone(), attrs: Some(attrs), ..Default::default() };
+        let all = ranked(&ps.inputs, false);
+        let half = |attr: usize, chan: usize, high: usize| ps_attribute_half(&ps, attr, chan, high).map(|(slot, comp)| (all[slot].semantic(), comp));
+        assert_eq!((half(3, 0, 1), half(3, 1, 0)), (Some(("TEXCOORD1".into(), 1)), Some(("TEXCOORD1".into(), 2))));
+        assert_eq!((half(3, 2, 0), half(3, 3, 1)), (Some(("TEXCOORD4".into(), 0)), Some(("TEXCOORD4".into(), 3))));
+        assert_eq!((half(5, 1, 0), half(4, 2, 0)), (Some(("TEXCOORD7".into(), 2)), Some(("TEXCOORD3".into(), 2))));
+        assert_eq!(all[ps_attribute_slot(&ps, 4, 0).unwrap()].semantic(), "TEXCOORD3");
+        // both registers of the pair are read through attribute 3
+        let slot = |semantic: &str| all.iter().position(|e| e.semantic() == semantic).unwrap();
+        assert_eq!((ps_slot_attribute(&ps, slot("TEXCOORD1")), ps_slot_attribute(&ps, slot("TEXCOORD4")), ps_slot_attribute(&ps, slot("TEXCOORD3"))), (Some(3), Some(3), Some(4)));
+        // a second register without the fp16 flags: no table
+        f[0x138 + 8 * 4 + 5] = 9;
+        assert_eq!(ps_input_table(&f), None);
+    }
+
+    /// A VS with an fp16 param writes every half to its element as a float, and a pixel shader
+    /// interpolates its float16 inputs (they were declared `nointerpolation`, like integers).
+    #[test]
+    fn fp16_params_in_the_generated_stages() {
+        use crate::gpu::rdna2::encode;
+        let f16 = |name: &str, index: u32, register: u32| SigElement { component_type: 6, mask: 0xF, ..input(name, index, register, 0xF) };
+        let mut pos = input("SV_Position", 0, 0, 0);
+        pos.system_value = 1;
+        let sig = vec![pos, f16("NORMAL", 0, 1), f16("TANGENT", 0, 2), input("TEXCOORD", 0, 3, 0xF)];
+        let params = vec![OutParam { register: 1, fp16: true }, OutParam { register: 3, fp16: false }];
+        let mut code = encode("EXP", "ENC_EXP", &[("TGT", 32), ("EN", 0xB), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7)], None).unwrap();
+        code.extend(encode("EXP", "ENC_EXP", &[("TGT", 33), ("EN", 1), ("VSRC0", 8)], None).unwrap());
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let vs = VsInterface { outputs: sig.clone(), attr_base: 4, params: Some(params), ..Default::default() };
+        let t = translate(&code, &Options { mode: Mode::Vertex(vs), ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        for want in ["xo.p0[0] = f16tof32((v4 & 0xFFFFu));", "xo.p0[3] = f16tof32((v5 >> 16));", "xo.p1[3] = f16tof32((v7 >> 16));", "xo.p2[0] = asfloat(v8);"] {
+            assert!(t.hlsl.contains(want), "{want}\n{}", t.hlsl);
+        }
+        // channel 2 is not enabled: TANGENT.xy are not written
+        assert!(!t.hlsl.contains("xo.p1[0]"), "{}", t.hlsl);
+
+        let attrs = vec![PsAttr { kind: 6, register: 1, mask: 3, flat: false, second: Some(2) }, PsAttr { kind: 6, register: 3, mask: 0xF, flat: false, second: None }];
+        let mut target = input("SV_Target", 0, 0, 0xF);
+        target.system_value = 64;
+        let ps = PsInterface { inputs: sig, outputs: vec![target], input_ena: 2, attrs: Some(attrs) };
+        // v_interp_p2_f16 v2 = attr0.w, the high half: TANGENT.w
+        let mut code = encode("V_INTERP_P2_F16", "ENC_VOP3", &[("VDST", 2), ("SRC0", 3 << 6 | 1 << 8), ("SRC1", 256 + 1), ("SRC2", 256 + 2)], None).unwrap();
+        code.extend(encode("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 1), ("VSRC0", 2), ("DONE", 1), ("VM", 1)], None).unwrap());
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let t = translate(&code, &Options { mode: Mode::Pixel(ps.clone()), ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        assert!(t.hlsl.contains("(float)xi.a1[3]"), "{}", t.hlsl);
+        assert!(t.hlsl.contains("\n     float4 a0 : NORMAL0;\n     float4 a1 : TANGENT0;\n"), "{}", t.hlsl);
+        // a 32-bit read of the pair is no value the console has: refused, not guessed
+        let mut code = encode("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 2), ("VSRC", 1), ("ATTR", 0), ("ATTRCHAN", 0)], None).unwrap();
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let t = translate(&code, &Options { mode: Mode::Pixel(ps), ..Default::default() }).unwrap();
+        assert_eq!(t.unsupported_why.keys().collect::<Vec<_>>(), ["v_interp_p2_f32: 32-bit interpolation of an fp16 attribute"]);
     }
 }

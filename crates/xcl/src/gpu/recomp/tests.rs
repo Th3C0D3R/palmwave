@@ -3334,7 +3334,7 @@ fn gpu_mesh_mode_two_passes() {
         rw_mask: 0xF,
         stream: 0,
     };
-    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0), sig("TEXCOORD", 0, 1)], threads: 128, max_vertices: 128, max_primitives: 128 };
+    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0), sig("TEXCOORD", 0, 1)], threads: 128, max_vertices: 128, max_primitives: 128, params: None };
     let exp = |tgt: u64, en: u64, v: [u64; 4], done: u64| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
         ("EXP", "ENC_EXP", vec![("TGT", tgt), ("EN", en), ("VSRC0", v[0]), ("VSRC1", v[1]), ("VSRC2", v[2]), ("VSRC3", v[3]), ("DONE", done)], None)
     };
@@ -3424,7 +3424,7 @@ fn gpu_mesh_mode_every_thread_exports_its_vertex_and_triangle() {
     }
     use super::{dxc, mesh_passthrough, MsInterface, MESH_HEADER};
     let pos = crate::gpu::dxbc::SigElement { name: "SV_Position".into(), index: 0, system_value: 1, component_type: 3, register: 0, mask: 0xF, rw_mask: 0xF, stream: 0 };
-    let ms = MsInterface { outputs: vec![pos], threads: 128, max_vertices: 128, max_primitives: 128 };
+    let ms = MsInterface { outputs: vec![pos], threads: 128, max_vertices: 128, max_primitives: 128, params: None };
     let exp = |tgt: u64, en: u64, v: [u64; 4]| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
         ("EXP", "ENC_EXP", vec![("TGT", tgt), ("EN", en), ("VSRC0", v[0]), ("VSRC1", v[1]), ("VSRC2", v[2]), ("VSRC3", v[3]), ("DONE", 1)], None)
     };
@@ -3505,7 +3505,7 @@ fn mesh_split_accounts_vertex_chunks() {
         outputs.push(sig("TEXCOORD", 0, k + 1, k));
     }
     outputs.push(sig("SV_ClipDistance", 2, 21, 0));
-    let ms = MsInterface { outputs, threads: 128, max_vertices: 128, max_primitives: 128 };
+    let ms = MsInterface { outputs, threads: 128, max_vertices: 128, max_primitives: 128, params: None };
     let elems = passthrough_elements(&ms, None);
     assert_eq!(elems, 21);
     // 22 rows * 16 B = 352 B/vertex: 64 accounted vertices fit (96 would be 33792 B), so at
@@ -3562,7 +3562,7 @@ fn mesh_layout_independent_of_group_count() {
     }
     outputs.push(sig("SV_ClipDistance", 2, 21, 0));
     // 22 rows * 16 B = 352 B/vertex: 64 accounted vertices fit; 80 declared do not
-    let ms = MsInterface { outputs, threads: 128, max_vertices: 80, max_primitives: 1 };
+    let ms = MsInterface { outputs, threads: 128, max_vertices: 80, max_primitives: 1, params: None };
     let elems = passthrough_elements(&ms, None);
     assert_eq!(elems, 21);
     // one triangle: its 3 copies fit one compact group, so the dispatch count is 1
@@ -3818,7 +3818,7 @@ fn gpu_mesh_mode_reads_memory_windows() {
         rw_mask: 0xF,
         stream: 0,
     };
-    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0)], threads: 64, max_vertices: 64, max_primitives: 64 };
+    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0)], threads: 64, max_vertices: 64, max_primitives: 64, params: None };
     let list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
         ("V_MBCNT_LO_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", 128)], None),
         ("V_MBCNT_HI_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", V)], None), // thread
@@ -6378,7 +6378,7 @@ fn far_jumps_are_direct_branches() {
 /// programs with cross-half operations included; native wave64 and wave32 programs unchanged.
 #[test]
 fn mesh_split_wave64_form() {
-    let ms = super::MsInterface { threads: 128, max_vertices: 64, max_primitives: 64, outputs: vec![] };
+    let ms = super::MsInterface { threads: 128, max_vertices: 64, max_primitives: 64, outputs: vec![], params: None };
     let lane = prog(&[("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V)], None)]);
     let branch = prog(&[("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 0)], None)]);
     for code in [&lane, &branch] {
@@ -8569,4 +8569,116 @@ fn retail_mesh_programs_keep_vertices_with_their_threads() {
     }
     println!("{ran} programs, {} without a layout, {} wrong: {wrong:?}; stopped at {faulted:?}", unknown.len(), wrong.len());
     assert!(wrong.is_empty());
+}
+
+/// The console's FP16 parameter form from a mesh program to a pixel shader (`OutParam::fp16`),
+/// as a title's deferred passes have it: param 0 carries the float16 registers 1 and 2 as
+/// halves (A.x | A.y << 16, A.z | A.w << 16, B.x | B.y << 16, B.z | B.w << 16), param 1 the
+/// float32 register 3; the pixel shader reads the halves with `v_interp_p2_f16` (`high`: the
+/// upper one) through attribute 0 and register 3 through attribute 1. A.x is the position's x
+/// and B.z the vertex number, so both must come out interpolated across the triangle.
+/// Without the tables' fp16 rows param 0 was written to register 1 as it is (two halves read
+/// as one float), param 1 to register 2, and the float16 inputs were not interpolated.
+#[test]
+fn gpu_mesh_fp16_params_reach_the_pixel_shader() {
+    if !gpu_ready() || !mesh_ready() {
+        return;
+    }
+    use super::{dxc, MsInterface, OutParam, PsAttr, PsInterface, MESH_HEADER};
+    let outputs = vec![el("SV_Position", 0, 1, 3, 0, 0xF), el("TEXCOORD", 0, 0, 6, 1, 0xF), el("TEXCOORD", 1, 0, 6, 2, 0xF), el("TEXCOORD", 2, 0, 3, 3, 0xF)];
+    let ms = MsInterface { outputs: outputs.clone(), threads: 128, max_vertices: 128, max_primitives: 128, params: Some(vec![OutParam { register: 1, fp16: true }, OutParam { register: 3, fp16: false }]) };
+    let lit = |vdst: u64, x: f32| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) { ("V_MOV_B32", "ENC_VOP1", vec![("VDST", vdst), ("SRC0", 255)], Some(f(x))) };
+    let pack = |vdst: u64, lo: u64, hi: u64| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) { ("V_CVT_PKRTZ_F16_F32", "ENC_VOP2", vec![("VDST", vdst), ("SRC0", V + lo), ("VSRC1", hi)], None) };
+    let exp = |tgt: u64, en: u64, v: [u64; 4], done: u64| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
+        ("EXP", "ENC_EXP", vec![("TGT", tgt), ("EN", en), ("VSRC0", v[0]), ("VSRC1", v[1]), ("VSRC2", v[2]), ("VSRC3", v[3]), ("DONE", done)], None)
+    };
+    let list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
+        ("S_BFE_U32", "ENC_SOP2", vec![("SDST", 0), ("SSRC0", 3), ("SSRC1", 255)], Some(0x40018)), // wave index
+        ("V_MBCNT_LO_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", 128)], None),
+        ("V_MBCNT_HI_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", V)], None),
+        ("V_LSHL_ADD_U32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 0), ("SRC1", 134), ("SRC2", V)], None), // thread in group
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 124), ("SSRC0", 255)], Some(1 << 12 | 3)), // 1 primitive, 3 vertices
+        ("S_SENDMSG", "ENC_SOPP", vec![("SIMM16", 9)], None),
+        ("S_BARRIER", "ENC_SOPP", vec![], None),
+        ("V_CMPX_GT_U32", "ENC_VOPC", vec![("SRC0", 131), ("VSRC1", 0)], None), // threads 0..2
+        ("BUFFER_LOAD_DWORDX4", "ENC_MUBUF", vec![("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("V_CVT_F32_U32", "ENC_VOP1", vec![("VDST", 15), ("SRC0", V)], None), // the vertex number
+        lit(20, 0.25),
+        lit(21, 0.5),
+        lit(22, 0.75),
+        lit(23, 1.0),
+        lit(24, 2.0),
+        lit(25, 4.0),
+        lit(26, 8.0),
+        lit(27, 0.0),
+        pack(30, 10, 20), // A = (pos.x, 0.25, 0.5, 0.75)
+        pack(31, 21, 22),
+        pack(32, 23, 24), // B = (1, 2, vertex, 4)
+        pack(33, 15, 25),
+        exp(12, 0xF, [10, 11, 12, 13], 1),
+        exp(32, 0xF, [30, 31, 32, 33], 0),
+        exp(33, 0xF, [26, 15, 27, 23], 0), // C = (8, vertex, 0, 1)
+        ("S_MOV_B64", "ENC_SOP1", vec![("SDST", 126), ("SSRC0", 193)], None),
+        ("V_CMPX_EQ_U32", "ENC_VOPC", vec![("SRC0", 128), ("VSRC1", 0)], None), // thread 0
+        ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 21), ("SRC0", 255)], Some(1 << 10 | 2 << 20)),
+        exp(20, 1, [21, 0, 0, 0], 1),
+    ];
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    let t = translate(&prog(&refs), &on_gpu(Options { mode: Mode::Mesh(ms.clone()), wave64: true, ..Default::default() })).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let cs = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+
+    // the pixel shader: attribute 0 = registers 1 + 2 (fp16), attribute 1 = register 3
+    let psi = PsInterface {
+        inputs: outputs,
+        outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
+        input_ena: 0x302,
+        attrs: Some(vec![PsAttr { kind: 6, register: 1, mask: 3, flat: false, second: Some(2) }, PsAttr { kind: 6, register: 3, mask: 0xF, flat: false, second: None }]),
+    };
+    // (attribute 0's channel, high half) into v4..v7: A.x, A.w, B.z, B.y
+    let halves = [(0u64, 0u64), (1, 1), (3, 0), (2, 1)];
+    let mut ps_list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = Vec::new();
+    for (k, (chan, high)) in halves.into_iter().enumerate() {
+        let (v, attr) = (4 + k as u64, chan << 6 | high << 8);
+        ps_list.push(("V_INTERP_P1LL_F16", "ENC_VOP3", vec![("VDST", v), ("SRC0", attr), ("SRC1", V)], None));
+        ps_list.push(("V_INTERP_P2_F16", "ENC_VOP3", vec![("VDST", v), ("SRC0", attr), ("SRC1", V + 1), ("SRC2", V + v)], None));
+        ps_list.push(("V_CVT_F32_F16", "ENC_VOP1", vec![("VDST", v), ("SRC0", V + v)], None));
+    }
+    ps_list.push(("V_INTERP_P1_F32", "ENC_VINTRP", vec![("VDST", 8), ("VSRC", 0), ("ATTR", 1), ("ATTRCHAN", 0)], None));
+    ps_list.push(("V_INTERP_P2_F32", "ENC_VINTRP", vec![("VDST", 8), ("VSRC", 1), ("ATTR", 1), ("ATTRCHAN", 0)], None));
+    ps_list.push(("V_ADD_F32", "ENC_VOP2", vec![("VDST", 7), ("SRC0", V + 8), ("VSRC1", 7)], None)); // B.y + C.x
+    ps_list.push(("EXP", "ENC_EXP", vec![("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1), ("VM", 1)], None));
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = ps_list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    let pt = translate(&prog(&refs), &Options { mode: Mode::Pixel(psi.clone()), wave64: true, ..Default::default() }).unwrap();
+    assert!(pt.complete(), "{:?}", pt.unsupported_why);
+    let ps = dxc::compile(&pt.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", pt.hlsl));
+    let pass = super::emit::mesh_passthrough_for(&ms, Some(&psi.inputs));
+    let msb = dxc::compile(&pass, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass}"));
+
+    // one triangle over the whole target; vertex table at byte 0x100, V# in s[16:19]
+    let corners = [(-1.0f32, -1.0f32), (-1.0, 3.0), (3.0, -1.0)];
+    let mut mem = vec![0u32; 256];
+    for (i, (x, y)) in corners.iter().enumerate() {
+        mem[0x40 + 4 * i..0x40 + 4 * i + 4].copy_from_slice(&[f(*x), f(*y), f(0.0), f(1.0)]);
+    }
+    let mut sg = vec![0u32; 128];
+    sg[16..20].copy_from_slice(&[0x100, 16 << 16, 3, 0]);
+    let (px, rec) = runner::mesh_draw(&cs, &msb, &ps, 1, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
+    // the record: every element's slot holds its register's components as float32
+    let vd = ms.vert_dwords();
+    assert_eq!((rec[0], rec[1]), (3, 1), "GS_ALLOC_REQ counts");
+    for (v, corner) in corners.iter().enumerate() {
+        let b = MESH_HEADER + v * vd;
+        let slot = |k: usize| -> Vec<f32> { rec[b + 4 * k..b + 4 * k + 4].iter().map(|&x| f32::from_bits(x)).collect() };
+        assert_eq!(slot(1), [corner.0, 0.25, 0.5, 0.75], "vertex {v}: register 1, the low pair of param 0's channels");
+        assert_eq!(slot(2), [1.0, 2.0, v as f32, 4.0], "vertex {v}: register 2, channels 2 and 3 of param 0");
+        assert_eq!(slot(3), [8.0, v as f32, 0.0, 1.0], "vertex {v}: register 3, param 1");
+    }
+    // the pixels: (A.x, A.w, B.z, B.y + C.x) = (x, 0.75, weight of vertex 1 + 2 · weight of vertex 2, 10)
+    for (x, y) in [(2usize, 2usize), (16, 5), (5, 16), (29, 29), (30, 1), (1, 30)] {
+        let (nx, ny) = ((x as f32 + 0.5) / 16.0 - 1.0, 1.0 - (y as f32 + 0.5) / 16.0);
+        let want = [nx, 0.75, (ny + 1.0) / 4.0 + (nx + 1.0) / 2.0, 10.0];
+        let got = px[y * 32 + x];
+        assert!(got.iter().zip(want).all(|(a, b)| (a - b).abs() < 4e-3), "pixel ({x},{y}) = {got:?}, expected {want:?}");
+    }
 }

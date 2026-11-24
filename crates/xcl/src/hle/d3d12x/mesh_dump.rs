@@ -252,7 +252,7 @@ mod tests {
     /// the vertex count; vertex 2 is all zero and vertex 3 has no finite position.
     #[test]
     fn a_record_is_read_as_the_pass_through_reads_it() {
-        let ms = MsInterface { outputs: Vec::new(), threads: 8, max_vertices: 8, max_primitives: 8 };
+        let ms = MsInterface { outputs: Vec::new(), threads: 8, max_vertices: 8, max_primitives: 8, params: None };
         let mut r = vec![0u32; 2 * ms.record_dwords()];
         r[0] = 4;
         r[1] = 3;

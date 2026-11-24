@@ -3,8 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use super::{elements_at, param_registers, ps_attribute_slot, ps_input_vgpr, ps_slot_attribute, ranked, vs_param_register, Mode, MsInterface, Options, KERNEL_EXPORTS, KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_SPLIT_MAGIC, KERNEL_SPLIT_SGPRS, KERNEL_VGPRS, MESH_HEADER};
+use super::{elements_at, fp16_places, out_param, ps_attribute_half, ps_attribute_slot, ps_input_vgpr, ps_slot_attribute, ranked, Mode, MsInterface, Options, KERNEL_EXPORTS, KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_SPLIT_MAGIC, KERNEL_SPLIT_SGPRS, KERNEL_VGPRS, MESH_HEADER};
 use super::upper_lanes::Read;
+use super::OutParam;
 use crate::gpu::dxbc::SigElement;
 use crate::gpu::rdna2::{self, Decoded, Encoding, Operand, Variant};
 
@@ -1767,6 +1768,19 @@ impl Em {
         }
     }
 
+    /// The halves of the enabled channels of an fp16 param (`OutParam::fp16`): the elements
+    /// (places in `ranked(outputs, true)`) and the component each is, and its 16 bits.
+    fn fp16_halves(outputs: &[SigElement], params: Option<&[OutParam]>, register: u32, en: u64, srcs: &[String]) -> Vec<(Vec<usize>, usize, String)> {
+        let mut out = Vec::new();
+        for chan in (0..4).filter(|c| en >> c & 1 == 1) {
+            for half in 0..2 {
+                let (at, comp) = fp16_places(outputs, params, register, chan, half);
+                out.push((at, comp, if half == 0 { format!("({} & 0xFFFFu)", srcs[chan]) } else { format!("({} >> 16)", srcs[chan]) }));
+            }
+        }
+        out
+    }
+
     fn export_graphics(&mut self, d: &Decoded, en: u64, tgt: u64, compr: bool, srcs: &[String]) -> Result<(), &'static str> {
         let act = self.act();
         let done = rdna2::field_value(d.enc, &d.words, "DONE") == Some(1);
@@ -1785,8 +1799,21 @@ impl Em {
                 // param N is a register: channel c goes to component c of every element there
                 let k = (tgt - 32) as usize;
                 let params = ranked(&vs.outputs, true);
-                let at = vs_param_register(vs, k).map(|r| elements_at(&vs.outputs, true, r)).unwrap_or_default();
-                if at.is_empty() {
+                let p = out_param(&vs.outputs, vs.params.as_deref(), k);
+                if let Some(p) = p.filter(|p| p.fp16) {
+                    // an fp16 param: every half is a float16 component of an element
+                    if compr {
+                        return Err("fp16 param, compressed");
+                    }
+                    for (at, c, bits) in Self::fp16_halves(&vs.outputs, vs.params.as_deref(), p.register, en, srcs) {
+                        for j in at.into_iter().filter(|&j| c < out_comps(params[j])) {
+                            let comp = if out_comps(params[j]) == 1 { String::new() } else { format!("[{c}]") };
+                            st.push(format!("xo.p{j}{comp} = f16tof32({bits});"));
+                        }
+                    }
+                }
+                let at = p.filter(|p| !p.fp16).map(|p| elements_at(&vs.outputs, true, p.register)).unwrap_or_default();
+                if at.is_empty() && st.is_empty() {
                     self.line("/* param without an OSG1 element (dummy) */");
                     return Ok(());
                 }
@@ -1845,8 +1872,21 @@ impl Em {
                 // param N is a register: its record slot is that of every element there (the
                 // pass-through reads an element's slot as the whole register, as for the GS)
                 let k = (tgt - 32) as usize;
-                let at = param_registers(&ms.outputs, true).get(k).map(|&r| elements_at(&ms.outputs, true, r)).unwrap_or_default();
-                if at.is_empty() {
+                let p = out_param(&ms.outputs, ms.params.as_deref(), k);
+                if let Some(p) = p.filter(|p| p.fp16) {
+                    // an fp16 param: every half is a float16 component of an element, and the
+                    // record holds float32 (what the pass-through hands to the pixel shader)
+                    if compr {
+                        return Err("fp16 param, compressed");
+                    }
+                    for (at, c, bits) in Self::fp16_halves(&ms.outputs, ms.params.as_deref(), p.register, en, srcs) {
+                        for j in at {
+                            st.push(format!("res.Store((xcl_vtx + {}u) * 4u, asuint(f16tof32({bits})));", 4 * (j + 1) + c));
+                        }
+                    }
+                }
+                let at = p.filter(|p| !p.fp16).map(|p| elements_at(&ms.outputs, true, p.register)).unwrap_or_default();
+                if at.is_empty() && st.is_empty() {
                     self.line("/* param without an OSG1 element (dummy) */");
                     return Ok(());
                 }
@@ -1872,25 +1912,36 @@ impl Em {
         Ok(())
     }
 
-    /// (vdst, I/J VGPR or interp_mov parameter, attribute, channel)
-    fn interp_fields(d: &Decoded) -> (u64, u64, u64, u64) {
+    /// (vdst, I/J VGPR or interp_mov parameter, attribute, channel, the channel's high half –
+    /// `high` of the 16-bit forms, the bit after the channel's)
+    fn interp_fields(d: &Decoded) -> (u64, u64, u64, u64, u64) {
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
         if d.enc.name == "ENC_VINTRP" {
-            (f("VDST"), f("VSRC"), f("ATTR"), f("ATTRCHAN"))
+            (f("VDST"), f("VSRC"), f("ATTR"), f("ATTRCHAN"), 0)
         } else {
             let s1 = f("SRC1");
-            (f("VDST"), if s1 >= 256 { s1 - 256 } else { s1 }, f("SRC0") & 0x3F, f("SRC0") >> 6 & 3)
+            (f("VDST"), if s1 >= 256 { s1 - 256 } else { s1 }, f("SRC0") & 0x3F, f("SRC0") >> 6 & 3, f("SRC0") >> 8 & 1)
         }
     }
 
     /// v_interp_*: attributes come interpolated from the PC rasteriser (PS mode).
     fn interp(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         let Mode::Pixel(ps) = &self.opt.mode else { return Err("interpolation outside PS") };
-        let (vdst, ij, attr, chan) = Self::interp_fields(d);
-        let Some(slot) = ps_attribute_slot(ps, attr as usize, chan as usize) else {
+        let (vdst, ij, attr, chan, high) = Self::interp_fields(d);
+        // the 16-bit forms read one half of the channel: of an fp16 attribute a component of
+        // its own (`OutParam::fp16`); the 32-bit forms read the channel, which such an
+        // attribute does not have as one value
+        let place = if name.ends_with("_f16") {
+            ps_attribute_half(ps, attr as usize, chan as usize, high as usize)
+        } else if ps.attrs.as_ref().and_then(|t| t.get(attr as usize)).is_some_and(|a| a.second.is_some()) {
+            return Err("32-bit interpolation of an fp16 attribute");
+        } else {
+            ps_attribute_slot(ps, attr as usize, chan as usize).map(|slot| (slot, chan as usize))
+        };
+        let Some((slot, comp)) = place else {
             return Err("attribute outside ISG1");
         };
-        let src = format!("xi.a{slot}[{chan}]");
+        let src = format!("xi.a{slot}[{comp}]");
         let act = self.act();
         match name {
             "v_interp_p1_f32" | "v_interp_p1ll_f16" | "v_interp_p1lv_f16" => {
@@ -4518,7 +4569,8 @@ impl Em {
                     // the mode of the attribute this input is read through (none: never read)
                     let attr = ps_slot_attribute(ps, k);
                     let mut m = attr.and_then(|a| self.ps_modes.get(&(a as u32))).cloned().unwrap_or_default();
-                    if e.component_type != 3 {
+                    // (float32 and float16 are interpolated)
+                    if !matches!(e.component_type, 3 | 6) {
                         m = "nointerpolation".into();
                     }
                     let _ = writeln!(h, "    {m} {}4 a{k} : {};", hlsl_type(e), e.semantic());
@@ -4825,7 +4877,7 @@ pub fn ps_attr_modes(insts: &[Decoded], ena: u32) -> BTreeMap<u32, String> {
         if !name.starts_with("v_interp_") {
             continue;
         }
-        let (_, ij, attr, _) = Em::interp_fields(d);
+        let (_, ij, attr, _, _) = Em::interp_fields(d);
         let mode = if name == "v_interp_mov_f32" {
             "nointerpolation"
         } else {
