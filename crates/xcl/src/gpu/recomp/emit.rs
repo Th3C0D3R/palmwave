@@ -2097,6 +2097,83 @@ impl Em {
         ));
     }
 
+    /// `uint4 {t}_r`: IMAGE_GATHER4_L(_O) `d` on the 2D view `{t}_T`. The console gathers the
+    /// 2×2 footprint around `uv` in the mip its LOD selects (clamped to the S#'s MIN_LOD /
+    /// MAX_LOD and to the view's levels, rounded), moved by the offset `o` (6-bit fields) in
+    /// that mip's texels: channel `ch` of (x0, y1) (x1, y1) (x1, y0) (x0, y0). HLSL's Gather has
+    /// no LOD (it reads the view's first mip), so the four texels are loaded. CLAMP_X / CLAMP_Y
+    /// apply to their indices as `desc::sampler_d3d12` maps them (half border: clamp, the
+    /// mirror-once modes: mirror once); outside a border mode's texture a texel is the border
+    /// colour. A constant S# (built by the code) is applied here, any other read from its SGPRs.
+    fn gather4_level(&mut self, d: &Decoded, t: &str, uv: &[String], lod: &str, o: Option<&str>, ch: u64) {
+        let ssamp = Self::field(d, "SSAMP");
+        let s = match self.static_ss.get(&d.pc).copied() {
+            Some(w) => Ok(w),
+            None => Err([self.sreg(ssamp), self.sreg(ssamp + 1), self.sreg(ssamp + 2), self.sreg(ssamp + 3)]),
+        };
+        let (u, v) = (&uv[0], &uv[1]);
+        // S# word 1: MIN_LOD [11:0], MAX_LOD [23:12] (u4.8); MIP_FILTER none (word 2 [27:26])
+        // keeps MIN_LOD, as in `desc::sampler_d3d12`
+        let (lo, hi) = match &s {
+            Ok(w) => {
+                let lo = (w[1] & 0xFFF) as f32 / 256.0;
+                let hi = if (w[2] >> 26) & 3 == 0 { lo } else { ((w[1] >> 12) & 0xFFF) as f32 / 256.0 };
+                (format!("{lo:?}f"), format!("{hi:?}f"))
+            }
+            Err(r) => (format!("(float)({} & 0xFFFu) / 256.0f", r[1]), format!("(float)select((({} >> 26) & 3u) == 0u, {1} & 0xFFFu, ({1} >> 12) & 0xFFFu) / 256.0f", r[2], r[1])),
+        };
+        self.line(&format!("uint {t}_w, {t}_h, {t}_n; {t}_T.GetDimensions(0u, {t}_w, {t}_h, {t}_n);"));
+        self.line(&format!("uint {t}_L = min((uint)round(clamp({lod}, {lo}, {hi})), max({t}_n, 1u) - 1u); {t}_T.GetDimensions({t}_L, {t}_w, {t}_h, {t}_n);"));
+        let off = |k: u32| o.map_or(String::new(), |o| format!(" + (((int)({o} << {})) >> 26)", 26 - 8 * k));
+        self.line(&format!("int2 {t}_x = (int)floor({u} * (float){t}_w - 0.5f) + int2(0, 1){};", off(0)));
+        self.line(&format!("int2 {t}_y = (int)floor({v} * (float){t}_h - 0.5f) + int2(0, 1){};", off(1)));
+        // S# word 0: CLAMP_X [2:0], CLAMP_Y [5:3] – wrap, mirror, clamp, border, mirror once
+        let mut inside = Vec::new();
+        for (k, i, n) in [(0u32, format!("{t}_x"), format!("(int){t}_w")), (1, format!("{t}_y"), format!("(int){t}_h"))] {
+            let mirror = format!("int2 {i}m = (({i} % (2 * {n})) + 2 * {n}) % (2 * {n});");
+            let mirrored = format!("select({i}m < {n}, {i}m, 2 * {n} - 1 - {i}m)");
+            let (clamp, once) = (format!("clamp({i}, 0, {n} - 1)"), format!("min({i} ^ ({i} >> 31), {n} - 1)"));
+            match &s {
+                Ok(w) => match (w[0] >> (3 * k)) & 7 {
+                    0 => self.line(&format!("{mirror} {i} = {i}m % {n};")),
+                    1 => self.line(&format!("{mirror} {i} = {mirrored};")),
+                    2 | 4 => self.line(&format!("{i} = {clamp};")),
+                    6 => {
+                        self.line(&format!("bool2 {i}i = (uint2){i} < (uint){n};"));
+                        inside.push((k, format!("{i}i")));
+                    }
+                    _ => self.line(&format!("{i} = {once};")),
+                },
+                Err(r) => {
+                    let c = format!("{i}c");
+                    self.line(&format!("uint {c} = ({} >> {}u) & 7u; {mirror} bool2 {i}i = or(({c} != 6u).xx, (uint2){i} < (uint){n});", r[0], 3 * k));
+                    self.line(&format!(
+                        "{i} = select(({c} == 0u).xx, {i}m % {n}, select(({c} == 1u).xx, {mirrored}, select(or({c} == 2u, {c} == 4u).xx, {clamp}, select(({c} == 6u).xx, {i}, {once}))));"
+                    ));
+                    inside.push((k, format!("{i}i")));
+                }
+            }
+        }
+        let c = ["x", "y", "z", "w"][ch as usize];
+        let ld = |a: &str, b: &str| format!("{t}_T.Load(int3({t}_x.{a}, {t}_y.{b}, {t}_L)).{c}");
+        let g = format!("float4({}, {}, {}, {})", ld("x", "y"), ld("y", "y"), ld("y", "x"), ld("x", "x"));
+        if inside.is_empty() {
+            self.line(&format!("uint4 {t}_r = asuint({g});"));
+            return;
+        }
+        // BORDER_COLOR_TYPE (word 3 [31:30]): 1 opaque black, 2 opaque white, else 0 (the
+        // console's table too, as in `desc::sampler_d3d12`)
+        let border = match &s {
+            Ok(w) => (if w[3] >> 30 == 2 || (w[3] >> 30 == 1 && ch == 3) { "1.0f" } else { "0.0f" }).to_string(),
+            Err(r) if ch == 3 => format!("select((({} >> 30) - 1u) < 2u, 1.0f, 0.0f)", r[3]),
+            Err(r) => format!("select(({} >> 30) == 2u, 1.0f, 0.0f)", r[3]),
+        };
+        // per texel of the footprint: x0 x1 x1 x0, y1 y1 y0 y0
+        let ins: Vec<String> = inside.iter().map(|(k, i)| format!("{i}.{}", ["xyyx", "yyxx"][*k as usize])).collect();
+        let ins = if ins.len() == 2 { format!("and({}, {})", ins[0], ins[1]) } else { ins[0].clone() };
+        self.line(&format!("uint4 {t}_r = asuint(select({ins}, {g}, ({border}).xxxx));"));
+    }
+
     fn mimg(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
         if f("TFE") != 0 || f("LWE") != 0 {
@@ -2329,6 +2406,13 @@ impl Em {
             }
             let samp = if has_c { "SamplerComparisonState" } else { "SamplerState" };
             self.line(&format!("{ty} {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];"));
+            // gather4_l(_o) on a 2D view: the mip of its LOD (`gather4_level`), no sampler;
+            // gather4_lz and the other forms keep Gather
+            if base.starts_with("gather4") && has_l && !has_c && dim == 1 && comps.len() == 1 {
+                self.gather4_level(d, &t, &coords_unmoved, lod.as_deref().unwrap_or_default(), offset.as_deref(), comps[0]);
+                write_result(self, &format!("{t}_r"), 4, &|k: usize| k as u64, &f16);
+                return Ok(());
+            }
             let sampler = self.sampler_ref(d.pc, has_c, &s3);
             self.line(&format!("{samp} {t}_S = {sampler};"));
             if let Some(o) = &offset {

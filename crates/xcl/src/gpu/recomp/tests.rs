@@ -2373,6 +2373,102 @@ fn implicit_lod_between_mips(s_sharp: [u32; 4]) {
     }
 }
 
+/// `image_gather4_l` / `_l_o` in a pixel shader: the console gathers the 2×2 footprint of the
+/// mip the LOD selects, moved by the offset in that mip's texels, and the border colour
+/// (transparent black) outside the texture. A 4-level texture (8², 4², 2², 1²; level k texel
+/// (x, y) holds 100·k + 10·y + x) and the S# of the title's culling programs (border, LOD
+/// 0..12); pixel (x, y) gathers a quarter texel right of and below the centre of texel (x, y)
+/// of mip L, so its footprint is x..x+1, y..y+1 plus the offset. LOD 7 is the last level (3).
+/// The S# comes from the SGPRs and, a second time, from constants in the code (applied when
+/// translating); `image_gather4_lz_o` (mip 0, Gather) is the control.
+#[test]
+fn gpu_ps_image_gather4_l_reads_the_mip_of_its_lod() {
+    if !gpu_ready() {
+        return;
+    }
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_SAMPLE_DESC};
+    // CLAMP_X / Y / Z border (6), MIN_LOD 0, MAX_LOD 12, bilinear, MIP_FILTER linear, BORDER_COLOR_TYPE 0
+    let s_sharp = [0x1B6u32, 0x00C0_0000, 0x1850_0000, 0];
+    let mut data = Vec::new();
+    for k in 0..4u32 {
+        let n = 8 >> k;
+        for y in 0..n {
+            for x in 0..n {
+                data.extend_from_slice(&[(100 * k + 10 * y + x) as f32; 4].map(f32::to_le_bytes).concat());
+            }
+        }
+    }
+    let tex = || {
+        let res = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 8,
+            Height: 8,
+            DepthOrArraySize: 1,
+            MipLevels: 4,
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let mut srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            ..Default::default()
+        };
+        srv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 4, ..Default::default() };
+        runner::ViewTexture { res, srv, data: data.clone(), row_bytes: 8 * 16 }
+    };
+    let mut sgprs = vec![0u32; 32];
+    sgprs[16..24].copy_from_slice(&tsharp(0, 77, 9));
+    sgprs[24..28].copy_from_slice(&s_sharp);
+    // (instruction, LOD, offset, the mip it reads)
+    let cases = [
+        ("IMAGE_GATHER4_L", Some(1.0f32), 0u32, 1i32),
+        ("IMAGE_GATHER4_L", Some(2.0), 0, 2),
+        ("IMAGE_GATHER4_L", Some(7.0), 0, 3),
+        ("IMAGE_GATHER4_L_O", Some(1.0), 0x202, 1),
+        ("IMAGE_GATHER4_LZ_O", None, 0x202, 0),
+    ];
+    for (name, lod, offset, level) in cases {
+        // a constant S# for Gather is a static sampler, which `draw_views` does not bind
+        let s_sources: &[bool] = if lod.is_some() { &[false, true] } else { &[false] };
+        for &constant_s in s_sources {
+            let size = 8 >> level;
+            let scale = 1.0 / size as f32;
+            let mut list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
+                // v4 = offset, v5 / v6 = (pixel centre + 0.25) / size of mip L, v7 = LOD
+                ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 4), ("SRC0", 255)], Some(offset)),
+                ("V_ADD_F32", "ENC_VOP2", vec![("VDST", 5), ("SRC0", 255), ("VSRC1", 2)], Some(0.25f32.to_bits())),
+                ("V_MUL_F32", "ENC_VOP2", vec![("VDST", 5), ("SRC0", 255), ("VSRC1", 5)], Some(scale.to_bits())),
+                ("V_ADD_F32", "ENC_VOP2", vec![("VDST", 6), ("SRC0", 255), ("VSRC1", 3)], Some(0.25f32.to_bits())),
+                ("V_MUL_F32", "ENC_VOP2", vec![("VDST", 6), ("SRC0", 255), ("VSRC1", 6)], Some(scale.to_bits())),
+                ("V_MOV_B32", "ENC_VOP1", vec![("VDST", 7), ("SRC0", 255)], Some(lod.unwrap_or(0.0).to_bits())),
+            ];
+            if constant_s {
+                for (k, w) in s_sharp.iter().enumerate() {
+                    list.push(("S_MOV_B32", "ENC_SOP1", vec![("SDST", 24 + k as u64), ("SSRC0", 255)], Some(*w)));
+                }
+            }
+            let vaddr = if name.ends_with("_O") { 4 } else { 5 };
+            list.push((name, "ENC_MIMG", vec![("VDATA", 8), ("VADDR", vaddr), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)], None));
+            list.push(("EXP", "ENC_EXP", vec![("TGT", 0), ("EN", 0xF), ("VSRC0", 8), ("VSRC1", 9), ("VSRC2", 10), ("VSRC3", 11), ("DONE", 1), ("VM", 1)], None));
+            let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+            let ps = prog(&refs);
+            let px = draw_console_views(None, Some(&ps), &[[0.0, 0.0], [0.0, 32.0], [32.0, 0.0]], &sgprs, &[tex()], &[crate::gpu::desc::sampler_d3d12(&s_sharp, false)]);
+            let texel = |x: i32, y: i32| if (0..size).contains(&x) && (0..size).contains(&y) { (100 * level + 10 * y + x) as f32 } else { 0.0 };
+            let (ox, oy) = ((offset & 0x3F) as i32, (offset >> 8 & 0x3F) as i32);
+            for y in 0..16 {
+                for x in 0..16 {
+                    let (x0, y0) = (x + ox, y + oy);
+                    let want = [texel(x0, y0 + 1), texel(x0 + 1, y0 + 1), texel(x0 + 1, y0), texel(x0, y0)];
+                    assert_eq!(px[(y * 16 + x) as usize], want, "{name} LOD {lod:?}, S# {}: pixel ({x},{y})", if constant_s { "constant" } else { "in SGPRs" });
+                }
+            }
+        }
+    }
+}
+
 /// 48 SGPR spill slots in lanes 0..47 of v30 (`v_writelane` / `v_readlane`, as 287 retail
 /// pixel shaders do – 11 up to lane 47): slot k = `slot(k)`, then s44 = the sum of slots
 /// 0..31, s45 = the sum of slots 32..47.
