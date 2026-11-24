@@ -52,6 +52,13 @@ const PAGE: usize = 0x1000;
 const PAGES_PER_TILE: usize = TILE / PAGE;
 const CHUNK: usize = 64;
 const CHUNKS: usize = PAGE / CHUNK;
+/// the pool tile of a tile that has no video memory: one wholly under a GPU-owned texture
+/// (`State::unback_due`)
+const UNBACKED: (u32, u32) = (u32::MAX, u32::MAX);
+/// how long a GPU-owned texture stands over a tile before the tile gives its video memory back:
+/// the title's work in flight may still read what was there, and a transient target that goes
+/// before that costs no mapping
+const UNBACK_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Fast non-cryptographic integer hasher for page/tile lookup maps on the hot submit path.
 #[derive(Default)]
@@ -91,11 +98,16 @@ struct TileEntry {
     holes: u16,
     /// per-4 KiB-page hashes of the 64-byte chunks last sent to the GPU (`None` = all zero)
     sent: [Option<Box<[u64; CHUNKS]>>; PAGES_PER_TILE],
+    /// GPU-owned textures (`target_placed`) standing over the whole tile
+    targets: u16,
+    /// the CPU wrote the tile while a target stood over it: data of the title's, it keeps its
+    /// video memory
+    cpu_written: bool,
 }
 
 impl TileEntry {
     fn with_holes(pool: (u32, u32), holes: u16) -> Self {
-        Self { pool, holes, sent: std::array::from_fn(|_| None) }
+        Self { pool, holes, sent: std::array::from_fn(|_| None), targets: 0, cpu_written: false }
     }
 }
 
@@ -180,7 +192,7 @@ fn decommit_tiles(
     }
     for &t in &unmapped {
         if let Some(entry) = mapped.remove(&t) {
-            if !pinned.contains_key(&entry.pool) {
+            if entry.pool != UNBACKED && !pinned.contains_key(&entry.pool) {
                 free.push(entry.pool);
             }
         }
@@ -251,6 +263,29 @@ struct State {
     runs: Option<Vec<(usize, usize)>>,
     /// reusable buffer for dirty runs in `before_execute` (avoids per-submit heap alloc)
     scratch_runs: Vec<(usize, usize)>,
+    /// the tiles under GPU-owned textures (`XCL_SPARSE_UNDER_TARGETS`)
+    under: UnderTargets,
+}
+
+/// Tiles of the windows wholly under a GPU-owned texture of the title (render target, depth
+/// buffer, UAV texture: `vram`). The title's GPU work on such a texture goes to its PC texture
+/// and the CPU does not write it, so the tile's video memory holds nothing anyone reads – with
+/// the title's GPU heaps in the windows (`XCL_HEAPS_VRAM_MB`) that was every target twice. Such
+/// a tile gives its pool tile back (`UNBACKED`: unmapped, it reads as zero) and takes one again,
+/// cleared, when the CPU writes it, a buffer is placed on it or its last target is released.
+#[derive(Default)]
+struct UnderTargets {
+    /// GPU-owned texture → the whole tiles `[first, end)` it stands over
+    placed: FxHashMap<usize, (usize, usize)>,
+    /// those ranges and when they were placed, oldest first: their tiles go `UNBACK_AFTER` later
+    due: VecDeque<(usize, usize, std::time::Instant)>,
+    /// tiles whose last target was released while they had no video memory: backed before the
+    /// title's next work
+    released: Vec<usize>,
+    /// tiles of `mapped` with no video memory now
+    unbacked: usize,
+    /// tiles that gave their video memory back so far, and that took some again
+    counts: [u64; 2],
 }
 
 impl Drop for State {
@@ -560,6 +595,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             waited: FxHashMap::default(),
             runs: None,
             scratch_runs: Vec::new(),
+            under: UnderTargets::default(),
         })
     })();
     match made {
@@ -1079,7 +1115,8 @@ impl State {
                 let Some(wi) = self.window_index(cur) else { break };
                 let b = self.windows[wi].0;
                 let to_tile_end = (tile + TILE) - cur;
-                if !self.mapped.contains_key(&tile) {
+                // (a tile with no video memory reads as zero: not what the CPU's view holds)
+                if !self.mapped.get(&tile).is_some_and(|e| e.pool != UNBACKED) {
                     done += (n - done).min(to_tile_end);
                     continue;
                 }
@@ -1709,7 +1746,12 @@ impl State {
         self.runs = None;
         for &t in &tiles {
             if let Ok(i) = pools.binary_search_by_key(&t, |p| p.0) {
-                self.parked.insert(t, pools[i].1);
+                if pools[i].1 == UNBACKED {
+                    // nothing is mapped there
+                    self.under.unbacked -= 1;
+                } else {
+                    self.parked.insert(t, pools[i].1);
+                }
             }
         }
         MAPPED_GEN.fetch_add(1, Ordering::Release);
@@ -1748,6 +1790,212 @@ impl State {
         self.signal();
         true
     }
+
+    /// GPU-owned texture `res` was placed over `[va, va + bytes)`: the tiles wholly inside count
+    /// it, and give their video memory back `UNBACK_AFTER` later (`unback_due`).
+    fn target_placed(&mut self, res: usize, va: usize, bytes: usize, now: std::time::Instant) {
+        let Some((first, end)) = whole_tiles(va, bytes) else { return };
+        if self.window_index(first).is_none() || self.under.placed.contains_key(&res) {
+            return;
+        }
+        let mut any = false;
+        for t in (first..end).step_by(TILE) {
+            if let Some(e) = self.mapped.get_mut(&t) {
+                e.targets = e.targets.saturating_add(1);
+                any = true;
+            }
+        }
+        if any {
+            self.under.placed.insert(res, (first, end));
+            self.under.due.push_back((first, end, now));
+        }
+    }
+
+    /// GPU-owned texture `res` was released: the tiles no target stands over any more that have
+    /// no video memory get some before the title's next work (`back_written_and_released`) –
+    /// what the title's GPU work writes there next must not be lost.
+    fn target_gone(&mut self, res: usize) {
+        let Some((first, end)) = self.under.placed.remove(&res) else { return };
+        for t in (first..end).step_by(TILE) {
+            if let Some(e) = self.mapped.get_mut(&t) {
+                e.targets = e.targets.saturating_sub(1);
+                if e.targets == 0 && e.pool == UNBACKED {
+                    self.under.released.push(t);
+                }
+            }
+        }
+    }
+
+    /// The tiles of targets placed `UNBACK_AFTER` ago or longer give their video memory back:
+    /// those a target still stands over, that the CPU did not write since and no placed buffer
+    /// uses. Unmapped in their window, they read as zero. The number of tiles that went.
+    unsafe fn unback_due(&mut self, now: std::time::Instant) -> usize {
+        let mut gone: Vec<usize> = Vec::new();
+        while self.under.due.front().is_some_and(|&(_, _, at)| now.saturating_duration_since(at) >= UNBACK_AFTER) {
+            let Some((first, end, _)) = self.under.due.pop_front() else { break };
+            for t in (first..end).step_by(TILE) {
+                let Some(e) = self.mapped.get_mut(&t) else { continue };
+                if e.pool == UNBACKED || e.targets == 0 || e.cpu_written || self.pinned.contains_key(&e.pool) {
+                    continue;
+                }
+                self.free.push(e.pool);
+                e.pool = UNBACKED;
+                e.sent = std::array::from_fn(|_| None);
+                gone.push(t);
+            }
+        }
+        if gone.is_empty() {
+            return 0;
+        }
+        self.under.unbacked += gone.len();
+        self.under.counts[0] += gone.len() as u64;
+        let mut by_window: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+        for &t in &gone {
+            if let Some(wi) = self.window_index(t) {
+                by_window.entry(wi).or_default().push(t);
+            }
+        }
+        for (wi, ts) in by_window {
+            let (b, r) = (self.windows[wi].0, self.windows[wi].1.clone());
+            self.unmap_tiles(&r, b, &ts);
+        }
+        self.signal();
+        gone.len()
+    }
+
+    /// `tiles` that have no video memory take a pool tile again, cleared. Nothing of what the
+    /// CPU's view holds is sent: `sent` starts over, so the pages the CPU writes go whole.
+    unsafe fn back_tiles(&mut self, tiles: &[usize]) {
+        let mut new: Vec<(usize, (u32, u32))> = Vec::new();
+        for &t in tiles {
+            if !self.mapped.get(&t).is_some_and(|e| e.pool == UNBACKED) {
+                continue;
+            }
+            let Some((tile, reused)) = self.take_tile() else { break };
+            let Some(e) = self.mapped.get_mut(&t) else { continue };
+            e.pool = tile;
+            e.sent = std::array::from_fn(|_| None);
+            self.under.unbacked -= 1;
+            self.under.counts[1] += 1;
+            if reused {
+                self.to_zero.push((t, TILE));
+            }
+            new.push((t, tile));
+        }
+        if new.is_empty() {
+            return;
+        }
+        let mut by_window: FxHashMap<usize, Vec<(usize, (u32, u32))>> = FxHashMap::default();
+        for x in new {
+            if let Some(wi) = self.window_index(x.0) {
+                by_window.entry(wi).or_default().push(x);
+            }
+        }
+        for (wi, tiles) in by_window {
+            let (b, r) = (self.windows[wi].0, self.windows[wi].1.clone());
+            self.map_tiles(&r, b, &tiles);
+        }
+        self.signal();
+    }
+
+    /// Before the title's work: the tiles with no video memory that the CPU wrote (`dirty`:
+    /// sorted page addresses) – data of the title's under a target it has not released – and
+    /// those whose last target was released get video memory again.
+    unsafe fn back_written_and_released(&mut self, dirty: &[usize]) {
+        let mut back = std::mem::take(&mut self.under.released);
+        back.retain(|t| self.mapped.get(t).is_some_and(|e| e.targets == 0));
+        let mut last = usize::MAX;
+        for &a in dirty {
+            let t = a & !(TILE - 1);
+            if t != last {
+                last = t;
+                if let Some(e) = self.mapped.get_mut(&t).filter(|e| e.pool == UNBACKED) {
+                    e.cpu_written = true;
+                    back.push(t);
+                }
+            }
+        }
+        if !back.is_empty() {
+            self.back_tiles(&back);
+        }
+    }
+}
+
+/// The whole tiles inside `[va, va + bytes)`, as `[first, end)`.
+fn whole_tiles(va: usize, bytes: usize) -> Option<(usize, usize)> {
+    let first = va.checked_next_multiple_of(TILE)?;
+    let end = va.checked_add(bytes)? & !(TILE - 1);
+    (first < end).then_some((first, end))
+}
+
+/// Whether a saving of video memory is on, from its own switch (`0`: off, anything else: on)
+/// and, without one, from `XCL_HEAPS_VRAM_MB`: with the title's GPU heaps in the windows the
+/// title needs more video memory than a 16 GB card has, without them nothing changes.
+fn saving_on(switch: Option<&str>, heaps_in_vram: Option<&str>) -> bool {
+    match switch.map(str::trim) {
+        Some(v) => v != "0",
+        None => heaps_in_vram.is_some_and(|v| v.trim().parse::<usize>().is_ok()),
+    }
+}
+
+/// `saving_on` for the switch `name`, from the environment.
+pub(super) fn saving(name: &str) -> bool {
+    saving_on(std::env::var(name).ok().as_deref(), std::env::var("XCL_HEAPS_VRAM_MB").ok().as_deref())
+}
+
+/// Whether tiles under GPU-owned textures give their video memory back
+/// (`XCL_SPARSE_UNDER_TARGETS`): with the heaps in the windows the title's render targets would
+/// take video memory twice.
+fn under_targets() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| saving("XCL_SPARSE_UNDER_TARGETS"))
+}
+
+/// The title placed GPU-owned texture `res` (a render target, depth buffer or UAV texture, kept
+/// in video memory of its own: `vram::place`) over `[va, va + bytes)` of its memory.
+pub fn target_placed(res: usize, va: usize, bytes: usize) {
+    if !under_targets() {
+        return;
+    }
+    if let Some(s) = STATE.lock().unwrap().as_mut() {
+        s.target_placed(res, va, bytes, std::time::Instant::now());
+    }
+}
+
+/// A texture of `target_placed` was released.
+pub fn target_gone(res: usize) {
+    if !under_targets() {
+        return;
+    }
+    if let Some(s) = STATE.lock().unwrap().as_mut() {
+        s.target_gone(res);
+    }
+}
+
+/// (tests) `target_placed` as if `UNBACK_AFTER` ago, whatever the switch says: the tiles under
+/// it go at the next submit.
+#[cfg(test)]
+pub(crate) fn test_target_placed_long_ago(res: usize, va: usize, bytes: usize) {
+    let now = std::time::Instant::now();
+    if let Some(s) = STATE.lock().unwrap().as_mut() {
+        s.target_placed(res, va, bytes, now.checked_sub(UNBACK_AFTER).unwrap_or(now));
+    }
+}
+
+/// (tests) `target_gone`, whatever the switch says.
+#[cfg(test)]
+pub(crate) fn test_target_gone(res: usize) {
+    if let Some(s) = STATE.lock().unwrap().as_mut() {
+        s.target_gone(res);
+    }
+}
+
+/// (bytes of tiles under GPU-owned textures that hold no video memory now, tiles that gave
+/// theirs back so far, tiles that took some again) – `XCL_ACTIVITY`
+pub fn under_target_counts() -> (usize, u64, u64) {
+    let g = STATE.lock().unwrap();
+    let Some(s) = g.as_ref() else { return (0, 0, 0) };
+    (s.under.unbacked * TILE, s.under.counts[0], s.under.counts[1])
 }
 
 /// Whether `[p, p + n)` lies in the sparse windows and every page of it is committed and
@@ -1864,6 +2112,9 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     }
     let t_locked = std::time::Instant::now();
     PHASES[0].fetch_add((t_locked - t0).as_micros() as u64, Ordering::Relaxed);
+    if s.under.unbacked > 0 {
+        s.back_written_and_released(dirty);
+    }
     let zero_runs = std::mem::take(&mut s.to_zero);
     for &(a, n) in &zero_runs {
         s.clear_sent_range(a, n);
@@ -1885,6 +2136,9 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
             let t = x & !(TILE - 1);
             let end = (t + TILE).min(a + n);
             if let Some(entry) = s.mapped.get_mut(&t) {
+                if entry.targets != 0 {
+                    entry.cpu_written = true;
+                }
                 let mut pg = x & !(PAGE - 1);
                 while pg < end {
                     let idx = (pg - t) / PAGE;
@@ -1933,6 +2187,10 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     }
     dirty_runs.clear();
     s.scratch_runs = dirty_runs;
+    // (after the scan: a tile the CPU wrote just now keeps its video memory)
+    if !s.under.due.is_empty() && s.unback_due(t0) > 0 {
+        s.retire_free_pools();
+    }
     let q = queue.as_raw() as usize;
     if s.value > 0 && s.waited.get(&q).copied().unwrap_or(0) < s.value {
         let _ = queue.Wait(&s.fence, s.value);
@@ -1970,7 +2228,12 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     // its tiles: the window's video memory at the same addresses; probe actual OS commitment
     // so uncommitted pages (e.g. [start, va) or reserved tails) stay marked as holes
     s.ensure_mapped(start, delta + bytes, |t| query_tile_holes(t));
-    let tiles: Vec<(usize, (u32, u32))> = (start..va + bytes).step_by(TILE).filter_map(|t| s.mapped.get(&t).map(|e| (t, e.pool))).collect();
+    if s.under.unbacked > 0 {
+        // a buffer over tiles a target stood on: the GPU reads and writes them again
+        let unbacked: Vec<usize> = (start..va + bytes).step_by(TILE).filter(|t| s.mapped.get(t).is_some_and(|e| e.pool == UNBACKED)).collect();
+        s.back_tiles(&unbacked);
+    }
+    let tiles: Vec<(usize, (u32, u32))> = (start..va + bytes).step_by(TILE).filter_map(|t| s.mapped.get(&t).filter(|e| e.pool != UNBACKED).map(|e| (t, e.pool))).collect();
     let raw = *ppv;
     let res = ID3D12Resource::from_raw_borrowed(&raw)?.clone();
     s.map_tiles(&res, start, &tiles);
@@ -2213,6 +2476,7 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
+                under: UnderTargets::default(),
             };
 
             // Mirrors `place_buffer`: map both tiles probing real OS page commitment.
@@ -2305,6 +2569,7 @@ mod tests {
                 waited: FxHashMap::default(),
                 runs: None,
                 scratch_runs: Vec::new(),
+                under: UnderTargets::default(),
             };
 
             s.commit_range(base, TILE);
@@ -2461,6 +2726,185 @@ mod tests {
         assert_eq!(u, vec![t3]);
         assert_eq!(free, vec![(0, 13)]);
         assert_eq!(to_zero, vec![(t4, PAGE)], "unrelated mapped tile's to_zero must remain");
+    }
+
+    #[test]
+    fn whole_tiles_are_those_inside_the_range() {
+        let t = 0x40_0000usize;
+        assert_eq!(whole_tiles(t, 3 * TILE), Some((t, t + 3 * TILE)));
+        assert_eq!(whole_tiles(t + 0x1000, 3 * TILE), Some((t + TILE, t + 3 * TILE)));
+        assert_eq!(whole_tiles(t + 0x1000, 2 * TILE - 0x1000), Some((t + TILE, t + 2 * TILE)));
+        // less than a tile, or a tile's worth across a boundary: none whole
+        assert_eq!(whole_tiles(t, TILE - 1), None);
+        assert_eq!(whole_tiles(t + 0x8000, TILE), None);
+        assert_eq!(whole_tiles(usize::MAX - 0x100, 2 * TILE), None);
+    }
+
+    #[test]
+    fn a_saving_goes_with_the_heaps_in_video_memory_or_its_own_switch() {
+        assert!(!saving_on(None, None));
+        assert!(saving_on(None, Some("64")));
+        assert!(!saving_on(None, Some("big")), "a value XCL_HEAPS_VRAM_MB does not take");
+        assert!(!saving_on(Some("0"), Some("64")));
+        assert!(!saving_on(Some(" 0 "), Some("64")));
+        assert!(saving_on(Some("1"), None));
+    }
+
+    /// A tile with no video memory that is decommitted has no pool tile to give back.
+    #[test]
+    fn a_decommitted_tile_with_no_video_memory_frees_no_pool_tile() {
+        let mut mapped: FxHashMap<usize, TileEntry> = FxHashMap::default();
+        let pinned: FxHashMap<(u32, u32), u32> = FxHashMap::default();
+        let (mut free, mut to_zero) = (Vec::new(), Vec::new());
+        let (t0, t1) = (0x10_0000usize, 0x11_0000usize);
+        mapped.insert(t0, TileEntry::with_holes(UNBACKED, 0));
+        mapped.insert(t1, TileEntry::with_holes((0, 7), 0));
+        assert_eq!(decommit_tiles(&mut mapped, &pinned, &mut free, &mut to_zero, t0, 2 * TILE), vec![t0, t1]);
+        assert_eq!(free, vec![(0, 7)]);
+        assert!(mapped.is_empty());
+    }
+
+    /// A `State` whose one window is `tiles` tiles of memory reserved for the test (returned: its
+    /// address), on the default adapter or WARP.
+    unsafe fn state_over(tiles: usize) -> (State, usize) {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        use windows_sys::Win32::System::Memory::MEM_RESERVE;
+
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+        let mut dev: Option<ID3D12Device> = None;
+        if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+            let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+            D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+        }
+        let dev = dev.expect("D3D12 device");
+        let base = VirtualAlloc(std::ptr::null(), tiles * TILE, MEM_RESERVE, PAGE_NOACCESS) as usize;
+        assert!(base != 0 && base % TILE == 0);
+        let mut reserved: Option<ID3D12Resource> = None;
+        dev.CreateReservedResource(&buffer_desc((tiles * TILE) as u64), D3D12_RESOURCE_STATE_COMMON, None, &mut reserved).expect("CreateReservedResource");
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+        let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_fence");
+        let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).expect("event");
+        let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("rb_alloc");
+        let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None).expect("rb_list");
+        rb_list.Close().expect("rb_list close");
+        let s = State {
+            dev,
+            queue,
+            fence,
+            value: 0,
+            event,
+            rb_fence,
+            rb_value: 0,
+            windows: vec![(base, reserved.expect("reserved buffer"))],
+            pools: Vec::new(),
+            free: Vec::new(),
+            retired: Vec::new(),
+            mapped: FxHashMap::default(),
+            pinned: FxHashMap::default(),
+            parked: FxHashMap::default(),
+            buffers: FxHashMap::default(),
+            to_zero: Vec::new(),
+            staging: None,
+            ring_write: 0,
+            ring_submitted: 0,
+            ring_free: 0,
+            inflight: VecDeque::new(),
+            zero_buf: None,
+            slots: Vec::new(),
+            next_slot: 0,
+            readback: None,
+            rb_alloc,
+            rb_list,
+            rb_last_fence: 0,
+            waited: FxHashMap::default(),
+            runs: None,
+            scratch_runs: Vec::new(),
+            under: UnderTargets::default(),
+        };
+        (s, base)
+    }
+
+    /// The tiles wholly under a GPU-owned texture give their video memory back two seconds after
+    /// it was placed – but those the CPU wrote meanwhile and those of a placed buffer – and take
+    /// some again, cleared, when the CPU writes them or their last target is released. The CPU's
+    /// view of such a tile is not read back over, and decommitting one frees no pool tile.
+    #[test]
+    fn tiles_under_a_target_give_their_video_memory_back_until_they_are_used_again() {
+        use std::time::{Duration, Instant};
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+
+        unsafe {
+            let (mut s, base) = state_over(6);
+            assert!(!VirtualAlloc(base as *const c_void, 6 * TILE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            s.commit_range(base, 6 * TILE);
+            let t = |i: usize| base + i * TILE;
+            let pools: Vec<(u32, u32)> = (0..6).map(|i| s.mapped[&t(i)].pool).collect();
+            let targets = |s: &State| (0..6).map(|i| s.mapped[&t(i)].targets).collect::<Vec<u16>>();
+            let backed = |s: &State| (0..6).map(|i| s.mapped.get(&t(i)).is_some_and(|e| e.pool != UNBACKED)).collect::<Vec<bool>>();
+            let now = Instant::now();
+
+            // a target from inside tile 0 to inside tile 4: tiles 1, 2 and 3 are wholly under it
+            s.target_placed(0xA, t(0) + 0x800, 4 * TILE, now);
+            assert_eq!(targets(&s), [0, 1, 1, 1, 0, 0]);
+            assert_eq!(s.unback_due(now + Duration::from_secs(1)), 0, "not before two seconds");
+            // meanwhile the CPU wrote tile 3 (`before_execute` notes it) and a buffer was placed on tile 2
+            s.mapped.get_mut(&t(3)).unwrap().cpu_written = true;
+            s.pinned.insert(pools[2], 1);
+            let v = s.value;
+            assert_eq!(s.unback_due(now + UNBACK_AFTER), 1);
+            assert_eq!(backed(&s), [true, false, true, true, true, true]);
+            assert!(s.free.contains(&pools[1]) && s.under.unbacked == 1 && s.under.due.is_empty());
+            assert!(s.value > v, "the unmapping is sent");
+            assert!(s.mapped.len() == 6, "the tile is still the title's: its writes are watched");
+
+            // what the CPU's view holds there is not read back over (the tile reads as zero)
+            std::ptr::write_volatile(t(1) as *mut u64, 0x1122_3344_5566_7788);
+            s.readback_ranges(&[(t(1), TILE)]);
+            assert_eq!(std::ptr::read_volatile(t(1) as *const u64), 0x1122_3344_5566_7788);
+
+            // the CPU wrote it: video memory again, cleared, everything in it to be sent, and it
+            // keeps it under the next target
+            s.to_zero.clear();
+            s.back_written_and_released(&[t(1), t(1) + 3 * PAGE, t(5)]);
+            assert_eq!(backed(&s), [true; 6]);
+            assert_eq!(s.to_zero, vec![(t(1), TILE)]);
+            assert!(s.mapped[&t(1)].sent.iter().all(|p| p.is_none()) && s.under.unbacked == 0);
+            s.target_placed(0xB, t(1), TILE, now);
+            assert_eq!(s.unback_due(now + UNBACK_AFTER), 0);
+
+            // two targets over tiles 4 and 5: one released, they stay as they are; the other
+            // released, they get video memory before the title's next work
+            s.target_placed(0xC, t(4), 2 * TILE, now);
+            s.target_placed(0xD, t(4), 2 * TILE, now);
+            assert_eq!(targets(&s), [0, 2, 1, 1, 2, 2]);
+            assert_eq!(s.unback_due(now + UNBACK_AFTER), 2);
+            s.target_gone(0xC);
+            assert!(s.under.released.is_empty());
+            s.back_written_and_released(&[]);
+            assert_eq!(backed(&s), [true, true, true, true, false, false]);
+            s.target_gone(0xD);
+            s.target_gone(0xD);
+            assert_eq!(targets(&s), [0, 2, 1, 1, 0, 0]);
+            s.back_written_and_released(&[]);
+            assert_eq!(backed(&s), [true; 6]);
+            assert_eq!((s.under.unbacked, s.under.counts), (0, [3, 3]));
+
+            // a tile with no video memory decommitted: nothing parked, no pool tile freed
+            s.target_placed(0xE, t(5), TILE, now);
+            assert_eq!(s.unback_due(now + UNBACK_AFTER), 1);
+            let free = s.free.len();
+            s.decommit_range(t(5), TILE);
+            assert!(!s.mapped.contains_key(&t(5)) && s.parked.is_empty());
+            assert_eq!((s.free.len(), s.under.unbacked), (free, 0));
+            s.target_gone(0xE);
+            assert!(s.under.released.is_empty());
+
+            s.wait_for(s.value);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
     }
 
     /// The pages in `early`, checking that its ranges are page-aligned, not empty, disjoint and

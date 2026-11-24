@@ -120,6 +120,7 @@ pub(super) fn is_placed_texture(resource: usize) -> bool {
 pub(super) fn forget(resource: usize) {
     let placed = PLACED_TEXTURES.lock().unwrap().as_mut().is_some_and(|textures| textures.remove(&resource));
     if placed {
+        super::sparse::target_gone(resource);
         forget_pages(resource);
         if let Some(id) = ARENA_OF.lock().unwrap().as_mut().and_then(|m| m.remove(&resource)) {
             ARENAS.lock().unwrap().release(id, std::time::Instant::now());

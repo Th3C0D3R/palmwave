@@ -3861,6 +3861,144 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
     }
 }
 
+/// Tiles of sparse VRAM under a GPU-owned texture, with a translated compute program reading
+/// them through a V# on the real device and queue: they give their video memory back (and read
+/// as zero), one the CPU writes then holds what the CPU's view of the written page holds, and
+/// one whose target was released is backed again and holds what the CPU writes there next.
+/// (Every buffer is in sparse VRAM: none of the coherent window is taken.)
+#[test]
+fn gpu_sparse_tiles_under_a_target_are_backed_again_when_written_or_released() {
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    if !gpu_ready() {
+        return;
+    }
+    crate::hle::d3d12x::real::init().expect("real D3D12.X backend");
+    let u = crate::gpu::uma::get().expect("UMA");
+    let windows = crate::hle::d3d12x::real::uma_window_vas();
+    assert_eq!(windows.len(), 4);
+    let heap_obj = 0xDEAD_7A26usize;
+    assert!(crate::hle::d3d12x::console_heap::register(heap_obj, 4, 0x1000, 0x5000, 32, false, false, true));
+    let heap_va = crate::hle::d3d12x::console_heap::start(heap_obj).unwrap() as usize;
+    let gfx_attrs = 1u64 << 29;
+    let tile = || {
+        let p = unsafe { crate::hle::kernelx::XMemAllocDefault(0x1_0000, gfx_attrs) } as usize;
+        assert!(p != 0 && u.is_sparse(p) && p % 0x1_0000 == 0, "a tile of sparse VRAM");
+        p
+    };
+    let (in_a, in_b, out_buf, io_buf, res_buf) = (tile(), tile(), tile(), tile(), tile());
+    let vsharp = |addr: usize| -> [u32; 4] { [addr as u32, (((addr >> 32) as u32) & 0xFFFF) | (4 << 16), 64, 0] };
+    unsafe {
+        for l in 0..64usize {
+            *((in_a + 4 * l) as *mut u32) = 1000 + l as u32;
+            *((in_b + 4 * l) as *mut u32) = 5000 + 2 * l as u32;
+        }
+    }
+    let slot0 = crate::hle::d3d12x::console_heap::slot(heap_va as u64).unwrap();
+    let slot1 = crate::hle::d3d12x::console_heap::slot(heap_va as u64 + 32).unwrap();
+    crate::hle::d3d12x::console_heap::write(&slot0, &vsharp(in_a));
+    crate::hle::d3d12x::console_heap::write(&slot1, &vsharp(out_buf));
+    // out[l] = in[l] + 13, `in` the V# of slot 0 and `out` that of slot 1
+    let p = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 5), ("SSRC0", 128)], None),
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 2), ("OFFSET", 0)], None),
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 2), ("OFFSET", 32)], None),
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 141), ("VSRC1", 1)], None),
+        ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+    ]);
+    let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 6, ..Default::default() };
+    let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), mem_windows: 4, ..Default::default() })).unwrap();
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+    unsafe {
+        let dev_raw = crate::hle::d3d12x::real::device_raw();
+        let dev = ID3D12Device::from_raw_borrowed(&dev_raw).expect("device").clone();
+        // (unmapped tiles read as zero from tier 2 on)
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        let _ = dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut o as *mut _ as *mut _, std::mem::size_of_val(&o) as u32);
+        let tier2 = o.TiledResourcesTier.0 >= D3D12_TILED_RESOURCES_TIER_2.0;
+        let rs = crate::gpu::recomp::pso::abi_root_signature(&dev, false).expect("ABI root signature");
+        let pso: ID3D12PipelineState = dev
+            .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const _, BytecodeLength: dxil.len() },
+                ..Default::default()
+            })
+            .expect("CreateComputePipelineState");
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, Some(&pso)).unwrap();
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+        // user SGPRs: s4 = the descriptor table's offset in window 0 (the program clears s5)
+        let mut io = vec![0u32; crate::gpu::recomp::KERNEL_SGPRS];
+        io[4] = (heap_va - u.base()) as u32;
+        std::ptr::copy_nonoverlapping(io.as_ptr() as *const u8, io_buf as *mut u8, io.len() * 4);
+        // one submit through q_execute_command_lists (-> sparse::before_execute), waited for:
+        // what the program wrote, read back from video memory
+        let run = |fence_val: u64| -> Vec<u32> {
+            if fence_val > 1 {
+                alloc.Reset().unwrap();
+                list.Reset(&alloc, Some(&pso)).unwrap();
+            }
+            list.SetComputeRootSignature(&rs);
+            list.SetComputeRootUnorderedAccessView(0, crate::hle::d3d12x::real::uma_va_of(io_buf).unwrap());
+            list.SetComputeRootUnorderedAccessView(1, crate::hle::d3d12x::real::uma_va_of(res_buf).unwrap());
+            for (k, &va) in windows.iter().enumerate() {
+                list.SetComputeRootUnorderedAccessView(2 + k as u32, va);
+            }
+            list.Dispatch(1, 1, 1);
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
+            queue.Signal(&fence, fence_val).unwrap();
+            if fence.GetCompletedValue() < fence_val {
+                let ev = windows::Win32::System::Threading::CreateEventW(None, false, false, None).unwrap();
+                fence.SetEventOnCompletion(fence_val, ev).unwrap();
+                windows::Win32::System::Threading::WaitForSingleObject(ev, 5000);
+                let _ = windows::Win32::Foundation::CloseHandle(ev);
+            }
+            crate::hle::d3d12x::sparse::readback_now(out_buf, 256);
+            (0..64usize).map(|l| *((out_buf + 4 * l) as *const u32)).collect()
+        };
+        let cpu_view = |buf: usize| -> Vec<u32> { (0..64usize).map(|l| *((buf + 4 * l) as *const u32) + 13).collect() };
+
+        assert_eq!(run(1), cpu_view(in_a), "the tile as the CPU wrote it");
+
+        // targets over both tiles: they give their video memory back and read as zero
+        let (_, gone0, back0) = crate::hle::d3d12x::sparse::under_target_counts();
+        let (res_a, res_b) = (0x7A26_E7A0usize, 0x7A26_E7B0usize);
+        crate::hle::d3d12x::sparse::test_target_placed_long_ago(res_a, in_a, 0x1_0000);
+        crate::hle::d3d12x::sparse::test_target_placed_long_ago(res_b, in_b, 0x1_0000);
+        let out = run(2);
+        assert!(crate::hle::d3d12x::sparse::under_target_counts().1 >= gone0 + 2, "both tiles gave their video memory back");
+        if tier2 {
+            assert_eq!(out, vec![13u32; 64], "a tile with no video memory reads as zero");
+        }
+
+        // the CPU writes one word of tile A; B's target is released: both have video memory
+        // again, and A holds what the CPU's view of the written page holds
+        *((in_a + 4 * 5) as *mut u32) = 4242;
+        crate::hle::d3d12x::sparse::test_target_gone(res_b);
+        let out = run(3);
+        assert!(crate::hle::d3d12x::sparse::under_target_counts().2 >= back0 + 2, "both tiles took video memory again");
+        assert_eq!(out[5], 4242 + 13);
+        assert_eq!(out, cpu_view(in_a), "the written page went whole");
+
+        // B was cleared when it was backed again: it reads as zero until the CPU writes it,
+        // and the page it writes goes whole
+        crate::hle::d3d12x::console_heap::write(&slot0, &vsharp(in_b));
+        assert_eq!(run(4), vec![13u32; 64]);
+        *((in_b + 4 * 3) as *mut u32) = 9999;
+        assert_eq!(run(5), cpu_view(in_b));
+
+        crate::hle::d3d12x::sparse::test_target_gone(res_a);
+        crate::hle::d3d12x::console_heap::unregister(heap_obj);
+        for p in [in_a, in_b, out_buf, io_buf, res_buf] {
+            crate::hle::kernelx::XMemFreeDefault(p as *mut _, gfx_attrs);
+        }
+    }
+}
+
 /// Experiment: does OpenExistingHeapFromAddress accept a reservation with only part committed?
 #[test]
 #[ignore]

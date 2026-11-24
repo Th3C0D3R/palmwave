@@ -99,9 +99,10 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 let (arenas, arenas_made) = crate::hle::d3d12x::vram::arena_bytes();
                 let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();
                 let (pages, page_pools) = crate::hle::d3d12x::vram::page_bytes();
+                let (under, given_back, taken_again) = crate::hle::d3d12x::sparse::under_target_counts();
                 let mb = |b: u64| b >> 20;
                 crate::xlog_info!(
-                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped)",
+                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped); {} MB of sparse tiles under targets hold none ({} tiles given back, {} taken again)",
                     mb(private as u64),
                     mb(local),
                     mb(non_local),
@@ -110,7 +111,10 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(arenas as u64),
                     mb(arenas_made as u64),
                     mb(pools as u64),
-                    mb(pools_mapped as u64)
+                    mb(pools_mapped as u64),
+                    mb(under as u64),
+                    given_back,
+                    taken_again
                 );
                 // what XCL itself holds: one line each for the textures kept in step, the
                 // buffers of their uploads and of the other paths, and the process's heaps
