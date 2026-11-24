@@ -1703,32 +1703,79 @@ mod tests {
         assert_eq!(({ b.audio_bytes }, { b.play_begin }, { b.play_length }, { b.loop_begin }, { b.loop_length }, { b.loop_count }), (4000, 0, 0, 0, 0, 255));
     }
 
-    #[test]
-    fn clamped_and_silenced_buffers_accepted_by_windows_xaudio2() {
-        struct AudioGuard {
-            eng: *mut c_void,
-            master: *mut c_void,
-            voice: *mut c_void,
-        }
-        impl Drop for AudioGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    if !self.voice.is_null() {
-                        let destroy: DestroyVoiceFn = std::mem::transmute(vtable(self.voice).add(VOICE_DESTROY).read());
-                        destroy(self.voice);
-                    }
-                    if !self.master.is_null() {
-                        let destroy: DestroyVoiceFn = std::mem::transmute(vtable(self.master).add(VOICE_DESTROY).read());
-                        destroy(self.master);
-                    }
-                    if !self.eng.is_null() {
-                        let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(vtable(self.eng).add(2).read());
-                        release(self.eng);
-                    }
+    struct AudioGuard {
+        eng: *mut c_void,
+        master: *mut c_void,
+        voice: *mut c_void,
+    }
+    impl Drop for AudioGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if !self.voice.is_null() {
+                    let destroy: DestroyVoiceFn = std::mem::transmute(vtable(self.voice).add(VOICE_DESTROY).read());
+                    destroy(self.voice);
+                }
+                if !self.master.is_null() {
+                    let destroy: DestroyVoiceFn = std::mem::transmute(vtable(self.master).add(VOICE_DESTROY).read());
+                    destroy(self.master);
+                }
+                if !self.eng.is_null() {
+                    let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(vtable(self.eng).add(2).read());
+                    release(self.eng);
                 }
             }
         }
+    }
 
+    #[test]
+    fn output_meter_observes_windows_xaudio2() {
+        use std::time::{Duration, Instant};
+        use windows::Win32::Media::Audio::{eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator};
+        use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED};
+        struct Apartment;
+        impl Drop for Apartment {
+            fn drop(&mut self) { unsafe { CoUninitialize() } }
+        }
+        // A quiet synthetic tone; keep its storage alive until DestroyVoice has returned.
+        let pcm: Vec<i16> = (0..4800).map(|i| ((i as f32 * std::f32::consts::TAU / 100.0).sin() * 512.0) as i16).collect();
+        unsafe {
+            CoInitializeEx(None, COINIT_MULTITHREADED).ok().expect("meter test COM apartment");
+            let _apartment = Apartment;
+            let devices: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).expect("audio endpoint enumeration");
+            if let Err(e) = devices.GetDefaultAudioEndpoint(eRender, eConsole) {
+                assert_eq!(e.code().0 as u32, 0x8007_0490, "unexpected audio endpoint error: {e}");
+                eprintln!("SKIPPED output_meter_observes_windows_xaudio2: no audio device ({e})");
+                return;
+            }
+            let mut guard = AudioGuard { eng: std::ptr::null_mut(), master: std::ptr::null_mut(), voice: std::ptr::null_mut() };
+            assert_eq!(XAudio2Create(&mut guard.eng, 0, 1), S_OK);
+            let create_master: CreateMasteringVoiceFn = std::mem::transmute(vtable(guard.eng).add(ENGINE_CREATE_MASTERING_VOICE).read());
+            let hr = create_master(guard.eng, &mut guard.master, 0, 0, 0, std::ptr::null(), std::ptr::null(), AUDIO_CATEGORY_GAME_EFFECTS);
+            assert_eq!(hr, S_OK, "CreateMasteringVoice with an available endpoint: {hr:#x}");
+            let create_src: CreateSourceVoiceFn = std::mem::transmute(vtable(guard.eng).add(ENGINE_CREATE_SOURCE_VOICE).read());
+            assert_eq!(create_src(guard.eng, &mut guard.voice, &pcm16_for_rate(1, 48_000), 0, 2.0, std::ptr::null_mut(), std::ptr::null(), std::ptr::null()), S_OK);
+            let mut b = buffer((pcm.len() * 2) as u32, 0, 0, 0, 0, 255);
+            b.audio_data = pcm.as_ptr() as *const u8;
+            let submit: SubmitSourceBufferFn = std::mem::transmute(vtable(guard.voice).add(VOICE_SUBMIT_SOURCE_BUFFER).read());
+            assert_eq!(submit(guard.voice, &b, std::ptr::null()), S_OK);
+            let start: unsafe extern "system" fn(*mut c_void, u32, u32) -> HRESULT = std::mem::transmute(vtable(guard.voice).add(19).read());
+            assert_eq!(start(guard.voice, 0, 0), S_OK);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut peak = 0.0_f32;
+            while Instant::now() < deadline {
+                if let Some(p) = crate::hle::audio_output::current_process_peak().expect("Windows session meter") {
+                    peak = peak.max(p);
+                    if peak > 0.0 { break; }
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(peak > 0.0, "synthetic PCM must reach this process's Windows session meter");
+            eprintln!("output meter: synthetic PCM session peak {peak:.6}");
+        }
+    }
+
+    #[test]
+    fn clamped_and_silenced_buffers_accepted_by_windows_xaudio2() {
         // Buffers declared before the guard so the guard drops first (destroying voices before backing memory frees).
         let pcm = vec![0u8; 960 * 4];
         let sil = vec![0u8; 64 * 1024];
