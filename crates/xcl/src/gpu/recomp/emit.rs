@@ -1473,11 +1473,16 @@ impl Em {
         if name.starts_with("s_buffer_load") {
             // V#: base = dw0 | dw1[15:0] << 32, stride = dw1[29:16], num_records = dw2
             let (d0, d1, d2) = (self.sreg(sbase), self.sreg(sbase + 1), self.sreg(sbase + 2));
-            self.window(&d1);
             self.line(&format!("uint {t}_off = {} + {soff};", hex(imm)));
             self.line(&format!("uint {t}_st = ({d1} >> 16) & 0x3FFFu;"));
             self.line(&format!("uint {t}_lim = select({t}_st == 0u, {d2}, {d2} * {t}_st);"));
-            self.line(&format!("uint {t}_a = ({d0} + {t}_off) & ~3u;"));
+            if self.opt.mem_windows > 1 {
+                self.line(&format!("uint64_t {t}_ea = ((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){t}_off;"));
+                self.window_read(&format!("(uint)({t}_ea >> 32)"));
+                self.line(&format!("uint {t}_a = (uint){t}_ea & ~3u;"));
+            } else {
+                self.line(&format!("uint {t}_a = ({d0} + {t}_off) & ~3u;"));
+            }
             // Branch-free: a dword past num_records reads offset 0 (always in the window) and
             // comes out 0. HLSL 2021's `?:` is a branch, and with several memory windows every
             // access is a switch between them (`windowed`): one per dword made DXC several
@@ -1499,9 +1504,17 @@ impl Em {
             let imm = ((imm << 11) as i32 >> 11) as u32; // 21-bit signed
             let b = self.sreg(sbase);
             let hi = self.sreg(sbase + 1);
-            self.window(&hi);
             // the dwords are contiguous: Load2 / Load4 (one window switch per four dwords)
-            self.line(&format!("uint {t}_a = ({b} + {} + {soff}) & ~3u;", hex(imm)));
+            if self.opt.mem_windows > 1 {
+                self.line(&format!(
+                    "uint64_t {t}_ea = ((((uint64_t){hi}) << 32) | (uint64_t){b}) + (uint64_t)(int64_t)(int){} + (uint64_t){soff};",
+                    hex(imm)
+                ));
+                self.window_read(&format!("(uint)({t}_ea >> 32)"));
+                self.line(&format!("uint {t}_a = (uint){t}_ea & ~3u;"));
+            } else {
+                self.line(&format!("uint {t}_a = ({b} + {} + {soff}) & ~3u;", hex(imm)));
+            }
             match count {
                 1 => {
                     self.line(&format!("uint {t}_0 = mem.Load({t}_a);"));
@@ -1537,20 +1550,81 @@ impl Em {
         Ok(())
     }
 
-    /// Several memory windows: the accesses that follow go to the window of the address
-    /// whose high dword (bits 32..63) is `hi` (`xcl_w`, read by the `mem` accessors).
-    fn window(&mut self, hi: &str) {
+    /// Several memory windows: select the window for a READ whose high dword (bits 32..63) is
+    /// `hi`. 32-bit console descriptor table pointers pass `hi == 0` (window 0); any other `hi`
+    /// outside `[xcl_uma_base, xcl_uma_base + mem_windows)` falls into the `default` arm of the
+    /// memory accessors (reads 0, never aliases another window).
+    fn window_read(&mut self, hi: &str) {
         if self.opt.mem_windows > 1 {
-            self.line(&format!("xcl_w = ({hi}) & 3u;"));
+            let t = self.t();
+            self.line(&format!("uint {t}_hi = {hi}; xcl_w = select({t}_hi == 0u, 0u, {t}_hi - xcl_uma_base);"));
         }
     }
 
-    /// `window` for a FLAT / global address: SADDR pair (global with SADDR) or the 64-bit
-    /// VGPR address.
-    fn flat_window(&mut self, global: bool, saddr: u64, addr: u64) {
+    /// Several memory windows: select the window for a WRITE / ATOMIC whose high dword is `hi`.
+    /// Unlike reads, `hi == 0` is NOT mapped to window 0 (unless `xcl_uma_base == 0`), so null
+    /// pointers and out-of-UMA addresses are dropped instead of clobbering window 0 descriptor
+    /// heaps or coherent window 3 CPU memory.
+    fn window_write(&mut self, hi: &str) {
         if self.opt.mem_windows > 1 {
-            let hi = if global && saddr != 0x7D && saddr != 0x7F { self.sreg(saddr + 1) } else { self.vreg(addr + 1) };
-            self.window(&hi);
+            self.line(&format!("xcl_w = ({hi}) - xcl_uma_base;"));
+        }
+    }
+
+    /// Compute the effective address of a FLAT / GLOBAL access into `uint {t}_a` (masked by
+    /// `~align_mask` when non-zero) and, when `mem_windows > 1`, select `xcl_w` from the exact
+    /// 64-bit address (carrying/borrowing across 4 GiB window boundaries).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_flat_addr(&mut self, global: bool, addtid: bool, saddr: u64, addr: u64, off: u32, align_mask: u32, is_write: bool, t: &str) {
+        let has_saddr = (addtid || global) && saddr != 0x7D && saddr != 0x7F;
+        if self.opt.mem_windows > 1 {
+            let off64 = if global { format!("(uint64_t)(int64_t)(int){}", hex(off)) } else { format!("(uint64_t){}", hex(off)) };
+            let ea = if addtid {
+                if has_saddr {
+                    let (s_lo, s_hi) = (self.sreg(saddr), self.sreg(saddr + 1));
+                    format!("((((uint64_t){s_hi}) << 32) | (uint64_t){s_lo}) + (uint64_t)(4u * lane_id) + {off64}")
+                } else {
+                    format!("(uint64_t)(4u * lane_id) + {off64}")
+                }
+            } else if has_saddr {
+                let (s_lo, s_hi) = (self.sreg(saddr), self.sreg(saddr + 1));
+                let v_lo = self.vreg(addr);
+                format!("((((uint64_t){s_hi}) << 32) | (uint64_t){s_lo}) + (uint64_t){v_lo} + {off64}")
+            } else {
+                let (v_lo, v_hi) = (self.vreg(addr), self.vreg(addr + 1));
+                format!("((((uint64_t){v_hi}) << 32) | (uint64_t){v_lo}) + {off64}")
+            };
+            self.line(&format!("uint64_t {t}_ea = {ea};"));
+            if is_write {
+                self.window_write(&format!("(uint)({t}_ea >> 32)"));
+            } else {
+                self.window_read(&format!("(uint)({t}_ea >> 32)"));
+            }
+            if align_mask == 0 {
+                self.line(&format!("uint {t}_a = (uint){t}_ea;"));
+            } else {
+                self.line(&format!("uint {t}_a = (uint){t}_ea & ~{align_mask}u;"));
+            }
+        } else {
+            let base = if addtid {
+                if has_saddr {
+                    format!("{} + 4u * lane_id", self.sreg(saddr))
+                } else {
+                    "4u * lane_id".to_string()
+                }
+            } else {
+                let v_lo = self.vreg(addr);
+                if has_saddr {
+                    format!("{} + {v_lo}", self.sreg(saddr))
+                } else {
+                    v_lo
+                }
+            };
+            if align_mask == 0 {
+                self.line(&format!("uint {t}_a = {base} + {};", hex(off)));
+            } else {
+                self.line(&format!("uint {t}_a = ({base} + {}) & ~{align_mask}u;", hex(off)));
+            }
         }
     }
 
@@ -1601,15 +1675,35 @@ impl Em {
         let soff = self.code32(f("SOFFSET"), None, false).ok_or("op")?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
         let (d0, d1, d2, d3) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2), self.sreg(srsrc + 3));
-        self.window(&d1);
         let index = if idxen { self.vreg(vaddr) } else { "0u".into() };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         let t = self.t();
+        let is_store = small.map_or(matches!(kind, BufKind::Store | BufKind::FormatStore), |(_, _, s)| s);
         self.line(&format!("uint {t}_stride = ({d1} >> 16) & 0x3FFFu;"));
-        self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
-        self.line(&format!("uint {t}_a = {d0} + {soff} + {t}_off + {t}_stride * {index};"));
+        if self.opt.mem_windows > 1 {
+            self.line(&format!("uint64_t {t}_off = (uint64_t){voff} + (uint64_t){}u;", f("OFFSET")));
+            self.line(&format!(
+                "uint64_t {t}_ea = ((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){soff} + {t}_off + (uint64_t){t}_stride * (uint64_t){index};"
+            ));
+            if is_store {
+                self.window_write(&format!("(uint)({t}_ea >> 32)"));
+            } else {
+                self.window_read(&format!("(uint)({t}_ea >> 32)"));
+            }
+            self.line(&format!("uint {t}_a = (uint){t}_ea;"));
+        } else {
+            self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
+            self.line(&format!("uint {t}_a = {d0} + {soff} + {t}_off + {t}_stride * {index};"));
+        }
         let act = self.act();
-        let in_range = |bytes: String| format!("select({t}_stride == 0u, {t}_off + {bytes} <= {d2}, {index} < {d2})");
+        let multi = self.opt.mem_windows > 1;
+        let in_range = |bytes: String| {
+            if multi {
+                format!("select({t}_stride == 0u, {t}_off + (uint64_t)({bytes}) <= (uint64_t){d2}, {index} < {d2})")
+            } else {
+                format!("select({t}_stride == 0u, {t}_off + {bytes} <= {d2}, {index} < {d2})")
+            }
+        };
         if let Some((n, signed, store)) = small {
             let ok = in_range(format!("{n}u"));
             let v = self.vreg(vdata);
@@ -2059,7 +2153,7 @@ impl Em {
                 None => format!("((uint64_t)({node} & ~7u) << 3)"),
             };
             self.line(&format!("uint64_t {a} = ((((uint64_t)({d1} & 0xFFu) << 32) | (uint64_t){d0}) << 8) + {off};"));
-            self.window(&format!("(uint)({a} >> 32)"));
+            self.window_read(&format!("(uint)({a} >> 32)"));
             self.line(&format!("uint4 {t} = bvh_intersect({node} & 7u, (uint){a}, {extent}, {origin}, {dir}, {inv}, ({d1} >> 31) != 0u);"));
             let st: Vec<String> = (0..4).map(|c| format!("{} = {t}.{};", self.vreg(vdata + c), ["x", "y", "z", "w"][c as usize])).collect();
             self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
@@ -3677,7 +3771,6 @@ impl Em {
         let soff = self.code32(f("SOFFSET"), None, false).ok_or("op")?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
         let (d0, d1, d2) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2));
-        self.window(&d1);
         let index = if idxen { self.vreg(vaddr) } else { "0u".into() };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         let t = self.t();
@@ -3685,9 +3778,19 @@ impl Em {
         let op = op.trim_end_matches("_x2");
         let bytes = if x2 { 8 } else { 4 };
         self.line(&format!("uint {t}_stride = ({d1} >> 16) & 0x3FFFu;"));
-        self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
-        self.line(&format!("uint {t}_a = ({d0} + {soff} + {t}_off + {t}_stride * {index}) & ~{}u;", bytes - 1));
-        self.line(&format!("bool {t}_ok = select({t}_stride == 0u, {t}_off + {bytes}u <= {d2}, {index} < {d2});"));
+        if self.opt.mem_windows > 1 {
+            self.line(&format!("uint64_t {t}_off = (uint64_t){voff} + (uint64_t){}u;", f("OFFSET")));
+            self.line(&format!(
+                "uint64_t {t}_ea = ((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){soff} + {t}_off + (uint64_t){t}_stride * (uint64_t){index};"
+            ));
+            self.window_write(&format!("(uint)({t}_ea >> 32)"));
+            self.line(&format!("uint {t}_a = (uint){t}_ea & ~{}u;", bytes - 1));
+            self.line(&format!("bool {t}_ok = select({t}_stride == 0u, {t}_off + (uint64_t){bytes}u <= (uint64_t){d2}, {index} < {d2});"));
+        } else {
+            self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
+            self.line(&format!("uint {t}_a = ({d0} + {soff} + {t}_off + {t}_stride * {index}) & ~{}u;", bytes - 1));
+            self.line(&format!("bool {t}_ok = select({t}_stride == 0u, {t}_off + {bytes}u <= {d2}, {index} < {d2});"));
+        }
         let act = self.act();
         if x2 {
             return self.atomic64(op, &format!("{t}_a"), vdata, vdata + 2, f("GLC") == 1, vdata, &format!("and({act}, {t}_ok)"));
@@ -3726,14 +3829,30 @@ impl Em {
         let soff = self.code32(f("SOFFSET"), None, false).ok_or("op")?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
         let (d0, d1, d2) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2));
-        self.window(&d1);
         let index = if idxen { self.vreg(vaddr) } else { "0u".into() };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         let t = self.t();
         self.line(&format!("uint {t}_stride = ({d1} >> 16) & 0x3FFFu;"));
-        self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
-        self.line(&format!("uint {t}_a = {d0} + {soff} + {t}_off + {t}_stride * {index};"));
-        let ok = format!("select({t}_stride == 0u, {t}_off + {n}u <= {d2}, {index} < {d2})");
+        if self.opt.mem_windows > 1 {
+            self.line(&format!("uint64_t {t}_off = (uint64_t){voff} + (uint64_t){}u;", f("OFFSET")));
+            self.line(&format!(
+                "uint64_t {t}_ea = ((((uint64_t)({d1} & 0xFFFFu)) << 32) | (uint64_t){d0}) + (uint64_t){soff} + {t}_off + (uint64_t){t}_stride * (uint64_t){index};"
+            ));
+            if store {
+                self.window_write(&format!("(uint)({t}_ea >> 32)"));
+            } else {
+                self.window_read(&format!("(uint)({t}_ea >> 32)"));
+            }
+            self.line(&format!("uint {t}_a = (uint){t}_ea;"));
+        } else {
+            self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
+            self.line(&format!("uint {t}_a = {d0} + {soff} + {t}_off + {t}_stride * {index};"));
+        }
+        let ok = if self.opt.mem_windows > 1 {
+            format!("select({t}_stride == 0u, {t}_off + (uint64_t){n}u <= (uint64_t){d2}, {index} < {d2})")
+        } else {
+            format!("select({t}_stride == 0u, {t}_off + {n}u <= {d2}, {index} < {d2})")
+        };
         let act = self.act();
         let v = self.vreg(vdata);
         if store {
@@ -3758,14 +3877,11 @@ impl Em {
         }
         if let Some((n, signed, store, half)) = flat_small(op) {
             let global = d.enc.name == "ENC_FLAT_GLBL";
-            let addr = self.vreg(f("ADDR"));
             let saddr = f("SADDR");
-            let base = if global && saddr != 0x7D && saddr != 0x7F { format!("{} + {addr}", self.sreg(saddr)) } else { addr };
-            self.flat_window(global, saddr, f("ADDR"));
             let raw = f("OFFSET") as u32;
             let off = if global { (((raw << 20) as i32) >> 20) as u32 } else { raw };
             let t = self.t();
-            self.line(&format!("uint {t}_a = {base} + {};", hex(off)));
+            self.emit_flat_addr(global, false, saddr, f("ADDR"), off, 0, store, &t);
             let act = self.act();
             if store {
                 let v = self.vreg(f("DATA"));
@@ -3792,26 +3908,10 @@ impl Em {
         };
         let global = d.enc.name == "ENC_FLAT_GLBL";
         let saddr = f("SADDR");
-        let base = if op.ends_with("_addtid") {
-            // EA = SADDR ("off"/null sentinel → 0) + 4 * lane index + signed OFFSET
-            match saddr {
-                0x7D | 0x7F => "4u * lane_id".to_string(),
-                _ => format!("{} + 4u * lane_id", self.sreg(saddr)),
-            }
-        } else {
-            let addr = self.vreg(f("ADDR"));
-            if global && saddr != 0x7D && saddr != 0x7F {
-                let s = self.sreg(saddr);
-                format!("{s} + {addr}")
-            } else {
-                addr
-            }
-        };
-        self.flat_window(global, saddr, f("ADDR"));
         let raw = f("OFFSET") as u32;
         let off = if global { (((raw << 20) as i32) >> 20) as u32 } else { raw };
         let t = self.t();
-        self.line(&format!("uint {t}_a = {base} + {};", hex(off)));
+        self.emit_flat_addr(global, op.ends_with("_addtid"), saddr, f("ADDR"), off, 0, store, &t);
         let act = self.act();
         let mut st = Vec::new();
         for i in 0..count {
@@ -3876,16 +3976,13 @@ impl Em {
     fn flat_atomic(&mut self, d: &Decoded, op: &str) -> Result<(), &'static str> {
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
         let global = d.enc.name == "ENC_FLAT_GLBL";
-        let addr = self.vreg(f("ADDR"));
         let saddr = f("SADDR");
-        let base = if global && saddr != 0x7D && saddr != 0x7F { format!("{} + {addr}", self.sreg(saddr)) } else { addr };
-        self.flat_window(global, saddr, f("ADDR"));
         let raw = f("OFFSET") as u32;
         let off = if global { (((raw << 20) as i32) >> 20) as u32 } else { raw };
         let t = self.t();
         let x2 = op.ends_with("_x2");
         let op = op.trim_end_matches("_x2");
-        self.line(&format!("uint {t}_a = ({base} + {}) & ~{}u;", hex(off), if x2 { 7 } else { 3 }));
+        self.emit_flat_addr(global, false, saddr, f("ADDR"), off, if x2 { 7 } else { 3 }, true, &t);
         let act = self.act();
         if x2 {
             let data = f("DATA");
@@ -4207,7 +4304,7 @@ impl Em {
             for k in 1..windows {
                 let _ = writeln!(h, "{coherent}RWByteAddressBuffer mem{k} : register(u{});", 2 + k);
             }
-            h.push_str("static uint xcl_w = 0u;\n");
+            h.push_str("static uint xcl_w = 0u;\nstatic uint xcl_uma_base = 0u;\n");
             h.push_str(MEM_ACCESSORS_HERE);
         } else {
             h.push_str(LOADX4_ONE_WINDOW);
@@ -4248,6 +4345,9 @@ impl Em {
         let mut sg: BTreeSet<u64> = self.sgprs.clone();
         sg.extend([106, 107, 124, 126, 127]);
         let load_sgprs = |h: &mut String| {
+            if windows > 1 {
+                let _ = writeln!(h, "    xcl_w = 0u;\n    xcl_uma_base = io.Load({}u);", super::IO_UMA_BASE_HI * 4);
+            }
             for &c in &sg {
                 let _ = writeln!(h, "    uint {} = io.Load({}u);", sname(c).unwrap(), c * 4);
             }
@@ -5149,28 +5249,31 @@ fn windowed(h: &str, windows: u32, heap: Option<&str>) -> String {
 }
 
 /// The accessor functions: one per `mem` method (and overload) the translator emits.
+/// Only explicit windows `0..windows` touch GPU buffers; any out-of-range `xcl_w` hits
+/// `default` (reads return 0, stores/atomics are dropped and zero their `out` parameter) so
+/// out-of-UMA pointers can never wrap onto live memory windows.
 fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
-    let mut sigs: Vec<(&str, String, &str, &str)> = vec![
-        ("uint", "Load".into(), "uint a", "a"),
-        ("uint2", "Load2".into(), "uint a", "a"),
-        ("uint3", "Load3".into(), "uint a", "a"),
-        ("uint4", "Load4".into(), "uint a", "a"),
-        ("void", "Store".into(), "uint a, uint v", "a, v"),
-        ("void", "Store2".into(), "uint a, uint2 v", "a, v"),
-        ("void", "Store3".into(), "uint a, uint3 v", "a, v"),
-        ("void", "Store4".into(), "uint a, uint4 v", "a, v"),
-        ("void", "InterlockedCompareExchange".into(), "uint a, uint c, uint v, out uint o", "a, c, v, o"),
-        ("void", "InterlockedCompareExchange64".into(), "uint a, uint64_t c, uint64_t v, out uint64_t o", "a, c, v, o"),
+    let mut sigs: Vec<(&str, String, &str, &str, &str)> = vec![
+        ("uint", "Load".into(), "uint a", "a", "return 0u;"),
+        ("uint2", "Load2".into(), "uint a", "a", "return uint2(0u, 0u);"),
+        ("uint3", "Load3".into(), "uint a", "a", "return uint3(0u, 0u, 0u);"),
+        ("uint4", "Load4".into(), "uint a", "a", "return uint4(0u, 0u, 0u, 0u);"),
+        ("void", "Store".into(), "uint a, uint v", "a, v", "break;"),
+        ("void", "Store2".into(), "uint a, uint2 v", "a, v", "break;"),
+        ("void", "Store3".into(), "uint a, uint3 v", "a, v", "break;"),
+        ("void", "Store4".into(), "uint a, uint4 v", "a, v", "break;"),
+        ("void", "InterlockedCompareExchange".into(), "uint a, uint c, uint v, out uint o", "a, c, v, o", "o = 0u; break;"),
+        ("void", "InterlockedCompareExchange64".into(), "uint a, uint64_t c, uint64_t v, out uint64_t o", "a, c, v, o", "o = (uint64_t)0; break;"),
     ];
     for op in ["Add", "And", "Or", "Xor", "Exchange", "Min", "Max"] {
-        sigs.push(("void", format!("Interlocked{op}"), "uint a, uint v, out uint o", "a, v, o"));
+        sigs.push(("void", format!("Interlocked{op}"), "uint a, uint v, out uint o", "a, v, o", "o = 0u; break;"));
         if op != "Exchange" {
-            sigs.push(("void", format!("Interlocked{op}"), "uint a, uint v", "a, v"));
+            sigs.push(("void", format!("Interlocked{op}"), "uint a, uint v", "a, v", "break;"));
         }
-        sigs.push(("void", format!("Interlocked{op}64"), "uint a, uint64_t v, out uint64_t o", "a, v, o"));
+        sigs.push(("void", format!("Interlocked{op}64"), "uint a, uint64_t v, out uint64_t o", "a, v, o", "o = (uint64_t)0; break;"));
         if op == "Min" || op == "Max" {
-            sigs.push(("void", format!("Interlocked{op}"), "uint a, int v, out int o", "a, v, o"));
-            sigs.push(("void", format!("Interlocked{op}64"), "uint a, int64_t v, out int64_t o", "a, v, o"));
+            sigs.push(("void", format!("Interlocked{op}"), "uint a, int v, out int o", "a, v, o", "o = 0; break;"));
+            sigs.push(("void", format!("Interlocked{op}64"), "uint a, int64_t v, out int64_t o", "a, v, o", "o = (int64_t)0; break;"));
         }
     }
     let mut s = String::new();
@@ -5178,25 +5281,37 @@ fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
         // one access: window k is descriptor MEM_HEAP_BASE + k (a window the program does not
         // have reads window 0, as the switch's default did)
         let _ = writeln!(s, "#define XCL_MW {coherent}RWByteAddressBuffer m = ResourceDescriptorHeap[NonUniformResourceIndex({}u + (xcl_w < {windows}u ? xcl_w : 0u))]", super::MEM_HEAP_BASE);
-        let _ = writeln!(s, "uint4 xcl_loadx4(uint4 a) {{ XCL_MW; return uint4(m.Load(a.x), m.Load(a.y), m.Load(a.z), m.Load(a.w)); }}");
-        for (ret, name, params, args) in sigs {
+        // a window the program does not have (an address outside unified memory) reads zeros and
+        // drops stores and atomics, as the switch form's default arm does: it must not alias a
+        // live window
+        let _ = writeln!(s, "uint4 xcl_loadx4(uint4 a) {{ if (xcl_w >= {windows}u) return uint4(0u, 0u, 0u, 0u); XCL_MW; return uint4(m.Load(a.x), m.Load(a.y), m.Load(a.z), m.Load(a.w)); }}");
+        for (ret, name, params, args, def) in sigs {
             let r = if ret == "void" { "" } else { "return " };
-            let _ = writeln!(s, "{ret} xcl_m{name}({params}) {{ XCL_MW; {r}m.{name}({args}); }}");
+            let def = def.replace("break;", "return;");
+            let _ = writeln!(s, "{ret} xcl_m{name}({params}) {{ if (xcl_w >= {windows}u) {{ {def} }} XCL_MW; {r}m.{name}({args}); }}");
         }
         return s;
     }
     let _ = write!(s, "uint4 xcl_loadx4(uint4 a) {{ [branch] switch (xcl_w) {{ ");
+    let _ = write!(s, "case 0u: return uint4(mem.Load(a.x), mem.Load(a.y), mem.Load(a.z), mem.Load(a.w)); ");
     for k in 1..windows {
         let _ = write!(s, "case {k}u: return uint4(mem{k}.Load(a.x), mem{k}.Load(a.y), mem{k}.Load(a.z), mem{k}.Load(a.w)); ");
     }
-    let _ = writeln!(s, "default: return uint4(mem.Load(a.x), mem.Load(a.y), mem.Load(a.z), mem.Load(a.w)); }} }}");
-    for (ret, name, params, args) in sigs {
-        let r = if ret == "void" { "" } else { "return " };
+    let _ = writeln!(s, "default: return uint4(0u, 0u, 0u, 0u); }} }}");
+    for (ret, name, params, args, def) in sigs {
         let _ = write!(s, "{ret} xcl_m{name}({params}) {{ [branch] switch (xcl_w) {{ ");
-        for k in 1..windows {
-            let _ = write!(s, "case {k}u: {r}mem{k}.{name}({args}); break; ");
+        if ret == "void" {
+            let _ = write!(s, "case 0u: mem.{name}({args}); break; ");
+            for k in 1..windows {
+                let _ = write!(s, "case {k}u: mem{k}.{name}({args}); break; ");
+            }
+        } else {
+            let _ = write!(s, "case 0u: return mem.{name}({args}); ");
+            for k in 1..windows {
+                let _ = write!(s, "case {k}u: return mem{k}.{name}({args}); ");
+            }
         }
-        let _ = writeln!(s, "default: {r}mem.{name}({args}); break; }} }}");
+        let _ = writeln!(s, "default: {def} }} }}");
     }
     s
 }
