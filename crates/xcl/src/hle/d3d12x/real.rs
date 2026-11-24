@@ -553,6 +553,7 @@ pub fn init() -> Result<String, String> {
         }
         open_uma(&device);
         super::device_x::probe_dynamic_depth_bias(&device);
+        super::standin::probe(&device);
         crate::gpu::recomp::pso::note_image_atomics64(&device);
         let raw = device.into_raw(); // one reference kept for the process lifetime
         adopt(raw, Kind::Device);
@@ -2022,6 +2023,10 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     let mut copy = desc.as_ref().copied();
     if let Some(c) = copy.as_mut() {
         c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_view_format(c.Format.0 as u32) as i32);
+        // a view of a texture made in a stand-in format: in that format
+        if let Some(f) = super::standin::view_format_of(res, c.Format.0 as u32) {
+            c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(f as i32);
+        }
     }
     // a depth buffer's view in the formats the PC has for it (a D24S8 format itself, R16_UNORM of
     // a D16S8 buffer …: an invalid call, the device removed)
@@ -2209,6 +2214,9 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     if let (Some(c), Some(r)) = (copy.as_mut(), ID3D12Resource::from_raw_borrowed(&res)) {
         let rf = r.GetDesc().Format.0 as u32;
         c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_shader_view_format(rf, c.Format.0 as u32) as i32);
+        if let Some(f) = super::standin::view_format_of(res, c.Format.0 as u32) {
+            c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(f as i32);
+        }
     }
     let desc = copy.as_ref().map_or(desc, |c| c as *const _);
     super::present::note_use(res as usize, super::present::USE_UAV);
@@ -2362,6 +2370,13 @@ pub fn title_uploads() -> (u64, u64) {
 }
 
 unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, props: usize, flags: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let hr = committed_resource_x(this, props, flags, desc, state, clear, riid, ppv);
+    super::standin::note_created(desc, ppv, hr);
+    hr
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn committed_resource_x(this: *mut c_void, props: usize, flags: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     static SEEN: AtomicU64 = AtomicU64::new(0);
     if desc != 0 && std::env::var_os("XCL_D3D12_TRACE").is_some() && SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
         let w = |o: usize| *((desc + o) as *const u32);
@@ -2778,6 +2793,13 @@ pub(super) const PC_RESOURCE_STATES: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 |
 /// buffers-only heap) is made the PC's way (`device_x::pc_resource_desc`, the console's state
 /// bits dropped). Logged with the console's values.
 pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_void, heap: usize, offset: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let hr = placed_resource_in_heap_x(this, heap, offset, desc, state, clear, riid, ppv);
+    super::standin::note_created(desc, ppv, hr);
+    hr
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn placed_resource_in_heap_x(this: *mut c_void, heap: usize, offset: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     // a buffer in a heap that has unified memory (`note_heap_uma`): that memory at its offset
     if desc != 0 && crate::gpu::shader::readable(desc, 0x38) {
         let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
@@ -5422,6 +5444,9 @@ unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, de
     if let Some(c) = copy.as_mut() {
         let rf = ID3D12Resource::from_raw_borrowed(&res).map_or(0, |r| r.GetDesc().Format.0 as u32);
         c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_shader_view_format(rf, c.Format.0 as u32) as i32);
+        if let Some(f) = super::standin::view_format_of(res, c.Format.0 as u32) {
+            c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(f as i32);
+        }
     }
     let desc = copy.as_ref().map_or(desc, |c| c as *const _ as *const c_void);
     f(this, res, desc, handle);

@@ -820,10 +820,12 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                     std::ptr::copy_nonoverlapping(src.as_ptr() as *const u8, b.as_mut_ptr() as *mut u8, 4 * src.len());
                     b
                 };
-                let (dst, src) = (loc(1), loc(16));
+                let (mut dst, mut src) = (loc(1), loc(16));
                 let bx: [u32; 6] = [get(29), get(30), get(31), get(32), get(33), get(34)];
                 let (pd, ps) = (dst[0] as *mut c_void, src[0] as *mut c_void);
-                if ID3D12Resource::from_raw_borrowed(&pd).is_some() && ID3D12Resource::from_raw_borrowed(&ps).is_some() {
+                // (a texture made in a stand-in format: the footprint's format is its own)
+                let (ld, ls) = (dst.as_mut_ptr() as *mut D3D12_TEXTURE_COPY_LOCATION, src.as_mut_ptr() as *mut D3D12_TEXTURE_COPY_LOCATION);
+                if ID3D12Resource::from_raw_borrowed(&pd).is_some() && ID3D12Resource::from_raw_borrowed(&ps).is_some() && super::standin::copy_locations(&mut *ld, &mut *ls) {
                     list.CopyTextureRegion(
                         dst.as_ptr() as *const D3D12_TEXTURE_COPY_LOCATION,
                         get(13),

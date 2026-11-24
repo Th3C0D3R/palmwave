@@ -352,6 +352,11 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
     if matches!(u32::from_le_bytes(desc[0x20..0x24].try_into().unwrap()), 116 | 117) {
         return Err("a console float format the PC holds as R16G16B16A16_FLOAT".into());
     }
+    // likewise a target made in a stand-in format (`standin`)
+    let (format, flags) = (u32::from_le_bytes(desc[0x20..0x24].try_into().unwrap()), u32::from_le_bytes(desc[0x30..0x34].try_into().unwrap()));
+    if super::standin::resource_format(format, flags) != format {
+        return Err("a format the PC holds as a stand-in".into());
+    }
     // Render targets and depth buffers are the GPU's (their metadata planes, empty planes) –
     // except a small single-sample colour target with texels: a retail title makes its glyph
     // caches that way (256x256 R8 with ALLOW_RENDER_TARGET, two planes) and fills them from the

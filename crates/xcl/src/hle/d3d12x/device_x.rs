@@ -674,6 +674,11 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     if matches!(format, 86 | 115) && flags & 5 != 0 {
         d[0x20..0x24].copy_from_slice(&28u32.to_le_bytes());
     }
+    // a target in a format this device neither renders to nor writes (R9G9B9E5): its stand-in
+    let standin = super::standin::resource_format(format, flags);
+    if standin != format && dim != D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32 {
+        d[0x20..0x24].copy_from_slice(&standin.to_le_bytes());
+    }
     // a depth buffer the console also lets shaders write (a retail game's: ALLOW_DEPTH_STENCIL |
     // ALLOW_UNORDERED_ACCESS): the PC refuses the pair – the depth buffer stays
     if flags & 2 != 0 {
@@ -711,11 +716,12 @@ fn depth_typeless(f: u32) -> Option<u32> {
 }
 
 /// The format of a render target / depth view or pipeline on the PC: `pc_view_format`, and a
-/// B5G5R5A1 / B4G4R4A4 target is R8G8B8A8 (`pc_resource_desc`).
+/// B5G5R5A1 / B4G4R4A4 target is R8G8B8A8 (`pc_resource_desc`), one in a format the device does
+/// not render to its stand-in (`standin`).
 pub fn pc_target_format(f: u32) -> u32 {
     match f {
         86 | 115 => 28,
-        f => pc_view_format(f),
+        f => super::standin::for_format(f).unwrap_or_else(|| pc_view_format(f)),
     }
 }
 
@@ -856,6 +862,12 @@ fn note_alias(va: usize, x: &[u8; 0x38]) {
 /// memory (placed in its UMA heap); a texture gets a PC texture kept in step with the memory
 /// (`title_textures`: detiled as the console lays it out, uploaded again after CPU writes).
 pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void, va: u64, desc: *const u8, state: u32, clear: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let hr = placed_resource_x(this, va, desc, state, clear, riid, ppv);
+    super::standin::note_created(desc as usize, ppv, hr);
+    hr
+}
+
+unsafe fn placed_resource_x(this: *mut c_void, va: u64, desc: *const u8, state: u32, clear: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     static N: AtomicU64 = AtomicU64::new(0);
     if desc.is_null() || ppv.is_null() || !crate::gpu::shader::readable(desc as usize, 0x38) {
         return E_INVALIDARG;
