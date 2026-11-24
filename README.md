@@ -48,3 +48,5 @@ Run the workspace tests with `.\scripts\test.ps1`. The script reports GPU tests 
 ## License and credits
 
 The runtime comes from **ivall/xcl** and its contributors and is distributed under **GPL-2.0-only**. Third-party notices accompany the source. The Palmwave logo retains the license under which it was previously published. [Runtime license](LICENSE) · [Third-party notices](THIRD_PARTY.md) · [Logo license](assets/LICENSE.palmwave-logo)
+
+**AI used:** [realmoon.ai](https://realmoon.ai) (Moon AI)
