@@ -750,6 +750,19 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         return;
     }
     p.last = Instant::now();
+    if p.dumps.is_empty() && present_wait_ms() > 0 {
+        // `XCL_PRESENT_WAIT_MS`: the title's next frame waits until this one is done on the GPU
+        match fence::wait(&p.fence, p.value, &p.dev, Some(p.event), present_wait_ms()) {
+            Ok(()) => {}
+            Err(e) => {
+                p.disabled = matches!(&e, FenceError::Removed(_));
+                if p.disabled {
+                    crate::xlog_error!("present: waiting for the frame: {e}");
+                    return;
+                }
+            }
+        }
+    }
     if !p.dumps.is_empty() {
         match fence::wait(&p.fence, p.value, &p.dev, Some(p.event), frame_dump_wait_ms()) {
             Ok(()) => {
@@ -774,6 +787,21 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     if n == 0 {
         crate::xlog_info!("present: first game frame shown ({}x{})", desc.Width, desc.Height);
     }
+}
+
+/// `XCL_PRESENT_WAIT_MS` (default 120000, `0`: off): each present waits for the GPU to finish the
+/// frame it shows, at most that long, so the title never has two frames on the GPU at once. When
+/// a retail title's frames overlapped, its five queues blocked each other at a fence barrier and
+/// it stopped presenting for good (run P59, 19 minutes); runs whose every present waited for its
+/// frame (frame dumps with XCL_FRAME_DUMP_WAIT_MS) never did. The GPU is the bottleneck of those
+/// frames, so the lost overlap costs little.
+fn present_wait_ms() -> u32 {
+    static W: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *W.get_or_init(|| present_wait_from(std::env::var("XCL_PRESENT_WAIT_MS").ok().as_deref()))
+}
+
+fn present_wait_from(v: Option<&str>) -> u32 {
+    v.and_then(|v| v.trim().parse().ok()).unwrap_or(120_000)
 }
 
 /// `XCL_FRAME_DUMP=1`: every 120th shown frame is written to the logs folder (`XCL_FRAME_DUMP=n`,
@@ -1021,6 +1049,14 @@ impl Drop for Presenter {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn presents_wait_for_their_frame_unless_turned_off() {
+        assert_eq!(super::present_wait_from(None), 120_000);
+        assert_eq!(super::present_wait_from(Some(" 0 ")), 0);
+        assert_eq!(super::present_wait_from(Some("5000")), 5000);
+        assert_eq!(super::present_wait_from(Some("x")), 120_000);
+    }
+
     use super::*;
 
     #[test]
