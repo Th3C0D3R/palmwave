@@ -298,6 +298,30 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             return q;
         }
     }
+    // `XCL_HEAPS_VRAM_MB=n`: the title's GPU heaps of n MB or more go to the sparse VRAM windows
+    // instead of the coherent window below. There the GPU reads them from host memory across
+    // PCIe: a compute program's descriptor loads cost 4–7 µs a workgroup, and a retail game's
+    // world frames took seconds. In the sparse windows the CPU's writes reach the GPU at the next
+    // submission (write watch) and what the GPU writes is not seen by the CPU, so the small heaps
+    // (labels, readbacks) stay coherent.
+    if addr.is_null() && t & 0x1000 != 0 && p & PAGE_GRAPHICS_ANY != 0 && size >= heaps_vram_from() {
+        let align = if t & 0x8000_0000 != 0 {
+            4 << 20
+        } else if t & 0x2000_0000 != 0 && t & 0x0040_0000 == 0 {
+            2 << 20
+        } else {
+            crate::gpu::uma::GRAIN
+        };
+        let rounded = size.max(1).div_ceil(align) * align;
+        if let Some((q, _)) = crate::hle::d3d12x::sparse::alloc(rounded, align) {
+            static N: AtomicUsize = AtomicUsize::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 32 {
+                crate::xlog_info!("kernelx: GPU heap of {} MB (flags {t:#x}, protect {p:#x}) in sparse VRAM at {q:#x} (XCL_HEAPS_VRAM_MB)", rounded >> 20);
+            }
+            trace_mem("VirtualAlloc (graphics heap, sparse VRAM)", 0, rounded, t as u64, p, q);
+            return q as *mut c_void;
+        }
+    }
     // the title's GPU heaps (committed with a PAGE_GRAPHICS_* protection, write-combined: memory
     // the CPU writes and the GPU reads, as a PC game's upload heaps): in the coherent window, which
     // the GPU reads where it is – one copy (a retail game's 4.4 GB; as plain memory its shaders
@@ -360,6 +384,17 @@ unsafe fn reserve_watched(size: usize, t: u32, p: u32) -> *mut c_void {
 /// PAGE_GRAPHICS_NOACCESS … PAGE_GRAPHICS_NOCACHE (0x800 – 0x40000): the console's protection of
 /// GPU-visible memory
 const PAGE_GRAPHICS_ANY: u32 = 0x7_F800;
+
+/// Bytes from which the title's GPU heaps go to the sparse VRAM windows (`XCL_HEAPS_VRAM_MB`;
+/// `usize::MAX`, never, when unset).
+fn heaps_vram_from() -> usize {
+    static FROM: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *FROM.get_or_init(|| heaps_vram_from_env(std::env::var("XCL_HEAPS_VRAM_MB").ok().as_deref()))
+}
+
+fn heaps_vram_from_env(v: Option<&str>) -> usize {
+    v.and_then(|v| v.trim().parse::<usize>().ok()).map_or(usize::MAX, |mb| mb.max(1) << 20)
+}
 
 /// `XCL_TRACE_MEM=1`: the title's allocations of 64 KiB or more (the first 60; `XCL_TRACE_MEM=n`:
 /// the first n when n > 1)
@@ -1903,6 +1938,16 @@ pub unsafe extern "system" fn DisableThreadLibraryCalls(h: usize) -> BOOL {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_heaps_go_to_video_memory_only_from_the_size_asked() {
+        assert_eq!(heaps_vram_from_env(None), usize::MAX);
+        assert_eq!(heaps_vram_from_env(Some("big")), usize::MAX);
+        assert_eq!(heaps_vram_from_env(Some("64")), 64 << 20);
+        assert_eq!(heaps_vram_from_env(Some(" 256 ")), 256 << 20);
+        // 0: every heap (1 MB and up)
+        assert_eq!(heaps_vram_from_env(Some("0")), 1 << 20);
+    }
 
     #[test]
     fn affinity_masks_outside_the_process_are_fitted() {
