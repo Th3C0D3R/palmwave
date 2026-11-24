@@ -449,7 +449,7 @@ where
     for a in old_arrays.into_iter().filter(|&a| a != 0) {
         ApuFree(a as *mut c_void);
     }
-    crate::xlog_info!("acphal: SHAPE contexts {:?} (they do not run: no audio from the console's mixer)", c.counts);
+    crate::xlog_info!("acphal: SHAPE contexts {:?} allocated; hardware mixer not implemented (native Windows audio uses a separate path)", c.counts);
     S_OK
 }
 
