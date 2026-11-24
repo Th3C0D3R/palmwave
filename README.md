@@ -16,21 +16,29 @@ Palmwave runs Xbox Series X|S games on Windows. It is made with **Moon AI**, the
 
 ## Status
 
-### A retail Xbox Series game: it reaches world loading, not playable yet
+### A retail Xbox Series game: it loads its world without crashing, not playable yet
 
-Measured with Palmwave `0e0bbef` on an RTX 5080 (driver 621.14), a Ryzen 9 9950X3D and 61 GB of RAM, offline, with A pressed every 10 s from 30 s to pass the menus and `XCL_DSTORAGE_BCPACK_FILL=neutral`.
+Measured with Palmwave `c5bf293` on an RTX 5080 (driver 621.14), a Ryzen 9 9950X3D and 61 GB of RAM, offline, with A pressed every 10 s from 30 s to pass the menus, `XCL_DSTORAGE_BCPACK_FILL=neutral` and the title's hang detector turned off with `XCL_PATCH` (below).
 
 | Time | What happens |
 |---|---|
 | 0–4 s | The title boots and presents its own frames after about 4 s. |
 | 5–30 s | Its first screens, at 30 fps. |
-| 32–58 s | The intro video, at 30 fps. It ran at 3.5 fps while its video planes were copied a texel at a time and each texture upload waited on the CPU. |
-| 60–80 s | The world loads behind its loading screens, at 5–30 fps. Process commit levels off at about 29 GB. A per-texture layout table took 9 GB more before. DirectStorage requests no longer fail. |
-| from 82 s | The title stops presenting: its render jobs wait for pipelines that are still compiling. After 30 s without a frame, the title's own watchdog ends it, at about 110 s. |
+| 32–58 s | The intro video, at 30 fps. |
+| 60–80 s | The world loads behind its loading screens, at 5–30 fps. Process commit levels off at 30–35 GB. DirectStorage requests no longer fail. |
+| from 82 s | The title builds the compute pipelines of its world, one after another on one thread, and presents nothing until they are built. The game keeps running meanwhile: its sound plays all along. Runs of 25 and 60 minutes ended without a crash. |
+
+The first launch is the slow one. While it loads its world, the title binds hundreds of compute programs. The NVIDIA driver compiles most of them in 2–8 s each, but a few are giants of 12–25 MB of DXIL that take it up to about 30 minutes each. Everything built is kept on disk, both the DXIL and the driver's result. A later launch rebuilds the first 400 of these pipelines in under a minute, against 16 minutes the first time.
+
+**The title's hang detector.** The title ends itself on purpose after 30 s without a heartbeat from its main thread, which a first launch always hits while it compiles. `XCL_PATCH` writes byte patches into an image as it is loaded, each only where the bytes it expects are found, so another version of the file is left alone. For version 1.0.2.1 of the title's executable:
+
+```powershell
+$env:XCL_PATCH = "game_scarlett_master.exe+0x2215bdc:732e=9090;game_scarlett_master.exe+0x2215c70:7404=9090;game_scarlett_master.exe+0x2215d84:7404=9090"
+```
 
 What still separates it from playable, most urgent first:
 
-1. **Pipeline waits while the world loads.** The title's render jobs wait for graphics and compute pipelines still being compiled. A draw now waits at most 4 s. Next: one budget for all of a frame's pipeline waits, and the title's compute shaders compiled ahead of time.
+1. **Compile time of the world's compute programs on a first launch.** Next: compile the title's compute programs ahead of time (`xcl shaders <shaders.rpf> --precompile --only cs --pipelines`, which now uses every core) and make the giant programs smaller.
 2. **Video memory.** About 15 GB of video memory on a 16 GB card, in page pools that never shrink. Next: a video-memory budget that spills to system memory.
 3. **BCPack textures.** No BCPack mode is decoded yet. With `XCL_DSTORAGE_BCPACK_FILL=neutral`, the 768 such requests of a run complete with neutral grey blocks instead of failing.
 4. **Mesh pipelines.** 25,479 pipeline creations per run put the console's mesh shader in the amplification-shader slot and are refused, so whatever the title draws with them is missing.
