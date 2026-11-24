@@ -278,6 +278,9 @@ struct RenderTargets {
 #[derive(Default, Clone)]
 struct Bindings {
     heaps: Vec<usize>,
+    /// the console addresses of the view and sampler heap the title bound
+    /// (`console_heap::bound_bases`): what its programs' heap SGPRs hold
+    console_heaps: [u32; 2],
     topology: Option<u32>,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<windows::Win32::Foundation::RECT>,
@@ -3536,6 +3539,12 @@ pub(super) unsafe fn ensure_view_heap(this: *mut c_void) {
     }
 }
 
+/// The 32-bit console addresses of the view heap and the sampler heap `list` bound last (0:
+/// none): what a translated program finds in `recomp::IO_VIEW_HEAP` / `IO_SAMPLER_HEAP`.
+pub(super) fn heap_bases(list: *mut c_void) -> [u32; 2] {
+    LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).map_or([0; 2], |s| s.bindings.console_heaps)
+}
+
 /// console #32 SetDescriptorHeaps (PC #28)
 pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n: u32, heaps: *const usize) {
     const PC_SET_DESCRIPTOR_HEAPS: usize = 28;
@@ -3543,8 +3552,20 @@ pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n
     if heaps.is_null() || n == 0 {
         // no heaps: nothing bound any more (`ensure_view_heap` binds the shared heap again
         // before a translated draw or dispatch reads the memory windows from it)
-        with_bindings(this, |b| b.heaps.clear());
+        with_bindings(this, |b| {
+            b.heaps.clear();
+            b.console_heaps = [0; 2];
+        });
         return f(this, n, heaps);
+    }
+    // (the title's heaps, before the shared heap takes the views' place)
+    let bases = super::console_heap::bound_bases(std::slice::from_raw_parts(heaps, n as usize));
+    with_bindings(this, |b| b.console_heaps = bases);
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static CHANGES: AtomicU64 = AtomicU64::new(0);
+    let pair = bases[0] as u64 | (bases[1] as u64) << 32;
+    if LAST.swap(pair, Ordering::Relaxed) != pair && CHANGES.fetch_add(1, Ordering::Relaxed) < 8 {
+        crate::xlog_info!("D3D12.X: programs with dynamic resources get the view heap at {:#x} and the sampler heap at {:#x} (the heaps a list bound)", bases[0], bases[1]);
     }
     if super::console_heap::global_heap().is_none() {
         let given = std::slice::from_raw_parts(heaps, n as usize).to_vec();
@@ -4913,12 +4934,17 @@ mod tests {
         ext_vt[1..].copy_from_slice(&orig_vt);
         let fake = Box::new(FakeList { vt: unsafe { ext_vt.as_ptr().add(1) }, calls: Mutex::new(Vec::new()) });
         let list = &*fake as *const FakeList as *mut c_void;
-        with_bindings(list, |b| b.heaps = vec![0x1234_0000]);
+        with_bindings(list, |b| {
+            b.heaps = vec![0x1234_0000];
+            b.console_heaps = [0x4C61_0000, 0x6381_0000];
+        });
+        assert_eq!(heap_bases(list), [0x4C61_0000, 0x6381_0000]);
         unsafe {
             set_descriptor_heaps_x(list, 0, std::ptr::null());
             let mut bound = Vec::new();
             with_bindings(list, |b| bound = b.heaps.clone());
             assert!(bound.is_empty(), "no heap is bound after SetDescriptorHeaps(0, NULL)");
+            assert_eq!(heap_bases(list), [0, 0], "nor any console heap for programs with dynamic resources");
             assert_eq!(fake.calls.lock().unwrap().last(), Some(&Vec::new()));
             ensure_view_heap(list);
             with_bindings(list, |b| bound = b.heaps.clone());

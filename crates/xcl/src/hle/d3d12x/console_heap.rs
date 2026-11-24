@@ -335,6 +335,16 @@ pub fn start(obj: usize) -> Option<u64> {
     HEAPS.lock().unwrap().iter().find(|h| h.obj == obj).map(|h| h.shadow as u64)
 }
 
+/// What the console's driver gives a program for its SM 6.6 dynamic resources when a list
+/// binds the heaps `objs` (SetDescriptorHeaps): the 32-bit addresses (as descriptor tables
+/// are, window 0) of the first CBV/SRV/UAV heap and the first sampler heap among them, 0 where
+/// there is none (`recomp::IO_VIEW_HEAP` / `IO_SAMPLER_HEAP`).
+pub fn bound_bases(objs: &[usize]) -> [u32; 2] {
+    let heaps = HEAPS.lock().unwrap();
+    let first = |sampler: bool| objs.iter().find_map(|&o| heaps.iter().find(|h| h.obj == o && h.sampler == sampler)).map_or(0, |h| h.shadow as u32);
+    [first(false), first(true)]
+}
+
 /// A console slot: where its descriptor goes and its PC descriptors.
 #[derive(Clone, Copy, Debug)]
 pub struct Slot {
@@ -679,6 +689,24 @@ mod tests {
         unregister(0xA1);
         unregister(0xA2);
         assert!(start(0xA1).is_none() && slot(v).is_none() && slot(sm).is_none());
+    }
+
+    /// The heaps a list binds give their slots' console addresses – those of the first view
+    /// heap and of the first sampler heap, as descriptor tables have them – to the programs
+    /// that load descriptors from the heap themselves (`bound_bases`).
+    #[test]
+    fn bound_heaps_give_the_addresses_of_their_slots() {
+        let Some(_) = crate::gpu::uma::get() else { return };
+        assert!(register(0xB1, 4, 0x2000, 0x6000, 32, false, false, true));
+        assert!(register(0xB2, 2, 0xA000, 0, 16, true, false, true));
+        let (views, samplers) = (start(0xB1).unwrap() as u32, start(0xB2).unwrap() as u32);
+        assert_ne!(views, samplers);
+        assert_eq!(bound_bases(&[0xB2, 0xB1]), [views, samplers]);
+        assert_eq!(bound_bases(&[0xB1, 0xB0]), [views, 0], "an object that is no console heap names nothing");
+        assert_eq!(bound_bases(&[]), [0, 0]);
+        unregister(0xB1);
+        unregister(0xB2);
+        assert_eq!(bound_bases(&[0xB1, 0xB2]), [0, 0], "released");
     }
 
     /// Minecraft's view heaps: eight of 73 727 slots, 147 454 PC descriptors each – more in all
