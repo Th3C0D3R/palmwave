@@ -836,6 +836,12 @@ impl Em {
         let text = rdna2::format(d);
         self.line(&format!("// {:04x}: {text}", d.pc));
         self.cur_pc = d.pc;
+        // recognised whole-wave reduction (`upper_lanes`): capture the WaveActive* result
+        // before the first cross-lane step so partial waves never read unlaunched lanes
+        if let Some(&(v, op)) = self.upper.as_ref().and_then(|u| u.reduction_seeds.get(&d.pc)) {
+            let reg = self.vreg(v);
+            self.line(&format!("xcl_red_{:x} = {};", d.pc, op.hlsl(&reg)));
+        }
         // a far jump (`rdna2::resolve_far_jumps`) is an unconditional branch
         if let Some(t) = d.far_target {
             return Flow::Jump(t);
@@ -3479,31 +3485,40 @@ impl Em {
                 }
             }
             "v_readfirstlane_b32" => {
-                let (el, eh) = (self.sreg(126), self.sreg(127));
-                let eh = if self.opt.wave64 { eh } else { "0u".into() };
                 let t = self.t();
-                let rla = self.rla_uniform_fn();
-                self.line(&format!("uint {t} = {rla}({a}, first_lane({el}, {eh}));"));
+                if let Some(&seed) = self.upper.as_ref().and_then(|u| u.reduction_results.get(&d.pc)) {
+                    self.line(&format!("uint {t} = xcl_red_{seed:x};"));
+                } else {
+                    let (el, eh) = (self.sreg(126), self.sreg(127));
+                    let eh = if self.opt.wave64 { eh } else { "0u".into() };
+                    let rla = self.rla_uniform_fn();
+                    self.line(&format!("uint {t} = {rla}({a}, first_lane({el}, {eh}));"));
+                }
                 self.write32(&dst, &t);
                 return Ok(());
             }
             "v_readlane_b32" => {
                 let t = self.t();
-                let rla = self.rla_uniform_fn();
-                let read = format!("{rla}({a}, {b} & {wmask}u)");
-                // wave64 VS / PS (`upper_lanes`): in a 32-lane wave, lanes 32..63 without a lane
-                // read; a spill slot < 32 from its shadow whatever the wave size (its lane may
-                // not have been launched)
-                let slot = super::upper_lanes::slot(d);
-                match (self.upper.as_ref().and_then(|u| u.reads.get(&d.pc)).copied(), slot) {
-                    (Some(Read::Const(c)), Some(_)) => self.line(&format!("uint {t} = {c:#010x}u; if (!xcl_hw32) {t} = {read};")),
-                    (Some(Read::Const(c)), None) => {
-                        self.line(&format!("uint {t} = {read};"));
-                        self.line(&format!("{t} = select(and(xcl_hw32, ({b} & 63u) >= 32u), {c:#010x}u, {t});"));
+                if let Some(&seed) = self.upper.as_ref().and_then(|u| u.reduction_results.get(&d.pc)) {
+                    self.line(&format!("uint {t} = xcl_red_{seed:x};"));
+                } else {
+                    let rla = self.rla_uniform_fn();
+                    let read = format!("{rla}({a}, {b} & {wmask}u)");
+                    // wave64 VS / PS (`upper_lanes`): in a 32-lane wave, lanes 32..63 without a lane
+                    // read; a spill slot < 32 from its shadow whatever the wave size (its lane may
+                    // not have been launched)
+                    let slot = super::upper_lanes::slot(d);
+                    let upper_read = self.opt.split_wave64.then(|| self.upper.as_ref().and_then(|u| u.reads.get(&d.pc)).copied()).flatten();
+                    match (upper_read, slot) {
+                        (Some(Read::Const(c)), Some(_)) => self.line(&format!("uint {t} = {c:#010x}u; if (!xcl_hw32) {t} = {read};")),
+                        (Some(Read::Const(c)), None) => {
+                            self.line(&format!("uint {t} = {read};"));
+                            self.line(&format!("{t} = select(and(xcl_hw32, ({b} & 63u) >= 32u), {c:#010x}u, {t});"));
+                        }
+                        (Some(Read::Shadow), Some((v, l))) if l < 32 => self.line(&format!("uint {t} = xcl_sh{v}_{l};")),
+                        (Some(Read::Shadow), Some((v, l))) => self.line(&format!("uint {t} = xcl_sh{v}_{l}; if (!xcl_hw32) {t} = {read};")),
+                        _ => self.line(&format!("uint {t} = {read};")),
                     }
-                    (Some(Read::Shadow), Some((v, l))) if l < 32 => self.line(&format!("uint {t} = xcl_sh{v}_{l};")),
-                    (Some(Read::Shadow), Some((v, l))) => self.line(&format!("uint {t} = xcl_sh{v}_{l}; if (!xcl_hw32) {t} = {read};")),
-                    _ => self.line(&format!("uint {t} = {read};")),
                 }
                 self.write32(&dst, &t);
                 return Ok(());
@@ -3514,7 +3529,7 @@ impl Em {
                     let v = self.vreg(*n);
                     self.line(&format!("if (lane_id == ({b} & {wmask}u)) {v} = {a};"));
                     // a spill slot some read takes from its shadow (`upper_lanes`)
-                    let slot = super::upper_lanes::slot(d).filter(|s| self.upper.as_ref().is_some_and(|u| u.shadows.contains(s)));
+                    let slot = self.opt.split_wave64.then(|| super::upper_lanes::slot(d).filter(|s| self.upper.as_ref().is_some_and(|u| u.shadows.contains(s)))).flatten();
                     if let Some((v, l)) = slot {
                         self.line(&format!("xcl_sh{v}_{l} = {a};"));
                     }
@@ -3944,8 +3959,10 @@ impl Em {
                 };
                 self.line(&format!("uint {t} = {rla}({v}, {t}_l);"));
                 // a 32-lane wave of a wave64 VS / PS: lanes 32..63 hold a constant (`upper_lanes`)
-                if let Some(Read::Const(c)) = self.upper.as_ref().and_then(|u| u.reads.get(&d.pc)).copied() {
-                    self.line(&format!("{t} = select(and(xcl_hw32, {t}_l >= 32u), {c:#010x}u, {t});"));
+                if self.opt.split_wave64 {
+                    if let Some(Read::Const(c)) = self.upper.as_ref().and_then(|u| u.reads.get(&d.pc)).copied() {
+                        self.line(&format!("{t} = select(and(xcl_hw32, {t}_l >= 32u), {c:#010x}u, {t});"));
+                    }
                 }
                 self.line(&format!("{t} = select(lanebit_at({el}, {eh}, {t}_l), {t}, 0u);"));
                 let dst = Dst::V(f("VDST"));
@@ -4205,10 +4222,15 @@ impl Em {
             self.x64_prelude(&mut h);
         }
         if let Some(u) = &self.upper {
-            // wave64 VS / PS on a GPU with 32-lane waves only (`upper_lanes`)
-            h.push_str("// the wave has 32 lanes: it is a console wave whose lanes 32..63 are not populated\nstatic bool xcl_hw32 = false;\n");
-            for (v, l) in &u.shadows {
-                let _ = writeln!(h, "static uint xcl_sh{v}_{l} = 0u; // v_writelane slot: v{v} lane {l}");
+            if self.opt.split_wave64 {
+                // wave64 VS / PS on a GPU with 32-lane waves only (`upper_lanes`)
+                h.push_str("// the wave has 32 lanes: it is a console wave whose lanes 32..63 are not populated\nstatic bool xcl_hw32 = false;\n");
+                for (v, l) in &u.shadows {
+                    let _ = writeln!(h, "static uint xcl_sh{v}_{l} = 0u; // v_writelane slot: v{v} lane {l}");
+                }
+            }
+            for &pc in u.reduction_seeds.keys() {
+                let _ = writeln!(h, "static uint xcl_red_{pc:x} = 0u; // whole-wave reduction");
             }
         }
         let infos: Vec<String> = (0..BUF_FORMATS.len()).map(|i| format!("0x{:08X}u", buf_format_info(i))).collect();
@@ -4287,7 +4309,7 @@ impl Em {
                 out_struct(&mut h, "XclOut", &vs.outputs);
                 h.push_str("XclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n");
                 h.push_str(if self.opt.wave64 { "    lane_id = WaveGetLaneIndex();\n" } else { "    uint xcl_hw_lane = WaveGetLaneIndex();\n    xcl_w32 = WaveGetLaneCount() > 32u;\n    xcl_half = xcl_w32 ? xcl_hw_lane >> 5 : 0u;\n    lane_id = xcl_hw_lane & 31u;\n" });
-                if self.upper.is_some() {
+                if self.upper.is_some() && self.opt.split_wave64 {
                     h.push_str("    xcl_hw32 = WaveGetLaneCount() < 64u;\n");
                 }
                 load_sgprs(&mut h);
@@ -4599,7 +4621,7 @@ impl Em {
                 }
                 h.push_str("};\nXclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n    bool xcl_live = false;\n");
                 h.push_str(if self.opt.wave64 { "    lane_id = WaveGetLaneIndex();\n" } else { "    uint xcl_hw_lane = WaveGetLaneIndex();\n    xcl_w32 = WaveGetLaneCount() > 32u;\n    xcl_half = xcl_w32 ? xcl_hw_lane >> 5 : 0u;\n    lane_id = xcl_hw_lane & 31u;\n" });
-                if self.upper.is_some() {
+                if self.upper.is_some() && self.opt.split_wave64 {
                     h.push_str("    xcl_hw32 = WaveGetLaneCount() < 64u;\n");
                 }
                 load_sgprs(&mut h);

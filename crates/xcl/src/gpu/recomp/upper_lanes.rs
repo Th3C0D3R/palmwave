@@ -132,13 +132,105 @@ impl Hi {
 
 const UNWRITTEN: [Hi; 32] = [Hi::Unwritten; 32];
 
+/// Associative, commutative integer wave reduction lowered to HLSL `WaveActive*`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReduceOp {
+    MinU32,
+    MaxU32,
+    MinI32,
+    MaxI32,
+    Or,
+    And,
+    Xor,
+    Add,
+}
+
+impl ReduceOp {
+    fn from_valu(name: &str) -> Option<Self> {
+        Some(match name {
+            "V_MIN_U32" => Self::MinU32,
+            "V_MAX_U32" => Self::MaxU32,
+            "V_MIN_I32" => Self::MinI32,
+            "V_MAX_I32" => Self::MaxI32,
+            "V_OR_B32" => Self::Or,
+            "V_AND_B32" => Self::And,
+            "V_XOR_B32" => Self::Xor,
+            "V_ADD_NC_U32" => Self::Add,
+            _ => return None,
+        })
+    }
+
+    fn identity(self) -> u32 {
+        match self {
+            Self::MinU32 | Self::And => u32::MAX,
+            Self::MaxU32 | Self::Or | Self::Xor | Self::Add => 0,
+            Self::MinI32 => i32::MAX as u32,
+            Self::MaxI32 => i32::MIN as u32,
+        }
+    }
+
+    fn is_idempotent(self) -> bool {
+        !matches!(self, Self::Xor | Self::Add)
+    }
+
+    fn combine(self, a: u64, b: u64) -> u64 {
+        if a == 0 || b == 0 {
+            return 0;
+        }
+        if !self.is_idempotent() && (a & b) != 0 {
+            return 0;
+        }
+        a | b
+    }
+
+    pub fn hlsl(self, v: &str) -> String {
+        match self {
+            Self::MinU32 => format!("WaveActiveMin({v})"),
+            Self::MaxU32 => format!("WaveActiveMax({v})"),
+            Self::MinI32 => format!("asuint(WaveActiveMin(asint({v})))"),
+            Self::MaxI32 => format!("asuint(WaveActiveMax(asint({v})))"),
+            Self::Or => format!("WaveActiveBitOr({v})"),
+            Self::And => format!("WaveActiveBitAnd({v})"),
+            Self::Xor => format!("WaveActiveBitXor({v})"),
+            Self::Add => format!("WaveActiveSum({v})"),
+        }
+    }
+}
+
+/// Per-lane lane-set state of an in-progress whole-wave reduction held in a VGPR.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct VReduce {
+    seed_pc: u64,
+    src_vgpr: u64,
+    op: ReduceOp,
+    sets: [u64; 64],
+}
+
+/// Scalar lane-set state of an in-progress whole-wave reduction held in an SGPR.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct SReduce {
+    seed_pc: u64,
+    src_vgpr: u64,
+    op: ReduceOp,
+    set: u64,
+}
+
 #[derive(Clone, PartialEq)]
 struct State {
     s: [Word; 128],
+    /// What each SGPR holds in inactive (unlaunched + helper) lanes of 0..31.
+    /// Like `s[127]` for lanes 32..63, except `S_WQM` sets helper lanes to `Any`.
+    inact_lo: [Word; 128],
     /// VGPR → its lanes 32..63 (absent: all unwritten)
     hi: BTreeMap<u64, [Hi; 32]>,
     /// VGPR → its lanes < 32 (bit n: lane n) whose last write was a `v_writelane`
     lo: BTreeMap<u64, u32>,
+    /// VGPR → constant held by every inactive (unlaunched + helper) lane across 0..63
+    inact_const: BTreeMap<u64, u32>,
+    /// VGPR → in-progress whole-wave reduction state
+    red_v: BTreeMap<u64, VReduce>,
+    /// SGPR → in-progress whole-wave reduction state (from `v_readlane`)
+    red_s: BTreeMap<u64, SReduce>,
 }
 
 impl State {
@@ -146,12 +238,27 @@ impl State {
         let mut s = [Word::Any; 128];
         s[125] = Word::Zero; // NULL
         s[127] = Word::Zero; // EXEC's upper word: lanes 32..63 are not populated
-        State { s, hi: BTreeMap::new(), lo: BTreeMap::new() }
+        let mut inact_lo = [Word::Any; 128];
+        inact_lo[125] = Word::Zero;
+        inact_lo[126] = Word::Zero; // EXEC's low word: unlaunched + helper lanes are inactive
+        State {
+            s,
+            inact_lo,
+            hi: BTreeMap::new(),
+            lo: BTreeMap::new(),
+            inact_const: BTreeMap::new(),
+            red_v: BTreeMap::new(),
+            red_s: BTreeMap::new(),
+        }
     }
 
     fn join(&self, o: &State) -> State {
         let mut s = self.s;
         for (a, b) in s.iter_mut().zip(o.s) {
+            *a = a.join(b);
+        }
+        let mut inact_lo = self.inact_lo;
+        for (a, b) in inact_lo.iter_mut().zip(o.inact_lo) {
             *a = a.join(b);
         }
         let mut hi = self.hi.clone();
@@ -169,7 +276,10 @@ impl State {
                 (m != 0).then_some((*v, m))
             })
             .collect();
-        State { s, hi, lo }
+        let inact_const = self.inact_const.iter().filter(|(v, c)| o.inact_const.get(v) == Some(*c)).map(|(&v, &c)| (v, c)).collect();
+        let red_v = self.red_v.iter().filter(|(v, r)| o.red_v.get(v) == Some(*r)).map(|(&v, r)| (v, r.clone())).collect();
+        let red_s = self.red_s.iter().filter(|(r, s)| o.red_s.get(r) == Some(*s)).map(|(&r, &s)| (r, s)).collect();
+        State { s, inact_lo, hi, lo, inact_const, red_v, red_s }
     }
 
     fn upper(&self, v: u64) -> [Hi; 32] {
@@ -187,6 +297,23 @@ impl State {
     fn set(&mut self, r: u64, w: Word) {
         if r < 128 && r != 125 {
             self.s[r as usize] = w;
+        }
+    }
+
+    fn set_inact_lo(&mut self, r: u64, w: Word) {
+        if r < 128 && r != 125 {
+            self.inact_lo[r as usize] = w;
+        }
+    }
+
+    /// A 32-bit scalar source in inactive lanes of 0..31.
+    fn src_inact_lo(&self, d: &Decoded, code: u64) -> Word {
+        match code {
+            0..=124 | 126 | 127 => self.inact_lo[code as usize],
+            125 | 128 => Word::Zero,
+            193 => Word::Ones,
+            255 => d.literal.map_or(Word::Any, Word::of),
+            _ => Word::Any,
         }
     }
 
@@ -237,6 +364,11 @@ pub struct UpperLanes {
     pub reads: BTreeMap<u64, Read>,
     /// (VGPR, lane) slots read from their shadow: their `v_writelane`s also write it
     pub shadows: BTreeSet<(u64, u32)>,
+    /// pc of the first cross-lane step of a recognised whole-wave reduction → (input VGPR, op)
+    pub reduction_seeds: BTreeMap<u64, (u64, ReduceOp)>,
+    /// pc of the `v_readlane` / `v_readfirstlane` reading a recognised whole-wave reduction →
+    /// seed pc (`xcl_red_<seed>`)
+    pub reduction_results: BTreeMap<u64, u64>,
 }
 
 impl UpperLanes {
@@ -541,21 +673,185 @@ fn vgpr_writes(d: &Decoded) -> Vec<u64> {
     w
 }
 
+/// A 32-bit compile-time constant from a VALU operand code (independent of lane).
+fn const_u32(st: &State, d: &Decoded, code: u64) -> Option<u32> {
+    match code {
+        128..=192 => Some((code - 128) as u32),
+        193..=208 => Some((-((code - 192) as i32)) as u32),
+        240..=248 => f32_inline(code),
+        255 => d.literal,
+        0..=127 => st.src32(d, code).value(),
+        _ => None,
+    }
+}
+
+/// Evaluate a whole-wave reduction step writing `vdst` while EXEC is all ones.
+fn eval_reduce(d: &Decoded, st: &State, vdst: u64) -> Option<VReduce> {
+    let name = d.inst.name;
+    let fv = |f: &str| rdna2::field_value(d.enc, &d.words, f).unwrap_or(0);
+    if d.enc.name == "ENC_VOP3" && (fv("ABS") != 0 || fv("NEG") != 0 || fv("CLAMP") != 0 || fv("OMOD") != 0) {
+        return None;
+    }
+    if matches!(name, "V_PERMLANE16_B32" | "V_PERMLANEX16_B32") {
+        let src_v = fv("SRC0").checked_sub(256)?;
+        let src = st.red_v.get(&src_v)?;
+        let xor_row = usize::from(name == "V_PERMLANEX16_B32");
+        let s1 = const_u32(st, d, fv("SRC1"));
+        let s2 = const_u32(st, d, fv("SRC2"));
+        let mut sets = [0u64; 64];
+        for row in 0..4 {
+            let srow = row ^ xor_row;
+            let first = src.sets[srow * 16];
+            if first != 0 && (0..16).all(|k| src.sets[srow * 16 + k] == first) {
+                sets[row * 16..row * 16 + 16].fill(first);
+            } else if let (Some(lo), Some(hi)) = (s1, s2) {
+                for i in 0..16 {
+                    let word = if i < 8 { lo } else { hi };
+                    let n = ((word >> (4 * (i & 7))) & 15) as usize;
+                    sets[row * 16 + i] = src.sets[srow * 16 + n];
+                }
+            }
+        }
+        return sets.iter().any(|&x| x != 0).then_some(VReduce { sets, ..*src });
+    }
+    if name == "V_MOV_B32" && d.variant == Variant::Plain {
+        let src_v = fv("SRC0").checked_sub(256)?;
+        return st.red_v.get(&src_v).cloned();
+    }
+    let op = ReduceOp::from_valu(name)?;
+    let (src0, src1) = match d.enc.name {
+        "ENC_VOP2" => (fv("SRC0"), 256 + fv("VSRC1")),
+        "ENC_VOP3" => (fv("SRC0"), fv("SRC1")),
+        _ => return None,
+    };
+    match d.variant {
+        Variant::Sdwa => None,
+        Variant::Dpp8 | Variant::Dpp16 => {
+            let e = ext_encoding(d)?;
+            let x = |n: &str| rdna2::field_value(e, &d.words, n).unwrap_or(0);
+            let v0 = x("VSRC0");
+            let v1 = src1.checked_sub(256)?;
+            let seed = |v: u64| {
+                (st.inact_const.get(&v) == Some(&op.identity())).then(|| VReduce {
+                    seed_pc: d.pc,
+                    src_vgpr: v,
+                    op,
+                    sets: std::array::from_fn(|l| 1u64 << l),
+                })
+            };
+            let (r0, r1) = if v0 == v1 {
+                let r = st.red_v.get(&v0).filter(|r| r.op == op).cloned().or_else(|| seed(v0))?;
+                (r.clone(), r)
+            } else {
+                let a = st.red_v.get(&v0).filter(|r| r.op == op)?;
+                let b = st.red_v.get(&v1).filter(|r| r.op == op && r.seed_pc == a.seed_pc)?;
+                (a.clone(), b.clone())
+            };
+            let mut sets = [0u64; 64];
+            if d.variant == Variant::Dpp8 {
+                let sel: [usize; 8] = std::array::from_fn(|i| x(&format!("LANE_SEL_{i}")) as usize);
+                for l in 0..64 {
+                    let s = (l & !7) | sel[l & 7];
+                    sets[l] = op.combine(r0.sets[s], r1.sets[l]);
+                }
+            } else {
+                if x("ROW_MASK") != 0xF || x("BANK_MASK") != 0xF {
+                    return None;
+                }
+                let ctrl = x("DPP_CTRL");
+                let bound = x("BOUND_CTRL") == 1;
+                for l in 0..64 {
+                    sets[l] = match dpp16_lane(ctrl, l as u32)? {
+                        Some(s) => op.combine(r0.sets[s as usize], r1.sets[l]),
+                        None if !bound && vdst == v1 => r1.sets[l],
+                        None if bound && op.identity() == 0 => r1.sets[l],
+                        None => 0,
+                    };
+                }
+            }
+            sets.iter().any(|&x| x != 0).then_some(VReduce { sets, ..r0 })
+        }
+        Variant::Plain => {
+            let mut sets = [0u64; 64];
+            let (seed_pc, src_vgpr) = match (src0.checked_sub(256), src1.checked_sub(256)) {
+                (Some(v0), Some(v1)) => {
+                    let a = st.red_v.get(&v0).filter(|r| r.op == op)?;
+                    let b = st.red_v.get(&v1).filter(|r| r.op == op && r.seed_pc == a.seed_pc)?;
+                    for l in 0..64 {
+                        sets[l] = op.combine(a.sets[l], b.sets[l]);
+                    }
+                    (a.seed_pc, a.src_vgpr)
+                }
+                (None, Some(v1)) => {
+                    let a = st.red_s.get(&src0).filter(|r| r.op == op)?;
+                    let b = st.red_v.get(&v1).filter(|r| r.op == op && r.seed_pc == a.seed_pc)?;
+                    for l in 0..64 {
+                        sets[l] = op.combine(a.set, b.sets[l]);
+                    }
+                    (a.seed_pc, a.src_vgpr)
+                }
+                (Some(v0), None) => {
+                    let a = st.red_v.get(&v0).filter(|r| r.op == op)?;
+                    let b = st.red_s.get(&src1).filter(|r| r.op == op && r.seed_pc == a.seed_pc)?;
+                    for l in 0..64 {
+                        sets[l] = op.combine(a.sets[l], b.set);
+                    }
+                    (a.seed_pc, a.src_vgpr)
+                }
+                (None, None) => return None,
+            };
+            sets.iter().any(|&x| x != 0).then_some(VReduce { seed_pc, src_vgpr, op, sets })
+        }
+    }
+}
+
+/// Constant written to every inactive (unlaunched + helper) lane of a VGPR in whole-wave mode.
+fn eval_inact_const(d: &Decoded, st: &State) -> Option<u32> {
+    if d.variant != Variant::Plain {
+        return None;
+    }
+    let fv = |f: &str| rdna2::field_value(d.enc, &d.words, f).unwrap_or(0);
+    if d.enc.name == "ENC_VOP3" && (fv("ABS") != 0 || fv("NEG") != 0 || fv("CLAMP") != 0 || fv("OMOD") != 0) {
+        return None;
+    }
+    match d.inst.name {
+        "V_MOV_B32" => const_u32(st, d, fv("SRC0")),
+        "V_CNDMASK_B32" => {
+            let (mask_inact_lo, mask_hi) = if d.enc.name == "ENC_VOP3" {
+                let c = fv("SRC2");
+                (st.src_inact_lo(d, c), st.src64(d, c).1)
+            } else {
+                (st.inact_lo[106], st.s[107])
+            };
+            (mask_inact_lo == Word::Zero && mask_hi == Word::Zero).then(|| const_u32(st, d, fv("SRC0"))).flatten()
+        }
+        _ => None,
+    }
+}
+
 /// One instruction's effect.
 fn step(d: &Decoded, st: &mut State) {
     let name = d.inst.name;
     let fv = |f: &str| rdna2::field_value(d.enc, &d.words, f).unwrap_or(0);
+    let exec_lo = st.s[126];
     let exec_hi = st.s[127];
+    let exec_inact_lo = st.inact_lo[126];
     if name.starts_with("S_MOVRELD") {
         // writes s[dst + m0]: any SGPR
         st.s = [Word::Any; 128];
         st.s[125] = Word::Zero;
         st.s[127] = exec_hi;
+        st.inact_lo = [Word::Any; 128];
+        st.inact_lo[125] = Word::Zero;
+        st.inact_lo[126] = exec_inact_lo;
+        st.red_s.clear();
         return;
     }
     // VGPR lanes
     if name == "V_WRITELANE_B32" {
         let v = fv("VDST");
+        st.inact_const.remove(&v);
+        st.red_v.remove(&v);
         match lane_operand(d) {
             Lane::Const(l) if l >= 32 => {
                 let mut u = st.upper(v);
@@ -572,6 +868,8 @@ fn step(d: &Decoded, st: &mut State) {
     } else if name.starts_with("V_MOVREL") || name.starts_with("V_SWAPREL") {
         // writes v[dst + m0] (v_swaprel also v[src0 + m0]): any VGPR
         st.lo.clear();
+        st.inact_const.clear();
+        st.red_v.clear();
         if exec_hi != Word::Zero {
             let all: Vec<u64> = (0..256).collect();
             for v in all {
@@ -584,9 +882,18 @@ fn step(d: &Decoded, st: &mut State) {
         let single = writes.len() == 1 && is_valu(d);
         // with only some lanes ≥ 32 active, DPP and v_permlane sources may be inactive: not followed
         let cross = d.variant != Variant::Plain || name.starts_with("V_PERMLANE");
+        let wwm = exec_lo == Word::Ones && exec_hi == Word::Ones;
         let mut new = Vec::new();
+        let mut new_inact = Vec::new();
+        let mut new_red = Vec::new();
         for &v in &writes {
             st.lo.remove(&v);
+            let red = (single && wwm).then(|| eval_reduce(d, st, v)).flatten();
+            new_red.push((v, red));
+            if !(exec_inact_lo == Word::Zero && exec_hi == Word::Zero) {
+                let ic = (single && wwm).then(|| eval_inact_const(d, st)).flatten();
+                new_inact.push((v, ic));
+            }
             let lanes = match exec_hi {
                 Word::Zero => continue,
                 Word::Ones => match single.then(|| evaluate(d, st, v)).flatten() {
@@ -607,25 +914,53 @@ fn step(d: &Decoded, st: &mut State) {
         for (v, lanes) in new {
             st.set_upper(v, lanes);
         }
+        for (v, ic) in new_inact {
+            match ic {
+                Some(c) => {
+                    st.inact_const.insert(v, c);
+                }
+                None => {
+                    st.inact_const.remove(&v);
+                }
+            }
+        }
+        for (v, r) in new_red {
+            match r {
+                Some(vr) => {
+                    st.red_v.insert(v, vr);
+                }
+                None => {
+                    st.red_v.remove(&v);
+                }
+            }
+        }
     }
     // SGPRs
     let op = name.split('_').nth(1).unwrap_or("");
     let b64 = name.ends_with("_B64");
     if name.contains("SAVEEXEC") || name.contains("WREXEC") {
         let s0 = st.src64(d, fv("SSRC0"));
+        let s0_inact = st.src_inact_lo(d, fv("SSRC0"));
         let (el, eh) = (st.s[126], st.s[127]);
         let nl = bitop(op, s0.0, el).unwrap_or(Word::Any);
         let nh = bitop(op, s0.1, eh).unwrap_or(Word::Any);
+        let nl_inact = bitop(op, s0_inact, exec_inact_lo).unwrap_or(Word::Any);
         let dst = fv("SDST");
         let wr = name.contains("WREXEC");
+        st.red_s.remove(&dst);
         if b64 {
+            st.red_s.remove(&(dst + 1));
             st.s[126] = nl;
             st.s[127] = nh;
+            st.inact_lo[126] = nl_inact;
             st.set(dst, if wr { nl } else { el });
             st.set(dst + 1, if wr { nh } else { eh });
+            st.set_inact_lo(dst, if wr { nl_inact } else { exec_inact_lo });
         } else {
             st.s[126] = nl;
+            st.inact_lo[126] = nl_inact;
             st.set(dst, if wr { nl } else { el });
+            st.set_inact_lo(dst, if wr { nl_inact } else { exec_inact_lo });
         }
         return;
     }
@@ -633,46 +968,91 @@ fn step(d: &Decoded, st: &mut State) {
         let dst = fv("SDST");
         let a = |st: &State| if b64 { st.src64(d, fv("SSRC0")) } else { (st.src32(d, fv("SSRC0")), Word::Zero) };
         let b = |st: &State| if b64 { st.src64(d, fv("SSRC1")) } else { (st.src32(d, fv("SSRC1")), Word::Zero) };
-        let r: Option<(Word, Word)> = match op {
-            "MOV" if d.enc.name == "ENC_SOP1" => Some(a(st)),
+        let a_inact = st.src_inact_lo(d, fv("SSRC0"));
+        let b_inact = st.src_inact_lo(d, fv("SSRC1"));
+        let r: Option<(Word, Word, Word)> = match op {
+            "MOV" if d.enc.name == "ENC_SOP1" => {
+                let x = a(st);
+                Some((x.0, x.1, a_inact))
+            }
             "NOT" if d.enc.name == "ENC_SOP1" => {
                 let x = a(st);
-                Some((x.0.not(), x.1.not()))
+                Some((x.0.not(), x.1.not(), a_inact.not()))
             }
-            // a word of 0 / all ones stays 0 / all ones
-            "WQM" if d.enc.name == "ENC_SOP1" => Some(a(st)),
+            // a word of 0 / all ones stays 0 / all ones in upper lanes; helper lanes in launched
+            // quads become active, so `inact_lo` becomes Any
+            "WQM" if d.enc.name == "ENC_SOP1" => {
+                let x = a(st);
+                Some((x.0, x.1, Word::Any))
+            }
             "CMOV" if d.enc.name == "ENC_SOP1" => {
                 let x = a(st);
                 let o = (st.s[dst.min(127) as usize], st.s[(dst + 1).min(127) as usize]);
-                Some((x.0.join(o.0), x.1.join(o.1)))
+                let oi = st.inact_lo[dst.min(127) as usize];
+                Some((x.0.join(o.0), x.1.join(o.1), a_inact.join(oi)))
             }
             "CSELECT" => {
                 let (x, y) = (a(st), b(st));
-                Some((x.0.join(y.0), x.1.join(y.1)))
+                Some((x.0.join(y.0), x.1.join(y.1), a_inact.join(b_inact)))
             }
             _ if d.enc.name == "ENC_SOP2" => {
                 let (x, y) = (a(st), b(st));
-                bitop(op, x.0, y.0).zip(bitop(op, x.1, y.1))
+                let li = bitop(op, a_inact, b_inact).unwrap_or(Word::Any);
+                bitop(op, x.0, y.0).zip(bitop(op, x.1, y.1)).map(|(lo, hi)| (lo, hi, li))
             }
             _ => None,
         };
-        if let Some((lo, hi)) = r {
+        if let Some((lo, hi, li)) = r {
             st.set(dst, lo);
+            st.set_inact_lo(dst, li);
+            st.red_s.remove(&dst);
             if b64 {
                 st.set(dst + 1, hi);
+                st.set_inact_lo(dst + 1, Word::Any);
+                st.red_s.remove(&(dst + 1));
             }
             return;
         }
+    }
+    if name == "V_READLANE_B32" {
+        let dst = fv("VDST");
+        st.set(dst, Word::Any);
+        st.set_inact_lo(dst, Word::Any);
+        let sr = fv("SRC0")
+            .checked_sub(256)
+            .and_then(|v| st.red_v.get(&v))
+            .and_then(|vr| match lane_operand(d) {
+                Lane::Const(l) => {
+                    let set = vr.sets[l as usize];
+                    (set != 0).then_some(SReduce { seed_pc: vr.seed_pc, src_vgpr: vr.src_vgpr, op: vr.op, set })
+                }
+                Lane::Sgpr => None,
+            });
+        match sr {
+            Some(x) => {
+                st.red_s.insert(dst, x);
+            }
+            None => {
+                st.red_s.remove(&dst);
+            }
+        }
+        return;
     }
     let valu = is_valu(d);
     for (r, n) in sgpr_outputs(d) {
         if valu && n == 2 {
             // a lane mask: bits of inactive lanes are 0
             st.set(r, Word::Any);
+            st.set_inact_lo(r, if exec_inact_lo == Word::Zero { Word::Zero } else { Word::Any });
             st.set(r + 1, if exec_hi == Word::Zero { Word::Zero } else { Word::Any });
+            st.set_inact_lo(r + 1, Word::Any);
+            st.red_s.remove(&r);
+            st.red_s.remove(&(r + 1));
         } else {
             for k in r..r + n {
                 st.set(k, Word::Any);
+                st.set_inact_lo(k, Word::Any);
+                st.red_s.remove(&k);
             }
         }
     }
@@ -810,6 +1190,22 @@ pub fn analyze(insts: &[Decoded]) -> UpperLanes {
                 out.shadows.insert(s);
             }
             out.reads.insert(d.pc, r);
+        }
+        let fv = |f: &str| rdna2::field_value(d.enc, &d.words, f).unwrap_or(0);
+        let full = match d.inst.name {
+            "V_READLANE_B32" => fv("SRC0")
+                .checked_sub(256)
+                .and_then(|v| st.red_v.get(&v))
+                .filter(|vr| matches!(lane_operand(d), Lane::Const(l) if vr.sets[l as usize] == u64::MAX)),
+            "V_READFIRSTLANE_B32" if st.s[126] == Word::Ones && st.s[127] == Word::Ones => fv("SRC0")
+                .checked_sub(256)
+                .and_then(|v| st.red_v.get(&v))
+                .filter(|vr| vr.sets[0] == u64::MAX),
+            _ => None,
+        };
+        if let Some(vr) = full {
+            out.reduction_seeds.insert(vr.seed_pc, (vr.src_vgpr, vr.op));
+            out.reduction_results.insert(d.pc, vr.seed_pc);
         }
     }
     out
@@ -978,5 +1374,29 @@ mod tests {
         // both paths the same constant (or nothing): the constant
         let r = reads(&[("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 4)], None), WWM, MASK, SEED, RESTORE, READ32]);
         assert_eq!(r, vec![Read::Const(u32::MAX)]);
+    }
+
+    #[test]
+    fn whole_wave_reduction_is_recognised_for_all_ops() {
+        const X2: I = ("V_MIN_U32", "VOP2_VOP_DPP8", &[("VDST", 6), ("SRC0", 0xE9), ("VSRC0", 6), ("VSRC1", 6), ("LANE_SEL_0", 2), ("LANE_SEL_1", 3), ("LANE_SEL_2", 0), ("LANE_SEL_3", 1), ("LANE_SEL_4", 6), ("LANE_SEL_5", 7), ("LANE_SEL_6", 4), ("LANE_SEL_7", 5)], None);
+        const X4: I = ("V_MIN_U32", "VOP2_VOP_DPP8", &[("VDST", 6), ("SRC0", 0xE9), ("VSRC0", 6), ("VSRC1", 6), ("LANE_SEL_0", 4), ("LANE_SEL_1", 5), ("LANE_SEL_2", 6), ("LANE_SEL_3", 7), ("LANE_SEL_4", 0), ("LANE_SEL_5", 1), ("LANE_SEL_6", 2), ("LANE_SEL_7", 3)], None);
+        const FINAL_COMBINE: I = ("V_MIN_U32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 10), ("VSRC1", 6)], None);
+        const READ0: I = ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 40), ("SRC0", V + 6), ("SRC1", 128)], None);
+        let p = program(&[WWM, MASK, SEED, X1, X2, X4, MIRROR, PX16, COMBINE, READ32, FINAL_COMBINE, READ0, RESTORE]);
+        let a = analyze(&p);
+        let seed_pc = p[3].pc; // X1
+        let read0_pc = p[11].pc; // READ0
+        assert_eq!(a.reduction_seeds.get(&seed_pc), Some(&(6, ReduceOp::MinU32)));
+        assert_eq!(a.reduction_results.get(&read0_pc), Some(&seed_pc));
+
+        // wrong identity (0 for V_MIN_U32): must NOT be recognised as a whole-wave reduction
+        const BAD_SEED: I = ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 6), ("SRC0", 128), ("SRC1", V + 55), ("SRC2", 10)], None);
+        let p_bad = program(&[WWM, MASK, BAD_SEED, X1, X2, X4, MIRROR, PX16, COMBINE, READ32, FINAL_COMBINE, READ0, RESTORE]);
+        assert!(analyze(&p_bad).reduction_results.is_empty());
+
+        // S_WQM-polluted mask: helper lanes could be 1, so WaveActive* would skip them
+        const WQM_EXEC: I = ("S_WQM_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 126)], None);
+        let p_wqm = program(&[WQM_EXEC, WWM, MASK, SEED, X1, X2, X4, MIRROR, PX16, COMBINE, READ32, FINAL_COMBINE, READ0, RESTORE]);
+        assert!(analyze(&p_wqm).reduction_results.is_empty());
     }
 }
