@@ -522,11 +522,20 @@ pub struct Options {
     /// (its pipelines would be refused): a load and a store of the two dwords, not atomic.
     /// Only programs with such an instruction differ.
     pub image_atomics64: bool,
+    /// a program of more than this many instructions is a giant (`GIANT_INSTRUCTIONS`) and
+    /// gets the forms that make less DXIL; every other program keeps its HLSL byte for byte
+    /// (the DXIL cache is keyed by the HLSL and the driver's by the DXIL)
+    pub giant_from: usize,
 }
+
+/// `Options::giant_from`. In the gap of a retail pack's 26 084 programs: all have 31 086
+/// instructions or fewer but six compute programs, of 44 430 to 46 741 (three) and 76 699 to
+/// 88 863 (three) – the six whose HLSL is over 8 MB.
+pub const GIANT_INSTRUCTIONS: usize = 40_000;
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true, loop_budget: 0, image_atomics64: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true, loop_budget: 0, image_atomics64: true, giant_from: GIANT_INSTRUCTIONS }
     }
 }
 
@@ -1373,6 +1382,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         }
     }
     let mut em = emit::Em::new(opt.clone());
+    em.giant = insts.len() > opt.giant_from;
     em.configure_round_modes(&insts, branches == 0);
     em.static_ss = constant_samplers(&insts, &leaders);
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode

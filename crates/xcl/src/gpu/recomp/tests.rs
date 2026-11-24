@@ -1538,6 +1538,76 @@ fn buffer_format_d16_packs_and_unpacks_halves() {
     }
 }
 
+/// A giant (`Options::giant_from`) decodes only the components a format load into one or two
+/// registers picks (the decoder is inlined at every site); with three or four, and in the d16
+/// forms, all four once. The values are checked on the GPU by `gpu_typed_buffer_loads_and_stores`.
+#[test]
+fn buffer_format_load_of_a_giant_decodes_only_the_registers_it_writes() {
+    let load = |name: &'static str, enc: &'static str, extra: &[(&'static str, u64)]| {
+        let mut fields = vec![("VDATA", 10), ("SRSRC", 3), ("SOFFSET", 128)];
+        fields.extend_from_slice(extra);
+        let t = translate(&prog(&[(name, enc, &fields, None)]), &Options { giant_from: 0, ..Options::default() }).unwrap();
+        assert!(t.complete(), "{name}: {:?}", t.unsupported_why);
+        if super::dxc::location().is_ok() {
+            super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{name}: {e}\n{}", t.hlsl));
+        }
+        // (decodes of one picked component, decodes of all four)
+        (t.hlsl.matches("_ok, fmt_sel(t").count(), t.hlsl.matches("_c = uint4(fmt_comp(").count(), t.hlsl)
+    };
+    let (picked, all, hlsl) = load("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[]);
+    assert_eq!((picked, all), (1, 0), "{hlsl}");
+    assert!(hlsl.contains("v10 = select(") && hlsl.contains("_info, (s15 >> 0u) & 7u, "), "{hlsl}");
+    let (picked, all, hlsl) = load("TBUFFER_LOAD_FORMAT_XY", "ENC_MTBUF", &[("FORMAT", 64)]);
+    assert_eq!((picked, all), (2, 0), "{hlsl}");
+    assert!(hlsl.contains("_info, (s15 >> 0u) & 7u, ") && hlsl.contains("_info, (s15 >> 3u) & 7u, "), "{hlsl}");
+    for name in ["BUFFER_LOAD_FORMAT_XYZ", "BUFFER_LOAD_FORMAT_XYZW", "BUFFER_LOAD_FORMAT_D16_X"] {
+        let (picked, all, hlsl) = load(name, "ENC_MUBUF", &[]);
+        assert_eq!((picked, all), (0, 1), "{name}\n{hlsl}");
+    }
+}
+
+/// A program that is not a giant keeps the HLSL it had before giants got their own forms: its
+/// DXIL is cached by that HLSL, and the driver's pipeline by the DXIL. The limit is
+/// `GIANT_INSTRUCTIONS` instructions: a program of exactly as many is not a giant.
+#[test]
+fn buffer_format_load_of_a_normal_program_is_unchanged() {
+    let nop = encode("S_NOP", "ENC_SOPP", &[], None).unwrap();
+    // `n` instructions: s_nop, two format loads and s_endpgm
+    let program = |n: usize| {
+        let mut code = nop.repeat(n - 3);
+        code.extend(prog(&[
+            ("BUFFER_LOAD_FORMAT_X", "ENC_MUBUF", &[("VDATA", 10), ("SRSRC", 3), ("SOFFSET", 128)], None),
+            ("TBUFFER_LOAD_FORMAT_XY", "ENC_MTBUF", &[("VDATA", 11), ("SRSRC", 3), ("SOFFSET", 128), ("FORMAT", 64)], None),
+        ]));
+        code
+    };
+    let small = program(3);
+    let normal = translate(&small, &Options::default()).unwrap();
+    assert_eq!(normal.instructions, 3);
+    // the text of the loads before `fmt_sel`, and nothing of the giants' in the file
+    for line in [
+        "uint4 t1_c = uint4(fmt_comp(t1_r, t1_info, 0u), fmt_comp(t1_r, t1_info, 1u), fmt_comp(t1_r, t1_info, 2u), fmt_comp(t1_r, t1_info, 3u));",
+        "v10 = select(t1_ok, dst_sel(t1_c, (s15 >> 0u) & 7u, t1_int), 0u); }",
+        "v11 = select(t2_ok, dst_sel(t2_c, (s15 >> 0u) & 7u, t2_int), 0u); v12 = select(t2_ok, dst_sel(t2_c, (s15 >> 3u) & 7u, t2_int), 0u); }",
+    ] {
+        assert!(normal.hlsl.contains(line), "{line}\n{}", normal.hlsl);
+    }
+    assert!(!normal.hlsl.contains("fmt_sel"), "{}", normal.hlsl);
+    // the same file whatever the limit, as long as the program is under it
+    for giant_from in [3, usize::MAX] {
+        assert!(translate(&small, &Options { giant_from, ..Options::default() }).unwrap().hlsl == normal.hlsl, "giant_from {giant_from}");
+    }
+    let giant = translate(&small, &Options { giant_from: 2, ..Options::default() }).unwrap();
+    assert!(giant.hlsl != normal.hlsl && giant.hlsl.matches("_ok, fmt_sel(t").count() == 3, "{}", giant.hlsl);
+    // the default limit
+    let limit = super::GIANT_INSTRUCTIONS;
+    let at = translate(&program(limit), &Options::default()).unwrap();
+    let over = translate(&program(limit + 1), &Options::default()).unwrap();
+    assert_eq!((at.instructions, over.instructions), (limit, limit + 1));
+    assert!(!at.hlsl.contains("fmt_sel") && at.hlsl.matches("_ok, dst_sel(t").count() == 3);
+    assert!(over.hlsl.matches("_ok, fmt_sel(t").count() == 3 && !over.hlsl.contains("_ok, dst_sel(t"));
+}
+
 #[test]
 fn gpu_typed_buffer_loads_and_stores() {
     if !gpu_ready() {
@@ -1622,6 +1692,16 @@ fn gpu_typed_buffer_loads_and_stores() {
     }
     assert_eq!(r.mem[0x130 / 4], 0xB800_4000, "d16 store 16_16_float");
     assert_eq!(r.sgpr[50], 1 | 1 << 5, "s_bitset1");
+    // as a giant (`Options::giant_from`), whose `_x` / `_xy` decode only what DST_SEL picks:
+    // the same values
+    let t = translate(&code, &Options { giant_from: 0, ..runner::options(Mode::Kernel) }).unwrap();
+    assert_eq!(t.hlsl.matches("_ok, fmt_sel(t").count(), 4, "{}", t.hlsl);
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    let g = runner::run(&dxil, &st, &mem).unwrap();
+    for l in 0..64 {
+        assert_eq!(g.vgpr[l], r.vgpr[l], "lane {l}: as a giant");
+    }
+    assert!(g.mem == r.mem && g.sgpr == r.sgpr, "memory and SGPRs as a giant");
 }
 
 fn el(name: &str, index: u32, sv: u32, ct: u32, reg: u32, mask: u8) -> crate::gpu::dxbc::SigElement {

@@ -60,6 +60,9 @@ pub(super) struct Em {
     has_f64_round_op: bool,
     /// program writes a non-default `MODE[3:2]` and uses f16 ops (emits `xcl_fp16_rm`)
     dynamic_f16_rm: bool,
+    /// the program has more than `Options::giant_from` instructions: forms that make less
+    /// DXIL, in HLSL no other program gets (theirs stays byte for byte what it was)
+    pub giant: bool,
 }
 
 /// Instructions without an effect in this execution model.
@@ -485,6 +488,7 @@ impl Em {
             has_f16_round_op: false,
             has_f64_round_op: false,
             dynamic_f16_rm: false,
+            giant: false,
         }
     }
 
@@ -1657,9 +1661,18 @@ impl Em {
                 self.line(&format!("bool {t}_int = ((({t}_info >> 3) & 7u) == 4u) || ((({t}_info >> 3) & 7u) == 5u);"));
                 self.line(&format!("bool {t}_ok = and(({t}_info & 7u) != 0u, {});", in_range(format!("fmt_bytes({t}_info)"))));
                 self.line(&format!("uint4 {t}_r = ld_raw({t}_a);"));
-                self.line(&format!(
-                    "uint4 {t}_c = uint4(fmt_comp({t}_r, {t}_info, 0u), fmt_comp({t}_r, {t}_info, 1u), fmt_comp({t}_r, {t}_info, 2u), fmt_comp({t}_r, {t}_info, 3u));"
-                ));
+                // a giant's `_x` / `_xy`: only the component each register's DST_SEL picks is
+                // decoded (`fmt_sel`). The decoder is inlined at every site, so all four
+                // components make a `_x` load 2.5 times the DXIL (4.3 KB instead of 1.7 at
+                // -O0, 2.1 instead of 1.0 at -O1), and a retail CS of 88 863 instructions has
+                // 3 281 of them. With three or four registers the four decodes are not larger.
+                // Only giants: the HLSL of every other program stays what it was.
+                let picked = self.giant && d16_format.is_none() && count <= 2;
+                if !picked {
+                    self.line(&format!(
+                        "uint4 {t}_c = uint4(fmt_comp({t}_r, {t}_info, 0u), fmt_comp({t}_r, {t}_info, 1u), fmt_comp({t}_r, {t}_info, 2u), fmt_comp({t}_r, {t}_info, 3u));"
+                    ));
+                }
                 if let Some((_, components, high)) = d16_format {
                     let half = |component: u64| {
                         let selected = format!("dst_sel({t}_c, ({d3} >> {}u) & 7u, {t}_int)", 3 * component);
@@ -1683,7 +1696,8 @@ impl Em {
                 let mut assigns = Vec::new();
                 for i in 0..count {
                     let v = self.vreg(vdata + i);
-                    assigns.push(format!("{v} = select({t}_ok, dst_sel({t}_c, ({d3} >> {}u) & 7u, {t}_int), 0u);", 3 * i));
+                    let from = if picked { format!("fmt_sel({t}_r, {t}_info") } else { format!("dst_sel({t}_c") };
+                    assigns.push(format!("{v} = select({t}_ok, {from}, ({d3} >> {}u) & 7u, {t}_int), 0u);", 3 * i));
                 }
                 self.line(&format!("if ({act}) {{ {} }}", assigns.join(" ")));
             }
@@ -4136,6 +4150,9 @@ impl Em {
         let infos: Vec<String> = (0..BUF_FORMATS.len()).map(|i| format!("0x{:08X}u", buf_format_info(i))).collect();
         let _ = writeln!(h, "static const uint FMT_INFO[78] = {{ {} }};", infos.join(", "));
         h.push_str(PRELUDE_MEM);
+        if self.giant {
+            h.push_str(PRELUDE_GIANT);
+        }
         if self.uses_scratch {
             h.push_str(PRELUDE_SCRATCH);
         }
@@ -5301,6 +5318,11 @@ void st_bytes(uint a, uint4 r, uint n) {
     if (s != 0u && s + 8u * n > 32u) st_part(b + 4u, m >> (32u - s), r.x >> (32u - s));
 }
 uint dst_sel(uint4 c, uint sel, bool isint) { return select(sel == 0u, 0u, select(sel == 1u, select(isint, 1u, 0x3F800000u), c[(sel - 4u) & 3u])); }
+"#;
+
+/// Follows `PRELUDE_MEM` in a giant program (`Em::giant`), and in no other.
+const PRELUDE_GIANT: &str = r#"// `dst_sel` of the four decoded components, decoding only the one `sel` picks
+uint fmt_sel(uint4 r, uint info, uint sel, bool isint) { return select(sel == 0u, 0u, select(sel == 1u, select(isint, 1u, 0x3F800000u), fmt_comp(r, info, (sel - 4u) & 3u))); }
 "#;
 
 /// A console wave64 as two hardware wave32 halves of one thread group (docs/wave64-on-wave32.md):
