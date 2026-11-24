@@ -783,7 +783,7 @@ mod size_args_tests {
     }
 }
 
-fn toolchain_identity() -> &'static str {
+pub(super) fn toolchain_identity() -> &'static str {
     static IDENTITY: OnceLock<String> = OnceLock::new();
     IDENTITY.get_or_init(|| {
         let Ok(dir) = location() else {
