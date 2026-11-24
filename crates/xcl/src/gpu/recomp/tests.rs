@@ -8776,13 +8776,15 @@ fn gpu_mesh_fp16_params_reach_the_pixel_shader() {
 /// `XCL_SAMPLE_RPF`; `XCL_FRAME_PROGRAMS` = a file of `stage<TAB>hash<TAB>weight` lines (the
 /// hash of the container, as a frame census names it; AS = an MS in the AS slot);
 /// `XCL_FRAME_OUT` = a folder for `programs.tsv` and each program's HLSL and disassembly
-/// (title data: never commit it); `XCL_FRAME_WINDOWS` = the windows (default 4 from the heap).
+/// (title data: never commit it); `XCL_FRAME_WINDOWS` = the windows (default 4 from the heap);
+/// `XCL_FRAME_DXC=1` also compiles each translation with DXC (one after the other: minutes).
 #[test]
 #[ignore]
 fn retail_frame_programs_translation_report() {
     use std::collections::BTreeMap;
     let (Ok(path), Ok(list)) = (std::env::var("XCL_SAMPLE_RPF"), std::env::var("XCL_FRAME_PROGRAMS")) else { return };
     let out = std::env::var("XCL_FRAME_OUT").ok().map(std::path::PathBuf::from);
+    let dxc = std::env::var_os("XCL_FRAME_DXC").is_some() && super::dxc::location().is_ok();
     let windows: u32 = std::env::var("XCL_FRAME_WINDOWS").ok().and_then(|v| v.parse().ok()).unwrap_or(4 | super::HEAP_WINDOWS);
     // hash → (stage, weight)
     let mut want: BTreeMap<u64, (String, usize)> = BTreeMap::new();
@@ -8828,6 +8830,12 @@ fn retail_frame_programs_translation_report() {
                 notes.extend(t.ignored.keys().map(|k| format!("ignored {k}")));
                 if t.hlsl.contains("pc ==") {
                     notes.push("pc block chain".into());
+                }
+                if dxc {
+                    let profile = ["vs_6_6", "ps_6_6", "cs_6_6"][(hw as usize - 4).min(2)];
+                    if let Err(e) = super::dxc::compile(&t.hlsl, "main", profile, &[]) {
+                        notes.push(format!("DXC {}", e.lines().find(|l| l.contains("error")).unwrap_or("error")));
+                    }
                 }
                 (t.instructions, t.hlsl.len())
             }
