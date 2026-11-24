@@ -204,9 +204,8 @@ struct State {
     value: u64,
     /// reusable auto-reset Win32 event for fence waits (no per-wait CreateEventW/CloseHandle)
     event: HANDLE,
-    /// fence signalled on title queues so `queue` waits before copying GPU writes back to CPU
-    rb_fence: ID3D12Fence,
-    rb_value: u64,
+    /// title queue → a fence it signals after the copies back of its GPU writes, its last value
+    rb_fences: FxHashMap<usize, (ID3D12Fence, u64)>,
     /// (window start, reserved buffer) of each sparse window
     windows: Vec<(usize, ID3D12Resource)>,
     /// video-memory pool heaps (None: given back, its index free for the next one)
@@ -517,7 +516,6 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
     let made = (|| -> windows::core::Result<State> {
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-        let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None)?;
         let mut slots = Vec::with_capacity(UPLOAD_SLOTS);
         for _ in 0..UPLOAD_SLOTS {
@@ -540,8 +538,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             fence,
             value: 0,
             event,
-            rb_fence,
-            rb_value: 0,
+            rb_fences: FxHashMap::default(),
             windows,
             pools: Vec::new(),
             free: Vec::new(),
@@ -987,6 +984,81 @@ impl State {
         }
     }
 
+    /// `parts` (address, offset at `p`, bytes) read back from video memory into the CPU view
+    /// (its committed pages), `sent` hashes following.
+    unsafe fn copy_back(&mut self, p: *const u8, parts: &[(usize, usize, usize)]) {
+        for &(dst, off, len) in parts {
+            let mut at = dst;
+            let mut src_off = off;
+            let end = dst + len;
+            while at < end {
+                let pg = at & !(PAGE - 1);
+                let t = pg & !(TILE - 1);
+                let idx = (pg - t) / PAGE;
+                let step = (pg + PAGE).min(end) - at;
+                if self.mapped.get(&t).is_some_and(|e| e.holes & (1u16 << idx) == 0) {
+                    std::ptr::copy_nonoverlapping(p.add(src_off), at as *mut u8, step);
+                }
+                at += step;
+                src_off += step;
+            }
+            self.sync_sent_range(dst, len);
+        }
+    }
+
+    /// A copy of `ranges` (address, bytes) into a readback buffer, recorded on `queue` (after
+    /// what it has been given) and followed by a signal of that queue's own fence.
+    unsafe fn readback_on(&mut self, queue: &ID3D12CommandQueue, ranges: &[(usize, usize)]) -> Option<Readback> {
+        let mut parts = Vec::new();
+        let mut size = 0usize;
+        for &(a, n) in ranges {
+            let mut cur = a;
+            while cur < a + n {
+                let tile = cur & !(TILE - 1);
+                let step = (a + n).min(tile + TILE) - cur;
+                if self.mapped.contains_key(&tile) {
+                    parts.push((cur, size, step));
+                    size += step;
+                }
+                cur += step;
+            }
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        let ty = queue.GetDesc().Type;
+        let alloc: ID3D12CommandAllocator = self.dev.CreateCommandAllocator(ty).ok()?;
+        let list: ID3D12GraphicsCommandList = self.dev.CreateCommandList(0, ty, &alloc, None).ok()?;
+        let mut d = buffer_desc(size as u64);
+        d.Flags = D3D12_RESOURCE_FLAG_NONE;
+        let mut buf: Option<ID3D12Resource> = None;
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+        self.dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut buf).ok()?;
+        let buf = buf?;
+        // the fence before anything is submitted: from then on what the GPU uses stays alive
+        let q = queue.as_raw() as usize;
+        if !self.rb_fences.contains_key(&q) {
+            let f: ID3D12Fence = self.dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+            self.rb_fences.insert(q, (f, 0));
+        }
+        for &(va, off, len) in &parts {
+            let wi = self.window_index(va)?;
+            list.CopyBufferRegion(&buf, off as u64, &self.windows[wi].1, (va - self.windows[wi].0) as u64, len as u64);
+        }
+        list.Close().ok()?;
+        let l: ID3D12CommandList = list.cast().ok()?;
+        let (fence, value) = self.rb_fences.get_mut(&q)?;
+        *value += 1;
+        let job = Readback { queue: q, fence: fence.clone(), value: *value, buf, parts, _list: (alloc, list) };
+        super::title_textures::own_work(|| queue.ExecuteCommandLists(&[Some(l)]));
+        if queue.Signal(&job.fence, job.value).is_err() {
+            // nothing will tell when the copy is done: its buffer and list are never released
+            std::mem::forget(job);
+            return None;
+        }
+        Some(job)
+    }
+
     /// Copy `ranges` (address, bytes) from sparse VRAM back into the CPU view and refresh
     /// `sent` hashes. Caller has already ordered `self.queue` after any GPU writes if needed.
     unsafe fn readback_ranges(&mut self, ranges: &[(usize, usize)]) {
@@ -1009,24 +1081,7 @@ impl State {
                 s.wait_for(s.value);
                 s.reclaim_ring();
             }
-            for &(dst, off, len) in pending.iter() {
-                // copy only committed (non-hole) bytes
-                let mut at = dst;
-                let mut src_off = off;
-                let end = dst + len;
-                while at < end {
-                    let pg = at & !(PAGE - 1);
-                    let t = pg & !(TILE - 1);
-                    let idx = (pg - t) / PAGE;
-                    let step = (pg + PAGE).min(end) - at;
-                    if s.mapped.get(&t).is_some_and(|e| e.holes & (1u16 << idx) == 0) {
-                        std::ptr::copy_nonoverlapping(p.add(src_off), at as *mut u8, step);
-                    }
-                    at += step;
-                    src_off += step;
-                }
-                s.sync_sent_range(dst, len);
-            }
+            s.copy_back(p, pending);
             pending.clear();
             *used = 0;
         };
@@ -1204,14 +1259,17 @@ pub unsafe fn free(p: usize) -> bool {
     u.sparse_release(p).is_some()
 }
 
-/// After `queue.ExecuteCommandLists`: copy GPU-written sparse ranges (e.g. `Write32/64`,
-/// `FillMemoryWith32BitValueX`, `CopyMemoryToMemoryX`) back to their CPU view so CPU reads
-/// and spin-waits see the GPU writes without clobbering `sent` hashes.
 /// The queue tile mappings go out on, once there is one.
 pub fn queue() -> Option<ID3D12CommandQueue> {
     STATE.lock().unwrap().as_ref().map(|s| s.queue.clone())
 }
 
+/// After `queue.ExecuteCommandLists`: copy GPU-written sparse ranges (e.g. `Write32/64`,
+/// `FillMemoryWith32BitValueX`, `CopyMemoryToMemoryX`) back to their CPU view so CPU reads
+/// and spin-waits see the GPU writes without clobbering `sent` hashes. The copy runs on `queue`
+/// after its lists and is waited for here, so the bytes are there when the title's call returns
+/// – unless the queue may be held by a wait it was given (a fence a later submit signals: the
+/// wait here would never end). Then a worker thread lands it once the GPU is there.
 pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usize, usize)]) {
     if ranges.is_empty() {
         return;
@@ -1233,12 +1291,112 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
             _ => merged.push((a, n)),
         }
     }
-    s.rb_value += 1;
-    let v = s.rb_value;
-    if queue.Signal(&s.rb_fence, v).is_ok() {
-        let _ = s.queue.Wait(&s.rb_fence, v);
+    let Some(job) = s.readback_on(queue, &merged) else { return };
+    drop(g);
+    let q = job.queue;
+    let mut unlanded = UNLANDED.lock().unwrap();
+    let m = unlanded.get_or_insert_with(HashMap::new);
+    // (after an earlier one the worker has not landed: in order, so the worker too)
+    if may_be_held(q) || m.get(&q).is_some_and(|&n| n > 0) {
+        *m.entry(q).or_default() += 1;
+        drop(unlanded);
+        let _ = readback_worker().lock().unwrap().send(job);
+        return;
     }
-    s.readback_ranges(&merged);
+    drop(unlanded);
+    job.land();
+}
+
+/// title queue → GPU waits it was given that had not completed then
+static WAITS: Mutex<Option<HashMap<usize, Vec<Held>>>> = Mutex::new(None);
+/// title queue → its copies back the worker has not landed yet
+static UNLANDED: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
+
+struct Held(ID3D12Fence, u64);
+
+// SAFETY: D3D12 objects are free-threaded
+unsafe impl Send for Held {}
+
+/// The title's `queue` was told to wait until `fence` reaches `value`.
+pub(super) unsafe fn note_queue_wait(queue: usize, fence: *mut c_void, value: u64) {
+    let Some(f) = ID3D12Fence::from_raw_borrowed(&fence) else { return };
+    if f.GetCompletedValue() < value {
+        WAITS.lock().unwrap().get_or_insert_with(HashMap::new).entry(queue).or_default().push(Held(f.clone(), value));
+    }
+}
+
+/// Whether a wait `queue` was given has not completed: its work may need a later submit to run.
+fn may_be_held(queue: usize) -> bool {
+    let mut g = WAITS.lock().unwrap();
+    let Some(w) = g.as_mut().and_then(|m| m.get_mut(&queue)) else { return false };
+    w.retain(|h| unsafe { h.0.GetCompletedValue() } < h.1);
+    !w.is_empty()
+}
+
+/// A copy back on a title queue: done when `fence` reaches `value`.
+struct Readback {
+    queue: usize,
+    fence: ID3D12Fence,
+    value: u64,
+    buf: ID3D12Resource,
+    /// (address, offset in `buf`, bytes)
+    parts: Vec<(usize, usize, usize)>,
+    /// kept until the GPU is done with them
+    _list: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
+}
+
+// SAFETY: D3D12 objects are free-threaded; the rest is plain data
+unsafe impl Send for Readback {}
+
+impl Readback {
+    /// Once the GPU is there (u64::MAX: the device is gone), into the CPU view. Returns only then:
+    /// the buffer and list are in use until it.
+    unsafe fn land(&self) {
+        use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+        if self.fence.GetCompletedValue() < self.value {
+            let event = CreateEventW(None, false, false, None).ok();
+            while self.fence.GetCompletedValue() < self.value {
+                match event {
+                    Some(e) if self.fence.SetEventOnCompletion(self.value, e).is_ok() => {
+                        WaitForSingleObject(e, 10_000);
+                    }
+                    // no event: look again
+                    _ => std::thread::sleep(std::time::Duration::from_millis(1)),
+                }
+            }
+            if let Some(e) = event {
+                let _ = CloseHandle(e);
+            }
+        }
+        let mut p = std::ptr::null_mut();
+        if self.fence.GetCompletedValue() == u64::MAX || self.buf.Map(0, None, Some(&mut p)).is_err() {
+            return;
+        }
+        if let Some(s) = STATE.lock().unwrap().as_mut() {
+            s.copy_back(p as *const u8, &self.parts);
+        }
+        self.buf.Unmap(0, None);
+    }
+}
+
+/// The thread that lands copies back in the CPU view, in submission order.
+fn readback_worker() -> &'static Mutex<std::sync::mpsc::Sender<Readback>> {
+    static W: std::sync::OnceLock<Mutex<std::sync::mpsc::Sender<Readback>>> = std::sync::OnceLock::new();
+    W.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Readback>();
+        let spawned = std::thread::Builder::new().name("xcl-sparse-readback".into()).spawn(move || unsafe {
+            for job in rx {
+                job.land();
+                if let Some(n) = UNLANDED.lock().unwrap().as_mut().and_then(|m| m.get_mut(&job.queue)) {
+                    *n -= 1;
+                }
+            }
+        });
+        if let Err(e) = spawned {
+            crate::xlog_error!("sparse windows: no thread for copies back from video memory: {e}");
+        }
+        Mutex::new(tx)
+    })
 }
 
 /// Synchronize `[va, va + len)` in a sparse window for a CPU read (`ID3D12Resource::Map` with
@@ -1832,7 +1990,6 @@ mod tests {
             let reserved = reserved.expect("reserved buffer");
             let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
-            let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_fence");
             let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).expect("event");
             let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("rb_alloc");
             let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None).expect("rb_list");
@@ -1844,8 +2001,7 @@ mod tests {
                 fence,
                 value: 0,
                 event,
-                rb_fence,
-                rb_value: 0,
+                rb_fences: FxHashMap::default(),
                 windows: vec![(base, reserved)],
                 pools: Vec::new(),
                 free: Vec::new(),
@@ -1927,7 +2083,6 @@ mod tests {
             let reserved = reserved.expect("reserved buffer");
             let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
-            let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_fence");
             let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).expect("event");
             let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("rb_alloc");
             let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None).expect("rb_list");
@@ -1939,8 +2094,7 @@ mod tests {
                 fence,
                 value: 0,
                 event,
-                rb_fence,
-                rb_value: 0,
+                rb_fences: FxHashMap::default(),
                 windows: vec![(base, reserved)],
                 pools: Vec::new(),
                 free: Vec::new(),
