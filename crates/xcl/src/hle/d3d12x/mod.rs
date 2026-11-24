@@ -27,6 +27,7 @@ pub mod null;
 pub mod present;
 pub mod pso_async;
 pub mod real;
+mod rt_dump;
 pub mod sparse;
 pub mod title_list;
 pub mod title_textures;

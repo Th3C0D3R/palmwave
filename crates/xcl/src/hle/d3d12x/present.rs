@@ -204,6 +204,16 @@ pub fn rtv_resource(handle: usize) -> Option<usize> {
     RTVS.lock().unwrap().as_ref()?.get(&handle).copied()
 }
 
+/// `res` if a render-target view names it now (which keeps it alive), with a reference of its own.
+pub(super) unsafe fn live_target(res: usize) -> Option<ID3D12Resource> {
+    let g = RTVS.lock().unwrap();
+    if !g.as_ref()?.values().any(|&r| r == res) {
+        return None;
+    }
+    let raw = res as *mut c_void;
+    ID3D12Resource::from_raw_borrowed(&raw).cloned()
+}
+
 /// The resource bound as render target 0 on `list` (`XCL_TRACE_FRAME`).
 pub fn rt0_resource(list: usize) -> Option<usize> {
     let h = *LISTS.lock().unwrap().as_ref()?.get(&list)?;
@@ -511,6 +521,8 @@ struct FrameDump {
     footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     format: DXGI_FORMAT,
     tag: String,
+    /// a render target of the frame (`XCL_RT_DUMP`): its rank
+    rt: Option<usize>,
 }
 
 unsafe impl Send for Presenter {}
@@ -669,7 +681,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     let mut dumps = Vec::new();
     if due {
         if let Some((buffer, footprint)) = readback_copy(&p.list, &src, &desc) {
-            dumps.push(FrameDump { _source: src.clone(), buffer, footprint, format: desc.Format, tag: "frame".into() });
+            dumps.push(FrameDump { _source: src.clone(), buffer, footprint, format: desc.Format, tag: "frame".into(), rt: None });
         }
     }
     // with `XCL_TRACE_FRAME`: also the render target the title binds most (its scene / UI)
@@ -692,7 +704,29 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
             });
         for (k, (res, buffer, footprint, format)) in targets.enumerate() {
             let tag = if k == 0 { "rt".into() } else { format!("rt{k}") };
-            dumps.push(FrameDump { _source: res, buffer, footprint, format, tag });
+            dumps.push(FrameDump { _source: res, buffer, footprint, format, tag, rt: None });
+        }
+    }
+    // `XCL_RT_DUMP`: the color render targets the title bound during this frame, each copied
+    // from the state the title left it in (COMMON: promoted for the copy, as the frame is)
+    if super::rt_dump::enabled() {
+        for (k, (res, d, state)) in super::rt_dump::frame_targets(PRESENTS.load(Ordering::Relaxed)).into_iter().enumerate() {
+            let readable = state == D3D12_RESOURCE_STATE_COMMON || state.0 & D3D12_RESOURCE_STATE_COPY_SOURCE.0 != 0;
+            let barrier = |before, after| {
+                let mut b = transition(&res, before, after);
+                (*b.Anonymous.Transition).Subresource = 0;
+                p.list.ResourceBarrier(&[b]);
+            };
+            if !readable {
+                barrier(state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            }
+            let copy = readback_copy(&p.list, &res, &d);
+            if !readable {
+                barrier(D3D12_RESOURCE_STATE_COPY_SOURCE, state);
+            }
+            if let Some((buffer, footprint)) = copy {
+                dumps.push(FrameDump { _source: res, buffer, footprint, format: d.Format, tag: String::new(), rt: Some(k) });
+            }
         }
     }
     let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
@@ -725,7 +759,10 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         match fence::wait(&p.fence, p.value, &p.dev, Some(p.event), frame_dump_wait_ms()) {
             Ok(()) => {
                 for dump in p.dumps.drain(..) {
-                    write_frame(&dump.buffer, &dump.footprint, dump.format, &dump.tag);
+                    match dump.rt {
+                        Some(k) => super::rt_dump::write(&dump.buffer, &dump.footprint, dump.format, PRESENTS.load(Ordering::Relaxed), k),
+                        None => write_frame(&dump.buffer, &dump.footprint, dump.format, &dump.tag),
+                    }
                 }
             }
             Err(e) => {
@@ -768,7 +805,7 @@ fn frame_dump_due() -> bool {
 }
 
 /// Frame `n` is dumped: every `every`-th (0: none), and every one from `from` on.
-fn dump_due(n: u64, every: u64, from: u64) -> bool {
+pub(super) fn dump_due(n: u64, every: u64, from: u64) -> bool {
     n >= from || (every > 0 && n % every == 20.min(every - 1))
 }
 
@@ -898,7 +935,7 @@ fn busiest_rt() -> Option<usize> {
 }
 
 /// an 11- / 10-bit unsigned float (5-bit exponent) -> f32
-fn small_float(v: u32, mantissa_bits: u32) -> f32 {
+pub(super) fn small_float(v: u32, mantissa_bits: u32) -> f32 {
     let (e, m) = (v >> mantissa_bits, v & ((1 << mantissa_bits) - 1));
     let m = m as f32 / (1u32 << mantissa_bits) as f32;
     match e {

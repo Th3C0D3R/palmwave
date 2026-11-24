@@ -568,6 +568,8 @@ pub fn note_transitions(list: usize, transitions: &[Transition]) {
 
 /// PC list `list` starts a new recording (made, reset, released): its noted transitions go.
 pub fn list_reset(list: usize) {
+    // (the render-target dump follows the same recordings)
+    super::rt_dump::list_reset(list);
     let mut g = LIST_NOTES.lock().unwrap();
     if !g.is_empty() {
         g.remove(&list);
@@ -577,6 +579,7 @@ pub fn list_reset(list: usize) {
 /// The PC lists `lists` were submitted, in this order: the textures kept in step are in the
 /// states their transitions leave them in.
 pub fn submitted(lists: &[*mut c_void]) {
+    super::rt_dump::submitted(lists);
     let notes: Vec<Transition> = {
         let g = LIST_NOTES.lock().unwrap();
         if g.is_empty() {
