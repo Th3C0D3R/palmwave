@@ -146,9 +146,14 @@ fn budget() -> usize {
     *MB.get_or_init(|| std::env::var("XCL_GPU_VIEW_BUFFERS_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4096)) << 20
 }
 
+/// `XCL_GPU_VIEW_WRITEBACK=1`: what the GPU writes into GPU-view mirrors goes back to the title's
+/// pages after each submission. Off by default for now: the copy-back works on whole 64 KiB pages,
+/// so it can land bytes the GPU never wrote over the title's data next to a UAV's range – run P57
+/// crashed after four minutes in the world reading a resource table whose pointer, 3 KB before a
+/// UAV of the same page, had been overwritten; a run without it (P55) did not crash.
 fn writeback() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("XCL_GPU_VIEW_WRITEBACK").map_or(true, |v| v.trim() != "0"))
+    cfg!(test) || *ON.get_or_init(|| std::env::var("XCL_GPU_VIEW_WRITEBACK").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// the most one submission copies back (`XCL_GPU_VIEW_WRITEBACK_MB`)
