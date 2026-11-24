@@ -768,8 +768,9 @@ impl Pipelines {
         }
     }
 
-    /// The compute pipeline of `c` (made and released).
-    fn make(&self, c: &recomp::pso::Compiled) {
+    /// The compute pipeline of `c` (made and released); false when the driver ran out of memory
+    /// on it (`make_or_switch`).
+    fn make(&self, c: &recomp::pso::Compiled) -> bool {
         use windows::Win32::Graphics::Direct3D12::*;
         let key: Vec<u32> = c.samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect();
         let rs = {
@@ -783,7 +784,7 @@ impl Pipelines {
                     }
                     Err(_) => {
                         self.refused.fetch_add(1, Ordering::Relaxed);
-                        return;
+                        return true;
                     }
                 },
             }
@@ -804,12 +805,32 @@ impl Pipelines {
         *self.running.0.lock().unwrap() -= 1;
         self.running.1.notify_one();
         drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+        let oom = matches!(&r, Err(e) if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY);
         let done = match r {
             Ok(_) => self.made.fetch_add(1, Ordering::Relaxed) + 1,
             Err(_) => self.refused.fetch_add(1, Ordering::Relaxed) + 1,
         };
         if done % 25 == 0 {
             eprintln!("  pipelines: {} made, {} refused", self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed));
+        }
+        !oom
+    }
+
+    /// `make`, and when the driver ran out of memory on a program with heap windows, the program
+    /// again in the switch form – what a title's pipeline gets then (`real::with_switch_fallback`),
+    /// so that its build is in the driver's cache too.
+    fn make_or_switch(&self, c: &recomp::pso::Compiled, again: impl FnOnce() -> Result<recomp::pso::Compiled, String>) {
+        if self.make(c) {
+            return;
+        }
+        match again() {
+            Ok(s) => {
+                eprintln!("  the driver ran out of memory on a program with heap windows: made again in the switch form ({} KB of DXIL)", s.dxil.len() / 1024);
+                if self.make(&s) {
+                    self.refused.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+            Err(e) => eprintln!("  the driver ran out of memory on a program with heap windows, and its switch form failed: {}", e.lines().next().unwrap_or("")),
         }
     }
 }
@@ -867,7 +888,9 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
                         Ok(c) => {
                             if let Some(p) = pipelines {
-                                p.make(&c);
+                                p.make_or_switch(&c, || {
+                                    recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows & !recomp::HEAP_WINDOWS)
+                                });
                             }
                             compiled.fetch_add(1, Ordering::Relaxed)
                         }
