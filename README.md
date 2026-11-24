@@ -16,36 +16,50 @@ Palmwave runs Xbox Series X|S games on Windows. It is made with **Moon AI**, the
 
 ## Status
 
-### A retail Xbox Series game: it loads its world without crashing, not playable yet
+### A retail Xbox Series game: in game, its world not visible yet, not playable
 
-Measured with Palmwave `c5bf293` on an RTX 5080 (driver 621.14), a Ryzen 9 9950X3D and 61 GB of RAM, offline, with A pressed every 10 s from 30 s to pass the menus, `XCL_DSTORAGE_BCPACK_FILL=neutral` and the title's hang detector turned off with `XCL_PATCH` (below).
+Measured with Palmwave `b3bef8b` on an RTX 5080 (driver 621.14), a Ryzen 9 9950X3D and 61 GB of RAM, offline, with the shader caches of earlier runs, A pressed at 30 s and 40 s, `XCL_PATCH` (below), `XCL_DSTORAGE_BCPACK_FILL=neutral`, `XCL_GPU_WAIT_WATCHDOG_MS=3000`, `XCL_PSO_PRELOAD_THREADS=2` and `XCL_DXC_THREADS=6`.
 
 | Time | What happens |
 |---|---|
 | 0–4 s | The title boots and presents its own frames after about 4 s. |
 | 5–30 s | Its first screens, at 30 fps. |
 | 32–58 s | The intro video, at 30 fps. |
-| 60–80 s | The world loads behind its loading screens, at 5–30 fps. Process commit levels off at 30–35 GB. DirectStorage requests no longer fail. |
-| from 82 s | The title builds the compute pipelines of its world, one after another on one thread, and presents nothing until they are built. The game keeps running meanwhile: its sound plays all along. Runs of 25 and 60 minutes ended without a crash. |
+| 60–84 s | The world loads behind its loading screens, at 5–30 fps. The compute pipelines of the world are built ahead of their use on background threads, so the title no longer stops to build them. |
+| from 84 s | **In game.** The title runs in its world and its sound plays. Its first world frame records about 7,000 draws and 7,000 compute dispatches. It presents its world frames, but nothing of the world is visible yet: the image is the title's own uniform background colour, and one world frame takes from 18 s to 2 minutes of GPU work. |
 
-The first launch is the slow one. While it loads its world, the title binds hundreds of compute programs. The NVIDIA driver compiles most of them in 2–8 s each, but a few are giants of 12–25 MB of DXIL that take it up to about 30 minutes each. Everything built is kept on disk, both the DXIL and the driver's result. A later launch rebuilds the first 400 of these pipelines in under a minute, against 16 minutes the first time.
+A first launch is much slower, because the world's compute programs are compiled then. A few of them are giants of 12–25 MB of DXIL that take the NVIDIA driver up to about 30 minutes each. Everything built is kept on disk, both the DXIL and the driver's result.
 
-**The title's hang detector.** The title ends itself on purpose after 30 s without a heartbeat from its main thread, which a first launch always hits while it compiles. `XCL_PATCH` writes byte patches into an image as it is loaded, each only where the bytes it expects are found, so another version of the file is left alone. For version 1.0.2.1 of the title's executable:
+**Byte patches for the title.** `XCL_PATCH` writes byte patches into an image as it is loaded, each only where the bytes it expects are found, so another version of the file is left alone. For version 1.0.2.1 of the title's executable:
+
+- The first three patches turn off its hang detector, which ends the title after 30 s without a heartbeat from its main thread.
+- The next two turn off its indirect-diffuse and stochastic-reflection passes, whose compute programs are the largest (up to about 88,000 instructions).
+- The last one sets its render-resolution mode, which gives world targets of 2560×1440.
 
 ```powershell
-$env:XCL_PATCH = "game_scarlett_master.exe+0x2215bdc:732e=9090;game_scarlett_master.exe+0x2215c70:7404=9090;game_scarlett_master.exe+0x2215d84:7404=9090"
+$g = "game_scarlett_master.exe"
+$env:XCL_PATCH = "$g+0x2215bdc:732e=9090;$g+0x2215c70:7404=9090;$g+0x2215d84:7404=9090;$g+0x22a3b5:e8a6f7ffff=31c0909090;$g+0x22aee6:e875ecffff=31c0909090;$g+0x7b4e6a:8b8944010000=b90100000090"
 ```
 
 What still separates it from playable, most urgent first:
 
-1. **Compile time of the world's compute programs on a first launch.** Next: compile the title's compute programs ahead of time (`xcl shaders <shaders.rpf> --precompile --only cs --pipelines`, which now uses every core) and make the giant programs smaller.
-2. **Video memory.** About 15 GB of video memory on a 16 GB card, in page pools that never shrink. Next: a video-memory budget that spills to system memory.
-3. **BCPack textures.** No BCPack mode is decoded yet. With `XCL_DSTORAGE_BCPACK_FILL=neutral`, the 768 such requests of a run complete with neutral grey blocks instead of failing.
-4. **Mesh pipelines.** 25,479 pipeline creations per run put the console's mesh shader in the amplification-shader slot and are refused, so whatever the title draws with them is missing.
+1. **GPU time of a world frame.**
+   - The title's 4.4 GB of GPU heaps are in host memory, which the GPU reads across PCIe. One of its world compute passes takes 431 ms there, against 0.45 ms with the same memory in video memory.
+   - `XCL_HEAPS_VRAM_MB=64` moves the heaps of 64 MB or more to video memory, but the title then needs about 20 GB of the 16 GB card.
+   - GPU waits between the title's queues complete only when `XCL_GPU_WAIT_WATCHDOG_MS` releases them.
+   - When GPU work runs too long, Windows resets the GPU and the title stops on "device removed".
+2. **Nothing of the world is visible.** In the first world frames its render targets keep their cleared values (`XCL_RT_DUMP=1` writes them as images).
+3. **Video memory.** 15–17 GB on a 16 GB card. The title's render targets, kept on 64 KiB pages of video memory, take 9.8 GB of it.
+4. **BCPack textures.** Only BC1 blocks are decoded. With `XCL_DSTORAGE_BCPACK_FILL=neutral`, the other requests complete with neutral grey blocks instead of failing.
 
-Sound: the title's Opus sound is now decoded. It has not been checked by ear on the test machine yet.
+Tools used for these measurements:
+- `XCL_GPU_PROFILE=1` times each draw and dispatch on the GPU.
+- `XCL_FRAME_DUMP_FROM=n` writes every presented frame from frame n.
+- `XCL_RT_DUMP=1` writes the frame's render targets and depth.
 
-Shader compilation does not block the start. The title creates 58,759 pipelines in 180 s and uses 12 or 13 of them, which are built at first use. On a second launch the DXIL cache cuts that build time from 2.9 s to 0.2 s. The window title's "pipelines queued" counts the pipelines that were created and never used.
+Sound: the title's Opus sound is decoded. It has not been checked by ear on the test machine yet.
+
+Shader compilation does not block the start. Before it loads its world, the title creates 58,759 pipelines and uses 12 or 13 of them, which are built at first use. On a second launch the DXIL cache cuts that build time from 2.9 s to 0.2 s. The window title's "pipelines queued" counts the pipelines that were created and never used.
 
 On a GPU with 32-lane waves, including the RTX 5080, the recompiler implements wave64 compute and mesh operations with two cooperating halves. Vertex and pixel shaders that read lanes 32–63 still have accuracy limits. [Wave64 implementation notes](docs/wave64-on-wave32.md)
 
