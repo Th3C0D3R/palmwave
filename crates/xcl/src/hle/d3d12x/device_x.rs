@@ -946,28 +946,22 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
 /// 0xFFFFFFFF = undefined for a buffer) in the initial state's place.
 pub(super) unsafe extern "system" fn create_placed_resource_layout_x(this: *mut c_void, va: u64, desc: *const u8, layout: u32, clear: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     real::note_newer_device_method(133);
-    create_placed_resource_x(this, va, desc, layout_state(layout), clear, riid, ppv)
+    let state = layout_state_for_desc(layout, desc as usize);
+    let hr = create_placed_resource_x(this, va, desc, state, clear, riid, ppv);
+    // the state an enhanced barrier's UNDEFINED layout before starts from
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        super::enhanced_barrier::note_state(*ppv as usize, state);
+    }
+    hr
 }
 
-/// The resource state (D3D12_RESOURCE_STATES) of a D3D12_BARRIER_LAYOUT (undefined, the
-/// queue-specific COMMON layouts and the video ones: COMMON). The DIRECT_QUEUE_* and
-/// COMPUTE_QUEUE_* layouts (18 – 29) are the queue's view of the plain ones.
-pub(super) fn layout_state(layout: u32) -> u32 {
-    match layout {
-        1 | 19 | 25 => 0xAC3, // generic read
-        2 => 0x4,             // render target
-        3 | 20 | 26 => 0x8,   // unordered access
-        4 => 0x10,            // depth write
-        5 => 0x20,            // depth read
-        6 | 21 => 0xC0,       // shader resource (all stages)
-        27 => 0x40,           // shader resource (compute: non-pixel)
-        7 | 22 | 28 => 0x800, // copy source
-        8 | 23 | 29 => 0x400, // copy dest
-        9 => 0x2000,          // resolve source
-        10 => 0x1000,         // resolve dest
-        11 => 0x100_0000,     // shading rate source
-        _ => 0,
-    }
+
+/// The resource state (D3D12_RESOURCE_STATES) of a D3D12_BARRIER_LAYOUT (undefined: COMMON),
+/// stripping buffer-only bits (`VERTEX_AND_CONSTANT_BUFFER | INDEX_BUFFER | INDIRECT_ARGUMENT`)
+/// when `desc` is a texture so creation matches `enhanced_barrier::Barrier`.
+pub(super) unsafe fn layout_state_for_desc(layout: u32, desc: usize) -> u32 {
+    let texture = desc != 0 && crate::gpu::shader::readable(desc, 4) && (desc as *const u32).read_unaligned() != D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
+    super::enhanced_barrier::layout_state(layout, texture).unwrap_or(0)
 }
 
 /// device #38 GetCopyableFootprints: a console resource desc the PC rejects (total stays
@@ -1061,7 +1055,7 @@ mod tests {
     /// Every D3D12_BARRIER_LAYOUT with a legacy equivalent gets it, the queue-specific ones too.
     #[test]
     fn barrier_layouts_become_resource_states() {
-        let s = |l: D3D12_BARRIER_LAYOUT| layout_state(l.0 as u32);
+        let s = |l: D3D12_BARRIER_LAYOUT| unsafe { layout_state_for_desc(l.0 as u32, 0) };
         assert_eq!(s(D3D12_BARRIER_LAYOUT_UNDEFINED), 0);
         assert_eq!(s(D3D12_BARRIER_LAYOUT_COMMON), 0);
         assert_eq!(s(D3D12_BARRIER_LAYOUT_GENERIC_READ), D3D12_RESOURCE_STATE_GENERIC_READ.0 as u32);
@@ -1083,7 +1077,9 @@ mod tests {
         assert_eq!(s(D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COPY_SOURCE), D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
         assert_eq!(s(D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COPY_DEST), D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
         assert_eq!(s(D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COMMON), 0);
-        assert_eq!(s(D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_GENERIC_READ), D3D12_RESOURCE_STATE_GENERIC_READ.0 as u32);
+        // the compute queue's generic read: what a compute list may name of GENERIC_READ – no
+        // index buffer, no pixel shader resource (`enhanced_barrier::layout_state`)
+        assert_eq!(s(D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_GENERIC_READ), (D3D12_RESOURCE_STATE_GENERIC_READ.0 & !(D3D12_RESOURCE_STATE_INDEX_BUFFER.0 | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0)) as u32);
         assert_eq!(s(D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_UNORDERED_ACCESS), D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32);
         assert_eq!(s(D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_SHADER_RESOURCE), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 as u32);
         assert_eq!(s(D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COPY_SOURCE), D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);

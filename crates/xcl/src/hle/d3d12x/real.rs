@@ -1054,7 +1054,8 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (99, l::clear_batch_marker_x as usize),
                 (127, b::dispatch_mesh as usize),
                 // console compute/BVH builder extensions (`XboxBvhBuilder.dll`)
-                (146, l::uav_barrier_x as usize),
+                // Barrier (ID3D12GraphicsCommandList7 #80) – at #146 on both layouts (a retail game)
+                (146, super::enhanced_barrier::barrier_x as usize),
                 (148, b::allocate_upload_memory as usize),
             ]
         }
@@ -1611,6 +1612,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         super::sparse::forget_buffer(this as usize);
         super::vram::forget(this as usize);
         super::title_textures::forget(this as usize);
+        super::enhanced_barrier::forget(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
@@ -2303,11 +2305,17 @@ unsafe extern "system" fn dev_create_committed_resource_layout_x(
     ppv: *mut *mut c_void,
 ) -> HRESULT {
     note_newer_device_method(127);
-    let state = super::device_x::layout_state(layout) as usize;
-    if flags & D3D12_HEAP_FLAG_ALLOW_DISPLAY.0 as u32 != 0 && desc != 0 && crate::gpu::shader::readable(desc, 0x38) {
-        return create_display_target(this, props, desc, state, clear, riid, ppv);
+    let state = super::device_x::layout_state_for_desc(layout, desc) as usize;
+    let hr = if flags & D3D12_HEAP_FLAG_ALLOW_DISPLAY.0 as u32 != 0 && desc != 0 && crate::gpu::shader::readable(desc, 0x38) {
+        create_display_target(this, props, desc, state, clear, riid, ppv)
+    } else {
+        dev_create_committed_resource_x(this, props, flags as usize, desc, state, clear, riid, ppv)
+    };
+    // the state an enhanced barrier's UNDEFINED layout before starts from
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        super::enhanced_barrier::note_state(*ppv as usize, state as u32);
     }
-    dev_create_committed_resource_x(this, props, flags as usize, desc, state, clear, riid, ppv)
+    hr
 }
 
 /// A display target: its console memory comes from the title's allocation hook, as the console
