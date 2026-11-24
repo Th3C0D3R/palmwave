@@ -18,24 +18,25 @@ Palmwave runs Xbox Series X|S games on Windows. It is made with **Moon AI**, the
 
 <p align="center">
   <img alt="Stage: in game" src="https://img.shields.io/badge/stage-in%20game-1f883d?style=for-the-badge">
-  <img alt="World geometry: partly drawn" src="https://img.shields.io/badge/world%20geometry-partly%20drawn-bf8700?style=for-the-badge">
+  <img alt="World: drawn" src="https://img.shields.io/badge/world-drawn-1f883d?style=for-the-badge">
   <img alt="Lighting: in progress" src="https://img.shields.io/badge/lighting-in%20progress-bf8700?style=for-the-badge">
+  <img alt="Speed: 0.2 to 0.5 fps" src="https://img.shields.io/badge/speed-0.2%E2%80%930.5%20fps-bf8700?style=for-the-badge">
   <img alt="Playable: not yet" src="https://img.shields.io/badge/playable-not%20yet-6e7781?style=for-the-badge">
 </p>
 
 ### A retail Xbox Series game: on the road to playable
 
-The title runs in its world: its first mission starts and part of the world's geometry is drawn, but the presented picture is still one flat colour because the world is not lit yet. Next come the rest of the geometry and the lighting, then the frame time.
+The title runs in its world: its first mission starts and its world is drawn. The street, the ground, palm trees, traffic lights, people and a car reach the title's G-buffer, and `XCL_SHOW_TARGET=lit` shows them in the window under one fixed light of Palmwave's. The picture the title presents itself is still almost one dark colour, because its own lighting does not work yet. A world frame takes 2–5 s, and the newest run's GPU faulted after about four minutes. Next come stability, the title's lighting and the frame time.
 
 ```mermaid
 flowchart LR
-  boot["Boots<br/>4 s"] --> menus["First screens<br/>and intro video<br/>30 fps"] --> load["World loads<br/>no crash"] --> ingame["In game<br/>first mission"] --> geo["World geometry<br/>partly drawn"] --> light["Lighting"] --> speed["30 fps"] --> play["Playable"]
+  boot["Boots<br/>4 s"] --> menus["First screens<br/>and intro video<br/>30 fps"] --> load["World loads<br/>no crash"] --> ingame["In game<br/>first mission"] --> geo["World geometry<br/>drawn"] --> light["Lighting"] --> speed["30 fps"] --> play["Playable"]
   classDef done fill:#1f883d,stroke:#1a7f37,color:#ffffff
   classDef wip fill:#bf8700,stroke:#9a6700,color:#ffffff
   classDef todo fill:#6e7781,stroke:#57606a,color:#ffffff
-  class boot,menus,load,ingame done
-  class geo,light wip
-  class speed,play todo
+  class boot,menus,load,ingame,geo done
+  class light,speed wip
+  class play todo
 ```
 
 | | Milestone | Where it stands |
@@ -44,14 +45,15 @@ flowchart LR
 | ✅ | First screens and intro video | At 30 fps. Its Opus sound is decoded (not checked by ear yet). |
 | ✅ | World loading | The first mission's world loads without a crash. |
 | ✅ | In game | The first mission starts: its opening card and the card's subtitle, then its world frames. |
-| 🔄 | World geometry | Part of it is drawn: the world's mesh shaders put utility poles, power lines, fences, an awning and bike racks into the depth buffer and the G-buffer (`XCL_RT_DUMP=1`), but about 91 % of the depth buffer stays empty: the ground and the rest of the street are not drawn yet. |
+| ✅ | World geometry | Drawn: the street, the ground, palm trees, traffic lights, people and a car reach the depth buffer and the G-buffer, and `XCL_SHOW_TARGET=lit` shows them in the window under one fixed light (not the title's lighting). Some vegetation comes out flat green and some textures black. |
 | ✅ | No crash in the world | With a 3 s GPU-wait watchdog, a run stayed in the world 3 minutes and presented frames until it was stopped, without a crash or a device removal. With a longer watchdog, runs with `6e68cf2` stopped presenting after a few world frames while the GPU stayed busy; with `9aafbcc` no GPU wait needed the watchdog, and world frames kept coming until the runs were stopped. |
-| 🔄 | Lighting | The presented picture is still one flat colour. The lighting targets stay almost black: with `9aafbcc`, only small lit areas show (about 1.5 % of a lighting target). Why is not known yet. |
-| ⏳ | Frame time | About 10 s per world frame with `9aafbcc` (9–20 s with `6e68cf2`), against 33 ms for 30 fps. Most of it is GPU time, with the GPU 99–100 % busy; the title's 4.4 GB of GPU heaps, which the GPU reads across PCIe, come first. |
+| 🔄 | Stability | With `16bae47` the newest run reached its world at about 100 s and stopped at 245 s on a GPU fault (a read at address 0, "device removed"); the cause is being looked for. Builds from `52687c1` to `fb0b6a6` stopped at 6 s, before the intro video, on a lock cycle between Palmwave and D3D12, fixed in `c1fa050` and `0ec0c55`. |
+| 🔄 | Lighting | The picture the title presents is still almost one dark colour. The lighting targets stay almost black: with `9aafbcc`, only small lit areas show (about 1.5 % of a lighting target). Why is not known yet. |
+| 🔄 | Frame time | 2–5 s per world frame (0.2–0.5 fps) with `16bae47`, against 33 ms for 30 fps; the GPU is 92 % busy and the title uses 21 GB of video memory against a budget of 14.6 GB. Most of it is GPU time, with the GPU 99–100 % busy; the title's 4.4 GB of GPU heaps, which the GPU reads across PCIe, come first. |
 | ⏳ | Controls in the world | Not tested yet. |
 | ⏳ | Playable at 30 fps | Not yet. |
 
-Measured with Palmwave `6e68cf2` (branch `world-loading`, not merged into `main` yet) on an RTX 5080 (driver 621.14), a Ryzen 9 9950X3D and 61 GB of RAM, offline, with the shader caches of earlier runs, A pressed at 30 s and 40 s, `XCL_PATCH` (below), `XCL_DSTORAGE_BCPACK_FILL=neutral`, `XCL_GPU_WAIT_WATCHDOG_MS=3000` (60000 and 600000 in the other runs), `XCL_PSO_PRELOAD_THREADS=4` and `XCL_DXC_THREADS=8`, with the frame, render-target and census dumps on (`XCL_FRAME_DUMP_FROM`, `XCL_RT_DUMP=1`, `XCL_FRAME_CENSUS_FROM`), which add about 0.5 s to each world frame. Newer runs with `9aafbcc` (same branch) are noted where they differ.
+The newest figures (world drawn, frame time, stability) were measured with `16bae47` on the same machine, with the shader caches of earlier runs, `XCL_DEPTH_UAV_TWINS=1`, `XCL_SHOW_TARGET=lit` and `XCL_DRED=1`. Older figures: Measured with Palmwave `6e68cf2` (branch `world-loading`, not merged into `main` yet) on an RTX 5080 (driver 621.14), a Ryzen 9 9950X3D and 61 GB of RAM, offline, with the shader caches of earlier runs, A pressed at 30 s and 40 s, `XCL_PATCH` (below), `XCL_DSTORAGE_BCPACK_FILL=neutral`, `XCL_GPU_WAIT_WATCHDOG_MS=3000` (60000 and 600000 in the other runs), `XCL_PSO_PRELOAD_THREADS=4` and `XCL_DXC_THREADS=8`, with the frame, render-target and census dumps on (`XCL_FRAME_DUMP_FROM`, `XCL_RT_DUMP=1`, `XCL_FRAME_CENSUS_FROM`), which add about 0.5 s to each world frame. Newer runs with `9aafbcc` (same branch) are noted where they differ.
 
 <details>
 <summary><strong>A run, second by second</strong></summary>
