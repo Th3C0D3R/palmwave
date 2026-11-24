@@ -51,7 +51,7 @@ Road to a playable 30 fps, most urgent first:
    - When GPU work runs too long, Windows resets the GPU and the title stops on "device removed".
 2. **Nothing of the world is visible.** The world's geometry is drawn with mesh shaders. Through XCL's two-pass mesh path, its depth buffer receives thin "needle" triangles, as if correct vertices were joined by wrong indices; with `XCL_MESH=0` it stays empty. Its colour targets keep their cleared values (`XCL_RT_DUMP=1` writes them as images).
 3. **Video memory.** 15–17 GB on a 16 GB card. The title's render targets, kept on 64 KiB pages of video memory, take 9.8 GB of it.
-4. **BCPack textures.** BC1, BC3, BC4, BC5, BC6H and BC7 streams are decoded; this has not been run on the title yet. BC2 is refused. With `XCL_DSTORAGE_BCPACK_FILL=neutral`, a request that is refused or whose stream the decoder does not take completes with neutral grey blocks instead of failing.
+4. **BCPack textures.** BC1, BC3, BC4, BC5, BC6H and BC7 streams are decoded; the title's BC1, BC5, BC6H and BC7 requests unpack in its runs. BC2 is refused. With `XCL_DSTORAGE_BCPACK_FILL=neutral`, a request that is refused or whose stream the decoder does not take completes with neutral grey blocks instead of failing.
 
 Tools used for these measurements:
 - `XCL_GPU_PROFILE=1` times each draw and dispatch on the GPU.

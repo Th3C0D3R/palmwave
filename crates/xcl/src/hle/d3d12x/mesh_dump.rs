@@ -1,5 +1,6 @@
-//! `XCL_MESH_RECORD_DUMP=n`: what the first pass of the two-pass mesh draws of shown frame `n`
-//! wrote – the records the pass-through mesh shader rasterises (`gpu::recomp::MsInterface`:
+//! `XCL_MESH_RECORD_DUMP=n`: what the first pass of the first two-pass mesh draws from shown
+//! frame `n` on wrote (a retail title's world starts at a frame that differs from run to run; its
+//! loading screens have no mesh draws) – the records the pass-through mesh shader rasterises (`gpu::recomp::MsInterface`:
 //! vertex count, primitive count, a vertex per thread of the group, a packed triangle per
 //! thread). The first records of the frame's first draws are copied out of the record buffer
 //! right after the compute pass and written to the logs folder two presents later:
@@ -69,7 +70,12 @@ static TAKEN: AtomicUsize = AtomicUsize::new(0);
 
 /// A two-pass draw recorded now is one the dump takes.
 pub(super) fn due() -> bool {
-    settings().is_some_and(|s| super::present::presents() == s.frame && TAKEN.load(Ordering::Relaxed) < s.draws)
+    settings().is_some_and(|s| due_at(super::present::presents(), &s, TAKEN.load(Ordering::Relaxed)))
+}
+
+/// From shown frame `s.frame` on, until `s.draws` draws are taken.
+fn due_at(presents: u64, s: &Settings, taken: usize) -> bool {
+    presents >= s.frame && taken < s.draws
 }
 
 /// After a draw's compute pass (and its UAV barrier), in the title's list: copy the first
@@ -110,7 +116,7 @@ pub(super) unsafe fn capture(this: *mut c_void, list: &ID3D12GraphicsCommandList
     super::bind::emit_transition(list, res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     list.CopyBufferRegion(&buffer, ARGS_BYTES, res, 0, records * record_bytes);
     super::bind::emit_transition(list, res, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    PENDING.lock().unwrap().push(Capture { frame: s.frame, buffer, record: record.clone(), records: records as usize, what, io: io.to_vec(), args: args_res.is_some() });
+    PENDING.lock().unwrap().push(Capture { frame: super::present::presents(), buffer, record: record.clone(), records: records as usize, what, io: io.to_vec(), args: args_res.is_some() });
 }
 
 /// At a present, after the GPU finished the frames before the last one: the captures of a
@@ -224,6 +230,15 @@ fn report(ms: &MsInterface, data: &[u32], records: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draws_are_taken_from_the_frame_asked_on_until_the_count() {
+        let s = Settings { frame: 1800, draws: 2, records: 4, args: false };
+        assert!(!due_at(1799, &s, 0), "a loading frame before it");
+        assert!(due_at(1800, &s, 0));
+        assert!(due_at(1852, &s, 1), "a later frame: the world started after the one asked");
+        assert!(!due_at(1852, &s, 2), "the count is reached");
+    }
 
     #[test]
     fn the_dump_is_off_unless_a_frame_is_named() {
