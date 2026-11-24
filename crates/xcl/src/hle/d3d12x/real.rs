@@ -5693,7 +5693,11 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
                     }
                 }
             };
-            let _ = a4;
+            // the first calls' arguments: what tells an unknown method's shape (a retail game calls
+            // the newer layout's #31 some 300 times a run from a call site not found in its code)
+            if info.calls.load(Ordering::Relaxed) < 4 {
+                crate::xlog_info!("D3D12.X: queue #{slot} ({} layout) called with ({a1:#x}, {a2:#x}, {a3:#x}, {a4:#x})", if shifted { "newer" } else { "older" });
+            }
             stubs::record_call(info, 0);
             0
         }
