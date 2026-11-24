@@ -213,12 +213,13 @@ struct BcpackUnpacked {
     requests: [AtomicU64; 16],
     bytes: [AtomicU64; 16],
     failed: [AtomicU64; 16],
+    filled_bytes: [AtomicU64; 16],
 }
 
 impl BcpackUnpacked {
     const fn new() -> Self {
         const Z: AtomicU64 = AtomicU64::new(0);
-        Self { requests: [Z; 16], bytes: [Z; 16], failed: [Z; 16] }
+        Self { requests: [Z; 16], bytes: [Z; 16], failed: [Z; 16], filled_bytes: [Z; 16] }
     }
 
     fn stats(&self) -> BTreeMap<String, BcpackUnpackStats> {
@@ -230,6 +231,7 @@ impl BcpackUnpacked {
                     requests: self.requests[i].load(Ordering::Relaxed),
                     destination_bytes: self.bytes[i].load(Ordering::Relaxed),
                     failed: self.failed[i].load(Ordering::Relaxed),
+                    filled_bytes: self.filled_bytes[i].load(Ordering::Relaxed),
                 };
                 (bcpack_name(m), s)
             })
@@ -245,8 +247,12 @@ pub struct BcpackUnpackStats {
     pub requests: u64,
     /// bytes of blocks rebuilt for them (counted before the write to the destination)
     pub destination_bytes: u64,
-    /// requests whose stream the decoder did not take (they fail with E_DECOMPRESSION)
+    /// requests whose stream the decoder did not take: they fail with E_DECOMPRESSION, or get
+    /// what a refused request gets under `XCL_DSTORAGE_BCPACK_FILL`
     pub failed: u64,
+    /// of the failed ones, bytes written by `XCL_DSTORAGE_BCPACK_FILL`
+    #[serde(default)]
+    pub filled_bytes: u64,
 }
 
 /// The BCPack stage of a request: `packed` to the `n` bytes of blocks of its mode.
@@ -266,7 +272,7 @@ fn bcpack_unpack(r: &Request, packed: &[u8], n: usize) -> Result<Vec<u8>, HRESUL
             // one warning per mode and kind of failure, then a running count
             warn_once(
                 &format!("BCPack {} stream ({})", bcpack_name(bc), e.kind()),
-                format_args!("{e} (packed={}, dst={n}); the request fails with E_DECOMPRESSION", packed.len()),
+                format_args!("{e} (packed={}, dst={n}); the request fails with E_DECOMPRESSION, or under XCL_DSTORAGE_BCPACK_FILL gets the blocks of a refused one", packed.len()),
             );
             if k <= 16 || k.is_power_of_two() {
                 crate::xlog_info!("DirectStorage: BCPack {} streams not unpacked so far: {k}", bcpack_name(bc));
@@ -303,6 +309,7 @@ fn log_bcpack_refusal(r: &Request, k: u64, neutral: bool) {
 /// `XCL_DSTORAGE_BCPACK_FILL=neutral`: the blocks are neutral ones (`bcpack_neutral_block`) and a
 /// request whose destination got them completes as if it had been decoded, for a title that stops
 /// streaming after failed requests. Unset, empty or `0`: neither. Returns (fill, neutral).
+/// A request of a mode with a decoder whose stream the decoder does not take gets the same.
 fn bcpack_fill_switch(v: Option<&str>) -> (bool, bool) {
     let v = v.map_or("", str::trim);
     (!v.is_empty() && v != "0", v.eq_ignore_ascii_case("neutral"))
@@ -371,8 +378,8 @@ enum FillTarget {
 }
 
 /// Fill the title's destination of `r` (exactly `destination_size` bytes) with solid blocks,
-/// neutral ones if `neutral`.
-unsafe fn bcpack_fill(r: &Request, target: &FillTarget, neutral: bool) -> bool {
+/// neutral ones if `neutral`; the bytes written are counted in `filled`, by mode.
+unsafe fn bcpack_fill(r: &Request, target: &FillTarget, neutral: bool, filled: &[AtomicU64; 16]) -> bool {
     let block = if neutral { bcpack_neutral_block(r.bcpack()) } else { bcpack_fill_block(r.bcpack()) };
     let Some(block) = block else { return false };
     let n = r.destination_size as usize;
@@ -390,7 +397,7 @@ unsafe fn bcpack_fill(r: &Request, target: &FillTarget, neutral: bool) -> bool {
         }
     };
     if ok {
-        BCPACK.filled_bytes[r.bcpack() as usize & 0xF].fetch_add(n as u64, Ordering::Relaxed);
+        filled[r.bcpack() as usize & 0xF].fetch_add(n as u64, Ordering::Relaxed);
     }
     ok
 }
@@ -1227,6 +1234,15 @@ impl QueueInner {
                             continue;
                         }
                         if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref()) } {
+                            // a BCPack stream the decoder did not take gets what a refused request
+                            // gets under `XCL_DSTORAGE_BCPACK_FILL`, into the pages at its turn
+                            if hr == E_DECOMPRESSION && req.bcpack() != 0 && self.bcpack_fill.load(Ordering::Relaxed) {
+                                let neutral = self.bcpack_neutral.load(Ordering::Relaxed);
+                                let target = dest_pages.map_or(FillTarget::Virtual, FillTarget::Pages);
+                                if unsafe { bcpack_fill(&req, &target, neutral, &UNPACKED.filled_bytes) } && neutral {
+                                    continue;
+                                }
+                            }
                             self.fail(hr, req, file.as_deref());
                             if since_status >= 0 {
                                 since_status = hr;
@@ -1243,7 +1259,7 @@ impl QueueInner {
                                 continue;
                             }
                         }
-                        let filled = fill.as_ref().is_some_and(|t| unsafe { bcpack_fill(&req, t, neutral) });
+                        let filled = fill.as_ref().is_some_and(|t| unsafe { bcpack_fill(&req, t, neutral, &BCPACK.filled_bytes) });
                         if filled && neutral {
                             continue;
                         }
@@ -2826,6 +2842,75 @@ mod tests {
             assert_eq!(record(), (1, E_DECOMPRESSION));
 
             CloseHandle(ev);
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+        }
+    }
+
+    /// A BC1 stream the decoder does not take gets what a refused request gets under each
+    /// setting of `XCL_DSTORAGE_BCPACK_FILL`, and is counted as failed (and filled).
+    #[test]
+    fn a_bcpack_stream_the_decoder_does_not_take_gets_the_fill_of_a_refused_request() {
+        unsafe {
+            let (q, s) = memory_queue(8, 4);
+            // a fixture's stream without its last byte: a lane waits for a byte that never comes
+            let whole = crate::hle::bcpack::tests::data("bc1-16-1.bin").unwrap();
+            let damaged = &whole[..whole.len() - 1];
+            let n = crate::hle::bcpack::tests::data("bc1-16-1.bc1").unwrap().len();
+            let bc1 = SOURCE_MEMORY_BIT | 1 << BCPACK_SHIFT;
+            let run = |r: [u8; REQUEST_BYTES], index: u32| {
+                queue_enqueue_request(q, r.as_ptr());
+                queue_enqueue_status(q, s, index);
+                queue_submit(q);
+                assert!(wait_until(|| status_is_complete(s, index)));
+                status_get_hresult(s, index)
+            };
+            let mut dst = vec![0xCDu8; n + 64];
+            let to_dst = |dst: &mut [u8]| request(bc1, dst.as_mut_ptr() as u64, n as u32, damaged.as_ptr() as u64, 0, damaged.len() as u32);
+            let before = stats().bcpack_unpacked.get("BC1").cloned().unwrap_or_default();
+
+            // unset: the request fails and its destination stays as it was
+            assert_eq!(run(to_dst(&mut dst), 0), E_DECOMPRESSION);
+            assert!(dst.iter().all(|&b| b == 0xCD), "without the switch the destination is left as it was");
+
+            // neutral: grey blocks up to the destination size, and the request completes
+            queue(q).bcpack_fill.store(true, Ordering::Relaxed);
+            queue(q).bcpack_neutral.store(true, Ordering::Relaxed);
+            assert_eq!(run(to_dst(&mut dst), 1), S_OK);
+            assert!(dst[..n].chunks(8).all(|c| c == &BC1_GREY[..]), "neutral BC1 blocks");
+            assert!(dst[n..].iter().all(|&b| b == 0xCD), "nothing past the destination size");
+
+            // the same into a physical page (with the test's unified memory), at a page offset
+            if crate::gpu::uma::get().is_some() {
+                use crate::hle::kernelx::{AllocateTitlePhysicalPages, FreeTitlePhysicalPages, MapTitlePhysicalPages, PHYS_PAGE_SIZE};
+                use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+                let mut count = 1usize;
+                let mut pages = [0usize; 1];
+                assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, pages.as_mut_ptr()), 1);
+                let reserved = VirtualAlloc(std::ptr::null(), PHYS_PAGE_SIZE, MEM_RESERVE, PAGE_READWRITE);
+                assert!(!reserved.is_null());
+                assert_eq!(MapTitlePhysicalPages(reserved, 1, 0, 4, pages.as_mut_ptr()), reserved);
+                let table = Box::new([pages[0]]);
+                let r = request_ex(bc1 | DEST_PHYS_PAGES_BIT, table.as_ptr() as u64, 0x40, n as u32, damaged.as_ptr() as u64, 0, damaged.len() as u32, 0, 0);
+                assert_eq!(run(r, 2), S_OK);
+                let got = std::slice::from_raw_parts((reserved as *const u8).add(0x40), n);
+                assert!(got.chunks(8).all(|c| c == &BC1_GREY[..]), "neutral BC1 blocks in the page");
+                MapTitlePhysicalPages(reserved, 1, 0, 4, std::ptr::null_mut());
+                VirtualFree(reserved, 0, MEM_RELEASE);
+                assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, pages.as_mut_ptr()), 1);
+            }
+
+            // `1`: magenta blocks, and the request still fails
+            queue(q).bcpack_neutral.store(false, Ordering::Relaxed);
+            dst.fill(0xCD);
+            assert_eq!(run(to_dst(&mut dst), 3), E_DECOMPRESSION);
+            assert!(dst[..n].chunks(8).all(|c| c == &BC1_MAGENTA[..]), "magenta BC1 blocks");
+            assert!(dst[n..].iter().all(|&b| b == 0xCD), "nothing past the destination size");
+
+            let after = stats().bcpack_unpacked["BC1"].clone();
+            assert!(after.failed >= before.failed + 3, "counted as failed");
+            assert!(after.filled_bytes >= before.filled_bytes + 2 * n as u64, "and the fills counted");
             queue_close(q);
             queue_release(q);
             status_release(s);
