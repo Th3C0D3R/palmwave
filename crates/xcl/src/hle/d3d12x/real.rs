@@ -3452,6 +3452,20 @@ impl Slots {
         *n += 1;
         SlotGuard(self)
     }
+
+    /// `acquire`, unless `skip` comes true while this waits for a slot: None, go on without one.
+    fn acquire_unless(&'static self, skip: impl Fn() -> bool) -> Option<SlotGuard> {
+        let mut n = self.n.lock().unwrap();
+        let most = (self.most)();
+        while *n >= most {
+            if skip() {
+                return None;
+            }
+            n = self.cv.wait_timeout(n, std::time::Duration::from_millis(50)).unwrap().0;
+        }
+        *n += 1;
+        Some(SlotGuard(self))
+    }
 }
 
 impl Drop for SlotGuard {
@@ -3462,6 +3476,67 @@ impl Drop for SlotGuard {
 }
 
 static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: big_compiles };
+
+/// Big driver compiles of pipelines built ahead of their first use (`pso_async::preloading`)
+/// at once: slots of their own, as many as `BIG_COMPILES` has. In those, a build the title waits
+/// for (on a worker) would wait behind one it may not use for a long time – minutes for a big
+/// program on an NVIDIA driver.
+static PRELOAD_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: big_compiles };
+
+/// What a big driver compile in the background waits for: a slot of `BIG_COMPILES`, then the
+/// commit for it (`wait_for_commit`). One of a pipeline built ahead of its first use waits for
+/// a slot of `PRELOAD_COMPILES`, and for none once a title thread waits for that pipeline (None):
+/// the title's thread would have built it itself, without one.
+fn admit_big() -> Option<SlotGuard> {
+    let slot = if super::pso_async::preloading() {
+        let Some(slot) = PRELOAD_COMPILES.acquire_unless(super::pso_async::preload_wanted) else {
+            static N: AtomicUsize = AtomicUsize::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                crate::xlog_info!("D3D12.X: the title waits for a big compute pipeline still being built ahead of its first use: its driver compile starts now, without a slot");
+            }
+            return None;
+        };
+        slot
+    } else {
+        BIG_COMPILES.acquire()
+    };
+    wait_for_commit();
+    Some(slot)
+}
+
+#[cfg(test)]
+mod slot_tests {
+    use super::*;
+
+    fn one() -> usize {
+        1
+    }
+
+    static ONE: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: one };
+
+    /// A wait for a slot that is skipped ends without one (a pipeline built ahead that the title
+    /// now waits for); one that is not waits until the slot is let go; a free slot is taken
+    /// whatever `skip` says.
+    #[test]
+    fn a_skipped_slot_wait_ends_without_a_slot() {
+        let held = ONE.acquire();
+        let skip = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let waiting = s.spawn(|| ONE.acquire_unless(|| skip.load(Ordering::SeqCst)).is_none());
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert!(!waiting.is_finished(), "waits while the slot is held");
+            skip.store(true, Ordering::SeqCst);
+            assert!(waiting.join().unwrap(), "skipped: no slot");
+        });
+        std::thread::scope(|s| {
+            let waiting = s.spawn(|| ONE.acquire_unless(|| false).is_some());
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(held);
+            assert!(waiting.join().unwrap(), "the slot that was let go");
+        });
+        assert!(ONE.acquire_unless(|| true).is_some(), "a free slot is taken");
+    }
+}
 
 /// Big background driver compiles at once: 1, or `XCL_BIG_COMPILES` (1 – 16). One at a time keeps
 /// the commit of a Windows machine with a small page file in bounds; with the RAM for it more can
@@ -3636,13 +3711,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     let (hr, admitted) = build_reusing(
         cached.is_some(),
         // in the background, one at a time and within the commit left (each ~1.5 GB in the driver)
-        || {
-            (big && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"))).then(|| {
-                let slot = BIG_COMPILES.acquire();
-                wait_for_commit();
-                slot
-            })
-        },
+        || (big && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"))).then(admit_big).flatten(),
         |with_blob| {
             let hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
             if with_blob && hr < 0 {

@@ -34,6 +34,10 @@ struct Pending {
     seq: u64,
     /// built by an `ahead` thread and not asked for by the title since
     ahead: std::sync::atomic::AtomicBool,
+    /// the `preload` thread building it (a handle to raise its priority by), 0 = none
+    builder: AtomicUsize,
+    /// a title thread waits for it (`title_waits`)
+    waited: std::sync::atomic::AtomicBool,
 }
 
 impl Pending {
@@ -42,6 +46,28 @@ impl Pending {
             used::note(self.key);
         }
     }
+
+    /// A title thread waits for this build (called with `done` held, before it is done). A
+    /// `preload` thread building it goes on at normal priority – the title does not wait on a
+    /// thread every other one runs before – and takes no compile slot (`preload_wanted`).
+    fn title_waits(&self) {
+        // (SeqCst: the preload thread stores `builder`, then reads `waited`)
+        self.waited.store(true, Ordering::SeqCst);
+        let h = self.builder.load(Ordering::SeqCst);
+        if h != 0 {
+            set_priority(h, windows_sys::Win32::System::Threading::THREAD_PRIORITY_NORMAL);
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                crate::xlog_info!("D3D12.X: {n} waits of the title for a pipeline still being built ahead of its first use (that build goes on at normal priority)");
+            }
+        }
+    }
+}
+
+/// Thread `h` (a handle with THREAD_SET_LIMITED_INFORMATION) runs at `priority` now.
+fn set_priority(h: usize, priority: i32) {
+    unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(h as windows_sys::Win32::Foundation::HANDLE, priority) };
 }
 
 /// stand-in handed to the title → its real pipeline
@@ -143,6 +169,8 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         orphan: Default::default(),
         seq: NEXT_SEQ.fetch_add(1, Ordering::Relaxed),
         ahead: Default::default(),
+        builder: AtomicUsize::new(0),
+        waited: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
     if compute && !send && ahead_threads() > 0 {
@@ -240,10 +268,30 @@ mod used {
 /// The workers that build the pipelines of an earlier run ahead of their first use
 /// (`XCL_PSO_PRELOAD=0`: off). Apart from the ones a bind sends to (`queue`) and at the lowest
 /// priority: a pipeline that is bound is not held up by the ones made ahead (whoever takes
-/// `job` first builds it), and the title's own threads are not either.
+/// `job` first builds it), and the title's own threads are not either. Each builds one pipeline
+/// at a time, so they send DXC no more compiles at once than there are of them; their big
+/// driver compiles have slots of their own (`real::admit_big`). When a title thread waits for a
+/// pipeline one of them builds, that build goes on at normal priority and without waiting for a
+/// slot (`Pending::title_waits`).
 struct Preload {
     list: Mutex<std::collections::VecDeque<Arc<Pending>>>,
     cv: Condvar,
+}
+
+thread_local! {
+    /// the pipeline this thread builds ahead of its first use (`preload`)
+    static PRELOADING: std::cell::RefCell<Option<Arc<Pending>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// This thread builds a pipeline ahead of its first use (`preload`): it may wait for what a
+/// build the title waits for does not (a slot for a big driver compile), unless `preload_wanted`.
+pub fn preloading() -> bool {
+    PRELOADING.with(|c| c.borrow().is_some())
+}
+
+/// A title thread waits for the pipeline this thread builds ahead of its first use.
+pub fn preload_wanted() -> bool {
+    PRELOADING.with(|c| c.borrow().as_ref().is_some_and(|p| p.waited.load(Ordering::SeqCst)))
 }
 
 fn preload() -> Option<&'static Preload> {
@@ -261,10 +309,10 @@ fn preload() -> Option<&'static Preload> {
         let n = (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4);
         for k in 0..n {
             let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(64 << 20).spawn(move || {
-                unsafe {
-                    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_LOWEST};
-                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
-                }
+                use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, OpenThread, SetThreadPriority, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL, THREAD_SET_LIMITED_INFORMATION};
+                // (what a title thread waiting for a pipeline this one builds raises it by; never closed)
+                let me = unsafe { OpenThread(THREAD_SET_LIMITED_INFORMATION, 0, GetCurrentThreadId()) } as usize;
+                unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST) };
                 static DONE: AtomicUsize = AtomicUsize::new(0);
                 loop {
                     let p = {
@@ -280,11 +328,27 @@ fn preload() -> Option<&'static Preload> {
                     if p.orphan.load(Ordering::Acquire) {
                         continue;
                     }
-                    // (None: a bind took it and builds it itself)
-                    let job = p.job.lock().unwrap().take();
+                    // (None: a bind took it and builds it itself.) `builder` is set with the job
+                    // taken: a title thread that finds no job sees who builds it.
+                    let job = {
+                        let mut j = p.job.lock().unwrap();
+                        let job = j.take();
+                        if job.is_some() {
+                            p.builder.store(me, Ordering::SeqCst);
+                        }
+                        job
+                    };
                     if let Some(job) = job {
+                        // (a title thread waits for it already)
+                        if p.waited.load(Ordering::SeqCst) {
+                            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
+                        }
+                        PRELOADING.with(|c| *c.borrow_mut() = Some(p.clone()));
                         let real = job();
+                        PRELOADING.with(|c| *c.borrow_mut() = None);
                         complete(&p, real);
+                        // (raised while a title thread waited: done now, so not raised again)
+                        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST) };
                         let n = DONE.fetch_add(1, Ordering::Relaxed) + 1;
                         if n.is_power_of_two() {
                             crate::xlog_info!("D3D12.X: {n} pipelines built ahead of their first use");
@@ -330,6 +394,57 @@ mod used_tests {
         released(known);
         released(unknown);
     }
+
+    /// A pipeline built ahead is built at the lowest priority until a title thread waits for it,
+    /// then at normal priority (a title thread waiting on a thread that every busy one runs
+    /// before waits for as long as the machine is busy), and the build is told it is wanted (it
+    /// waits for no compile slot then). Once built, its thread is at the lowest priority again.
+    #[test]
+    fn a_title_thread_waiting_for_a_pipeline_built_ahead_raises_its_thread() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, GetThreadPriority, OpenThread, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL, THREAD_QUERY_LIMITED_INFORMATION};
+        // (thread, its priority, building ahead, wanted)
+        fn seen() -> (u32, i32, bool, bool) {
+            unsafe { (GetCurrentThreadId(), GetThreadPriority(GetCurrentThread()), preloading(), preload_wanted()) }
+        }
+        let (standin, key) = (0x7E57_7011usize, 0x5EED_0011u64);
+        used::earlier_run_used(key);
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        submit_lazy(
+            standin,
+            true,
+            Box::new(move || {
+                let _ = seen_tx.send(seen());
+                let _ = go_rx.recv();
+                let _ = seen_tx.send(seen());
+                standin + 1
+            }),
+            key,
+        );
+        let long = Duration::from_secs(10);
+        let (tid, priority, ahead, wanted) = seen_rx.recv_timeout(long).expect("built ahead, with no bind");
+        assert_eq!((priority, ahead, wanted), (THREAD_PRIORITY_LOWEST, true, false));
+        assert!(!preloading() && !preload_wanted(), "not on a title thread");
+        let h = unsafe { OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, tid) };
+        assert!(!h.is_null());
+        let priority_after = |want: i32| {
+            let start = Instant::now();
+            while unsafe { GetThreadPriority(h) } != want && start.elapsed() < long {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            unsafe { GetThreadPriority(h) }
+        };
+        // a title thread waits for it (a compute bind): its thread is raised
+        let title = std::thread::spawn(move || resolve_wait(standin));
+        assert_eq!(priority_after(THREAD_PRIORITY_NORMAL), THREAD_PRIORITY_NORMAL, "raised while the title waits");
+        go_tx.send(()).unwrap();
+        assert_eq!(seen_rx.recv_timeout(long).unwrap(), (tid, THREAD_PRIORITY_NORMAL, true, true));
+        assert_eq!(title.join().unwrap(), standin + 1);
+        assert_eq!(priority_after(THREAD_PRIORITY_LOWEST), THREAD_PRIORITY_LOWEST, "back to the lowest once built");
+        unsafe { CloseHandle(h) };
+        released(standin);
+    }
 }
 
 fn entry(pso: usize) -> Option<Arc<Pending>> {
@@ -369,6 +484,9 @@ fn wait_unbounded(pso: usize, p: &Pending, budget: &FrameBudget) -> usize {
         complete(p, job());
     }
     let mut done = p.done.lock().unwrap();
+    if !*done {
+        p.title_waits();
+    }
     while !*done {
         done = p.cv.wait(done).unwrap();
     }
@@ -594,6 +712,9 @@ fn wait_built(p: &Pending, limit: Option<Duration>, budget: &FrameBudget) -> (bo
     let _waiting = TitleWait::new();
     let mut charged = start;
     let mut done = p.done.lock().unwrap();
+    if !*done {
+        p.title_waits();
+    }
     while !*done {
         let now = Instant::now();
         budget.charge(now - charged);
@@ -851,6 +972,8 @@ mod ahead_tests {
             orphan: Default::default(),
             seq,
             ahead: Default::default(),
+            builder: AtomicUsize::new(0),
+            waited: Default::default(),
         })
     }
 
