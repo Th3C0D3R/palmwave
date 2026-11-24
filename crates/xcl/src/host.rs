@@ -14,10 +14,21 @@ pub fn activity() -> bool {
     *ON.get_or_init(|| std::env::var_os("XCL_ACTIVITY").is_some())
 }
 
-/// `XCL_ACTIVITY`: the process's heaps – (bytes committed, bytes allocated) of the default heap
-/// (Rust's allocator, the C runtime's and DXC's `malloc`), then (count, bytes committed, the
-/// largest's bytes committed) of the others (drivers, the D3D12 runtime).
+/// `XCL_ACTIVITY` with `XCL_ACTIVITY_HEAPS=1`: the process's heaps – (bytes committed, bytes
+/// allocated) of the default heap (Rust's allocator, the C runtime's and DXC's `malloc`), then
+/// (count, bytes committed, the largest's bytes committed) of the others (drivers, the D3D12
+/// runtime). Off by default: HeapSummary locks each heap while it walks it, 0.5 s on a retail
+/// title's multi-GB heap every 2 s, and the title's threads that allocate wait meanwhile.
 fn heaps() -> ((usize, usize), (usize, usize, usize)) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("XCL_ACTIVITY_HEAPS").is_ok_and(|v| v == "1")) {
+        return ((0, 0), (0, 0, 0));
+    }
+    measure_heaps()
+}
+
+/// `heaps`, measured whatever the switch says.
+fn measure_heaps() -> ((usize, usize), (usize, usize, usize)) {
     use windows_sys::Win32::System::Memory::{GetProcessHeap, GetProcessHeaps, HeapSummary, HEAP_SUMMARY};
     unsafe {
         let own = GetProcessHeap();
@@ -204,7 +215,7 @@ mod tests {
     #[test]
     fn the_default_heap_reports_what_is_allocated() {
         let held = vec![1u8; 300 << 10];
-        let ((committed, allocated), _) = super::heaps();
+        let ((committed, allocated), _) = super::measure_heaps();
         assert!(allocated >= held.len() && committed >= allocated, "{committed} committed, {allocated} allocated");
     }
 }
