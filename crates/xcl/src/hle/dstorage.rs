@@ -919,18 +919,29 @@ const PAGE_WAIT_MS: u64 = 5000;
 /// How often it reads them again meanwhile.
 const PAGE_POLL: Duration = Duration::from_millis(1);
 
-/// Read the entries of the title's page array at `array` that are 0 in `pages` again (no page
-/// has that number); entries that had a page keep the snapshot's (titles also pass arrays on the
-/// stack). An array that cannot be read is left as it was.
-unsafe fn reread_zero_pages(array: u64, pages: &mut [usize]) {
+/// Read the title's page array at `array` again into `pages` (its entries at EnqueueRequest).
+/// An entry that was 0 (no page has that number) takes what the array holds now. One that named
+/// a page takes the array's entry when that names another allocated page: the title wrote it
+/// after EnqueueRequest, as it does the entries it leaves 0 until its Submit, and the page it
+/// named before may be anything else's by now. An entry that no longer names an allocated page
+/// keeps the snapshot's (titles also pass arrays on the stack), and an array that cannot be read
+/// is left as it was. Returns the first entry that went from one page to another (index, page
+/// at EnqueueRequest, page now) and how many did.
+unsafe fn reread_pages(array: u64, pages: &mut [usize]) -> (Option<(usize, usize, usize)>, u64) {
     let mut now = vec![0usize; pages.len()];
+    let (mut first, mut changed) = (None, 0);
     if read_own(array as usize, now.as_mut_ptr() as *mut u8, std::mem::size_of_val(pages)) {
-        for (p, n) in pages.iter_mut().zip(now) {
+        for (i, (p, n)) in pages.iter_mut().zip(now).enumerate() {
             if *p == 0 {
+                *p = n;
+            } else if n != *p && crate::hle::kernelx::physical_page_live(n) {
+                first.get_or_insert((i, *p, n));
+                changed += 1;
                 *p = n;
             }
         }
     }
+    (first, changed)
 }
 
 /// Run a request; the destination gets the bytes or nothing.
@@ -1101,12 +1112,15 @@ struct PageWaits {
     filled: AtomicU64,
     /// … a page still 0: the request failed as before
     missing: AtomicU64,
+    /// entries that named one page at EnqueueRequest and another at the request's turn
+    /// (`reread_pages`)
+    changed: AtomicU64,
 }
 
 impl PageWaits {
     fn new() -> Self {
         let z = || AtomicU64::new(0);
-        PageWaits { bound_ms: AtomicU64::new(PAGE_WAIT_MS), given_up: z(), waited: z(), filled: z(), missing: z() }
+        PageWaits { bound_ms: AtomicU64::new(PAGE_WAIT_MS), given_up: z(), waited: z(), filled: z(), missing: z(), changed: z() }
     }
 }
 
@@ -1286,25 +1300,27 @@ impl QueueInner {
         }
     }
 
-    /// A destination or source page array with page 0 in it at the request's turn (no page has
-    /// that number). A retail title fills the entries in after EnqueueRequest and before the
-    /// Submit that covers the request, and a half-full queue submits itself, so whole batches
-    /// reached the worker early: 2,047 of its streaming requests failed within 2 s. The entries
-    /// that are 0 are read again now, then on a short poll until they are all there, the title's
-    /// Submit `until` has come (then once more), or `PAGE_WAIT_MS` passed – once for all the
-    /// requests waiting for that Submit. A page still 0 then fails the request as before. The
-    /// wait holds no lock the title's calls take; Close and CancelRequestsWithTag wake it.
+    /// A destination or source page array at the request's turn: the title's array is read again
+    /// (`reread_pages`), so the request goes to the pages the array names now – a retail title
+    /// writes the entries after EnqueueRequest and before the Submit that covers the request, and
+    /// the snapshot of EnqueueRequest holds whatever the array's memory held before that.
+    /// With page 0 in it (no page has that number): a half-full queue submits itself, so whole
+    /// batches reached the worker before the title had written them: 2,047 of its streaming
+    /// requests failed within 2 s. The array is read again on a short poll until no entry is 0,
+    /// the title's Submit `until` has come (then once more), or `PAGE_WAIT_MS` passed – once for
+    /// all the requests waiting for that Submit. A page still 0 then fails the request as before.
+    /// The wait holds no lock the title's calls take; Close and CancelRequestsWithTag wake it.
     /// false: the queue was closed or the request (`turn`: its seq and tag) cancelled meanwhile.
     fn fill_in_pages(&self, array: u64, pages: &mut [usize], until: u64, turn: Option<(u64, u64)>) -> bool {
-        if !pages.contains(&0) {
-            return true;
-        }
         let w = &self.page_waits;
         let mut since = None;
         loop {
             // the count before the read: what the title wrote before that Submit is seen
             let covered = *self.submits.0.lock().unwrap() >= until;
-            unsafe { reread_zero_pages(array, pages) };
+            let (first, changed) = unsafe { reread_pages(array, pages) };
+            if let Some(first) = first {
+                self.pages_changed(first, changed, covered, until);
+            }
             if !pages.contains(&0) || covered || until <= w.given_up.load(Ordering::Relaxed) {
                 break;
             }
@@ -1329,6 +1345,22 @@ impl QueueInner {
             self.page_wait_ends(Some(!pages.contains(&0)));
         }
         true
+    }
+
+    /// Entries of a page array named one page at EnqueueRequest and another at the request's
+    /// turn (`first`: index, page then, page now): a line the first time on this queue, then
+    /// whenever their count passes a power of two.
+    fn pages_changed(&self, first: (usize, usize, usize), changed: u64, covered: bool, until: u64) {
+        let before = self.page_waits.changed.fetch_add(changed, Ordering::Relaxed);
+        let k = before + changed;
+        if before == 0 || k.ilog2() != before.ilog2() {
+            let (i, then, now) = first;
+            crate::xlog_warn!(
+                "DirectStorage: queue {:p}: a page array named another page at the request's turn than at EnqueueRequest (entry {i}: {then:#x} then, {now:#x} now; {} the title's Submit #{until} that covers it): the request goes to the pages named now ({k} such entries so far)",
+                self,
+                if covered { "after" } else { "before" }
+            );
+        }
     }
 
     /// A request starts waiting for its page array: a line the first time on this queue.
@@ -2990,6 +3022,63 @@ mod tests {
             assert_eq!(status_get_hresult(s, 1), S_OK);
             assert_eq!(readback, data);
             assert_eq!((w.filled.load(Ordering::Relaxed), w.missing.load(Ordering::Relaxed)), (2, 0));
+
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+            MapTitlePhysicalPages(reserved, 2, 0, 4, std::ptr::null_mut());
+            VirtualFree(reserved, 0, MEM_RELEASE);
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
+        }
+    }
+
+    /// The title writes a page array entry between EnqueueRequest and its Submit over one that
+    /// named another page (the array's memory held it from an earlier use): the request writes
+    /// the page the array names at its turn, and the page it named at EnqueueRequest – anything
+    /// else's by now – is left alone. An entry that no longer names a page (an array on the stack,
+    /// reused) keeps the page of EnqueueRequest.
+    #[test]
+    fn a_page_array_entry_written_after_enqueue_names_the_page_written() {
+        use crate::hle::kernelx::{AllocateTitlePhysicalPages, FreeTitlePhysicalPages, MapTitlePhysicalPages, PHYS_PAGE_SIZE};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        if crate::gpu::uma::get().is_none() {
+            return;
+        }
+        unsafe {
+            let mut count = 2usize;
+            let mut pages = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, pages.as_mut_ptr()), 1);
+            let reserved = VirtualAlloc(std::ptr::null(), 2 * PHYS_PAGE_SIZE, MEM_RESERVE, PAGE_READWRITE);
+            assert!(!reserved.is_null());
+            assert_eq!(MapTitlePhysicalPages(reserved, 2, 0, 4, pages.as_mut_ptr()), reserved);
+            let (old, new) = (reserved as *mut u8, (reserved as *mut u8).add(PHYS_PAGE_SIZE));
+            // what the page the array still names at EnqueueRequest holds by now
+            std::ptr::write_bytes(old, 0x11, 0x1000);
+            let (q, s) = memory_queue(16, 2);
+            let data: Vec<u8> = (0..0x1000u32).map(|i| (i * 11 + 1) as u8).collect();
+
+            let mut table = Box::new([pages[0]]);
+            let enqueue = |table: &[usize; 1], index: u32| {
+                queue_enqueue_request(q, request_ex(SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT, table.as_ptr() as u64, 0, data.len() as u32, data.as_ptr() as u64, 0, data.len() as u32, 0, 0).as_ptr());
+                queue_enqueue_status(q, s, index);
+            };
+            enqueue(&table, 0);
+            std::ptr::write_volatile(&mut table[0], pages[1]);
+            queue_submit(q);
+            assert!(wait_until(|| status_is_complete(s, 0)));
+            assert_eq!(status_get_hresult(s, 0), S_OK);
+            assert!(std::slice::from_raw_parts(new, data.len()) == &data[..], "the page the array names at the request's turn is written");
+            assert!(std::slice::from_raw_parts(old, 0x1000).iter().all(|&b| b == 0x11), "the page it named at EnqueueRequest is not");
+            assert_eq!(queue(q).page_waits.changed.load(Ordering::Relaxed), 1);
+
+            // no page any more where the array was: the page of EnqueueRequest
+            enqueue(&table, 1);
+            std::ptr::write_volatile(&mut table[0], 0x1237);
+            queue_submit(q);
+            assert!(wait_until(|| status_is_complete(s, 1)));
+            assert_eq!(status_get_hresult(s, 1), S_OK);
+            assert!(std::slice::from_raw_parts(new, data.len()) == &data[..]);
+            assert_eq!(queue(q).page_waits.changed.load(Ordering::Relaxed), 1);
 
             queue_close(q);
             queue_release(q);
