@@ -30,6 +30,8 @@ mod mesh_input_dump;
 pub mod layout;
 pub mod list_x;
 pub mod null;
+mod overlay_font;
+mod overlay_stats;
 pub mod present;
 pub mod pso_async;
 pub mod real;
