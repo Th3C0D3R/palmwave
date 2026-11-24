@@ -658,6 +658,8 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     p.dumps.clear();
     // `XCL_MESH_RECORD_DUMP`: the queue is past the frame before this one
     super::mesh_dump::flush();
+    // `XCL_MESH_INPUT_DUMP`: likewise
+    super::mesh_input_dump::flush();
     if !ensure_swapchain(p, hwnd, desc.Width as u32, desc.Height, fmt) {
         return;
     }

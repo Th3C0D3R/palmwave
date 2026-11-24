@@ -440,6 +440,22 @@ unsafe fn bind_two_pass_stage(
     Ok(io)
 }
 
+/// A draw's root arguments by parameter, for `XCL_MESH_INPUT_DUMP`: its descriptor tables, its
+/// root buffers and the first of each parameter's root constants.
+fn root_arguments(this: *mut c_void) -> Vec<(usize, super::mesh_input_dump::Root)> {
+    use super::mesh_input_dump::Root;
+    let (layout, args) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone()));
+    let word = |at: u32| args.get(at as usize..at as usize + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+    let params = layout.iter().flat_map(|l| l.params.iter().enumerate());
+    params
+        .filter_map(|(i, p)| match *p {
+            Param::Table { at } => Some((i, Root::Table(word(at)))),
+            Param::Descriptor { at } => Some((i, Root::Buffer(word(at) as u64 | (word(at + 4) as u64) << 32))),
+            Param::Constants { at, count } => (count > 0).then(|| (i, Root::Constant(word(at)))),
+        })
+        .collect()
+}
+
 unsafe fn scale_indirect_pipeline(dev: &ID3D12Device) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
     static CACHE: Mutex<Option<HashMap<usize, (ID3D12RootSignature, ID3D12PipelineState)>>> = Mutex::new(None);
     let key = dev.as_raw() as usize;
@@ -559,6 +575,9 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
                 list.Dispatch(groups, 1, 1);
             }
             emit_uav_barrier(list, Some(&res_buf));
+            if super::mesh_input_dump::due() {
+                super::mesh_input_dump::capture(this, list, format!("DispatchMesh({x}, {y}, {z}), pipeline {pso:#x}"), &io, &root_arguments(this));
+            }
             if super::mesh_dump::due() {
                 let what = format!("DispatchMesh({x}, {y}, {z}), pipeline {pso:#x} ({}), {} mesh group(s) a record", tp.kind, tp.mesh_groups_per_record);
                 super::mesh_dump::capture(this, list, &res_buf, &tp.record, what, &io, None);
@@ -628,6 +647,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     pc(this, msig.companion_dispatch, max, args, args_off, count_buf, count_off);
                 }
                 emit_uav_barrier(list, Some(&res_buf));
+                if super::mesh_input_dump::due() {
+                    super::mesh_input_dump::capture(this, list, format!("ExecuteIndirect(DispatchMesh, {max} at most), pipeline {pso:#x}"), &io, &root_arguments(this));
+                }
                 if super::mesh_dump::due() {
                     let what = format!("ExecuteIndirect(DispatchMesh, {max} at most{}), pipeline {pso:#x} ({}), {} mesh group(s) a record", if count_buf != 0 { ", count buffer" } else { "" }, tp.kind, tp.mesh_groups_per_record);
                     super::mesh_dump::capture(this, list, &res_buf, &tp.record, what, &io, (args != 0).then_some((args, args_off + msig.mesh_offset as u64)));
