@@ -4721,8 +4721,10 @@ const MESH_OUTPUT_BYTES: u32 = 32768;
 
 /// Vertices the pass-through puts in one mesh group: the vertex output budget divided by the
 /// stride, and DXC accounts whole chunks of 32 vertices even when fewer are declared (78
-/// vertices with 22 rows are accounted as 96). Measured with dxc 1.8.2502 (ms_6_6): every
-/// boundary from 9 to 26 float4 rows agrees.
+/// vertices with 22 rows are accounted as 96). Measured with dxc 1.8.2502 (ms_6_6): the
+/// formula gives DXC's exact boundary for 1 to 32 float4 rows, up to 256 primitives
+/// (NathanTheophile's 96-case bisect in this PR); narrower clip/cull rows count as full rows
+/// here, which can only overestimate.
 fn passthrough_max_vertices(vbytes: u32) -> u32 {
     (MESH_OUTPUT_BYTES / vbytes).min(256) / 32 * 32
 }
