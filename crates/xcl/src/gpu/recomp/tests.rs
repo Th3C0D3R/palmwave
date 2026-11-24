@@ -121,6 +121,58 @@ fn sdwa_compare_destination_is_a_write_to_the_analyses() {
     assert_eq!(samplers.into_iter().collect::<Vec<_>>(), [(insts[4].pc, [1, 2, 3, 4])]);
 }
 
+/// A compute program's memory windows are `globallycoherent` only when it reaches memory other
+/// workgroups of its dispatch may be writing (`emit::needs_coherent_memory`): a GLC / DLC / SLC
+/// access, an atomic, a cache invalidation or GDS – in all three window forms (one window, the
+/// switch over root UAVs, the descriptor heap). Plain scalar and vector loads and stores keep
+/// the cached view, as graphics programs always did.
+#[test]
+fn compute_windows_are_coherent_only_for_memory_other_workgroups_write() {
+    let one = |name: &str, enc: &str, fields: &[(&str, u64)]| encode(name, enc, fields, None).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let s_load = |glc: u64| one("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 0), ("OFFSET", 0x10), ("SOFFSET", 125), ("GLC", glc)]);
+    let buffer = |name: &str, cache: &[(&str, u64)]| {
+        let mut f = vec![("VDATA", 1), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("IDXEN", 1)];
+        f.extend_from_slice(cache);
+        one(name, "ENC_MUBUF", &f)
+    };
+    let plain: Vec<u8> = [s_load(0), buffer("BUFFER_LOAD_DWORD", &[]), buffer("BUFFER_STORE_DWORD", &[]), one("S_ENDPGM", "ENC_SOPP", &[])].concat();
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("s_load glc", s_load(1)),
+        ("buffer_load glc", buffer("BUFFER_LOAD_DWORD", &[("GLC", 1)])),
+        ("buffer_load dlc", buffer("BUFFER_LOAD_DWORD", &[("DLC", 1)])),
+        ("buffer_store slc", buffer("BUFFER_STORE_DWORD", &[("SLC", 1)])),
+        ("buffer_atomic_add", buffer("BUFFER_ATOMIC_ADD", &[])),
+        ("global_load glc", one("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 1), ("ADDR", 0), ("SADDR", 0x7D), ("GLC", 1)])),
+        ("buffer_gl0_inv", one("BUFFER_GL0_INV", "ENC_MUBUF", &[])),
+        ("s_dcache_inv", one("S_DCACHE_INV", "ENC_SMEM", &[])),
+    ];
+    let decode = |code: &[u8]| {
+        let (mut insts, mut off) = (Vec::new(), 0);
+        while off < code.len() {
+            let d = crate::gpu::rdna2::decode(&code[off..], off as u64).unwrap();
+            off += d.len;
+            insts.push(d);
+        }
+        insts
+    };
+    assert!(!super::emit::needs_coherent_memory(&decode(&plain)));
+    let gds = one("DS_ADD_U32", "ENC_DS", &[("ADDR", 0), ("DATA0", 1), ("GDS", 1)]);
+    assert!(super::emit::needs_coherent_memory(&decode(&gds)), "a GDS operation");
+    assert!(!super::emit::needs_coherent_memory(&decode(&one("DS_ADD_U32", "ENC_DS", &[("ADDR", 0), ("DATA0", 1)]))), "an LDS operation");
+    let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 6, ..Default::default() };
+    for windows in [1, 4, 4 | super::HEAP_WINDOWS] {
+        let hlsl = |code: &[u8], mode: Mode| translate(&[code, plain.as_slice()].concat(), &Options { mode, mem_windows: windows, ..Default::default() }).unwrap().hlsl;
+        assert!(!hlsl(&[], Mode::Compute(cs.clone())).contains("globallycoherent"), "plain loads and stores, {windows:#x} windows");
+        for (what, code) in &cases {
+            assert!(super::emit::needs_coherent_memory(&decode(code)), "{what}");
+            let h = hlsl(code, Mode::Compute(cs.clone()));
+            assert!(h.contains("globallycoherent RWByteAddressBuffer"), "{what}, {windows:#x} windows:\n{h}");
+            // the kernel mode of the tests stays as it was
+            assert!(!hlsl(code, Mode::Kernel).contains("globallycoherent"), "{what}, kernel mode");
+        }
+    }
+}
+
 #[test]
 fn geometry_wave32_rejects_cross_half_operations() {
     let one = |name: &str, enc: &str, fields: &[(&str, u64)]| encode(name, enc, fields, None).unwrap();

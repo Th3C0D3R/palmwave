@@ -64,6 +64,8 @@ pub(super) struct Em {
     /// the program has more than `Options::giant_from` instructions: forms that make less
     /// DXIL, in HLSL no other program gets (theirs stays byte for byte what it was)
     pub giant: bool,
+    /// a compute program's memory windows are `globallycoherent` (`needs_coherent_memory`)
+    pub coherent_memory: bool,
 }
 
 /// Instructions without an effect in this execution model.
@@ -487,6 +489,7 @@ impl Em {
             has_f64_round_op: false,
             dynamic_f16_rm: false,
             giant: false,
+            coherent_memory: false,
         }
     }
 
@@ -4378,10 +4381,7 @@ impl Em {
             h.push_str("#define XCL_PIXEL 1\n");
         }
         h.push_str("RWByteAddressBuffer io : register(u0);\nRWByteAddressBuffer res : register(u1);\n");
-        // compute work across workgroups (bottom-up BVH builds: atomics, then reading what
-        // other groups wrote) relies on GLC / cache invalidation on the console: keep the flat
-        // memory coherent across the GPU there; graphics keeps the cached (faster) view
-        let coherent = if matches!(self.opt.mode, Mode::Compute(_)) { "globallycoherent " } else { "" };
+        let coherent = self.window_coherence();
         let windows = self.opt.mem_windows.clamp(1, 4);
         let _ = writeln!(h, "{coherent}RWByteAddressBuffer mem : register(u2);");
         if windows > 1 {
@@ -4837,11 +4837,43 @@ impl Em {
             }
         }
         if windows > 1 {
-            let coherent = if matches!(self.opt.mode, Mode::Compute(_)) { "globallycoherent " } else { "" };
-            h = windowed(&h, windows, self.opt.heap_windows.then_some(coherent));
+            h = windowed(&h, windows, self.opt.heap_windows.then_some(self.window_coherence()));
         }
         h
     }
+
+    /// The storage class of the memory windows: compute work across workgroups (bottom-up BVH
+    /// builds: atomics, then reading what other groups wrote) relies on GLC / cache invalidation
+    /// on the console, and keeps the flat memory coherent across the GPU
+    /// (`needs_coherent_memory`); any other program, and graphics, the cached (faster) view.
+    fn window_coherence(&self) -> &'static str {
+        if matches!(self.opt.mode, Mode::Compute(_)) && self.coherent_memory {
+            "globallycoherent "
+        } else {
+            ""
+        }
+    }
+}
+
+/// Whether a compute program reaches memory that other workgroups of its dispatch may be
+/// writing: a GLC, DLC or SLC access, an atomic, a cache invalidation (`buffer_gl0_inv`,
+/// `buffer_gl1_inv`, `s_dcache_inv`, `s_gl1_inv`) or GDS. Only those get `globallycoherent`
+/// memory windows. Without any of them the console's own caches (scalar cache, L0, GL1) are
+/// not coherent across workgroups either, and the cached view gives what the console gives,
+/// while a `globallycoherent` load skips the SM's L1 on NVIDIA: every scalar load of a
+/// descriptor or constant went to L2, or across PCIe in the coherent window. (A retail game's
+/// slowest world passes – sky and cloud caches, TAA, scattering volumes – have none of them.)
+pub(super) fn needs_coherent_memory(insts: &[Decoded]) -> bool {
+    insts.iter().any(|d| {
+        let name = d.inst.name.to_ascii_lowercase();
+        let field = |f: &str| rdna2::field_value(d.enc, &d.words, f) == Some(1);
+        match d.enc.name {
+            _ if matches!(name.as_str(), "buffer_gl0_inv" | "buffer_gl1_inv" | "s_dcache_inv" | "s_gl1_inv") => true,
+            "ENC_SMEM" | "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL" => name.contains("atomic") || field("GLC") || field("DLC") || field("SLC"),
+            "ENC_DS" => field("GDS") || name.starts_with("ds_gws") || name == "ds_ordered_count",
+            _ => false,
+        }
+    })
 }
 
 /// Vertex output struct shared by the VS mode and the mesh pass-through: SV_Position, then

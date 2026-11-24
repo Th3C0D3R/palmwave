@@ -1462,6 +1462,8 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     let mut em = emit::Em::new(opt.clone());
     em.giant = insts.len() > opt.giant_from;
     em.configure_round_modes(&insts, branches == 0);
+    // `XCL_COHERENT_MEMORY` set: every compute program's windows coherent, as before (to compare)
+    em.coherent_memory = std::env::var_os("XCL_COHERENT_MEMORY").is_some() || emit::needs_coherent_memory(&insts);
     em.static_ss = constant_samplers(&insts, &leaders);
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
     // continues from the ES into the GS through s_setpc: left as it is)
