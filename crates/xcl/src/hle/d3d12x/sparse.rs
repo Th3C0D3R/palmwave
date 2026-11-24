@@ -1391,6 +1391,77 @@ impl State {
     }
 }
 
+/// Whether `[p, p + n)` lies in the sparse windows and every page of it is committed and
+/// writable, without `VirtualQuery`: the windows' record of commits (`committed` /
+/// `decommitted`) answers for each page, and the working set for the protection of those in it.
+/// `VirtualQuery` sizes the committed run around an address by walking it to its end, which in a
+/// sparse window is gigabytes: a retail game's DirectStorage destinations and its emulated CLZERO
+/// lines there took up to 138 ms a check, and its submit thread waited for every walk in
+/// `GetWriteWatch`. `false` (ask Windows) for a page the record does not hold as committed, or
+/// one in the working set without a writable protection. A committed page not in the working
+/// set is taken to be writable: XCL commits the windows read-write.
+pub fn known_writable(p: usize, n: usize) -> bool {
+    let Some(end) = p.checked_add(n) else { return false };
+    if n == 0 || !crate::gpu::uma::get().is_some_and(|u| u.is_sparse(p) && u.is_sparse(end - 1)) {
+        return false;
+    }
+    {
+        let g = STATE.lock().unwrap();
+        let Some(s) = g.as_ref() else { return false };
+        if !recorded_committed(&s.mapped, p, end) {
+            return false;
+        }
+    }
+    resident_pages_writable(p, end)
+}
+
+/// Every page of `[p, end)` is in a tile of `mapped` and not one of its holes.
+fn recorded_committed(mapped: &FxHashMap<usize, TileEntry>, p: usize, end: usize) -> bool {
+    let mut pg = p & !(PAGE - 1);
+    while pg < end {
+        let t = pg & !(TILE - 1);
+        if !mapped.get(&t).is_some_and(|e| e.holes & (1u16 << ((pg - t) / PAGE)) == 0) {
+            return false;
+        }
+        pg += PAGE;
+    }
+    true
+}
+
+/// No page of `[p, end)` that is in the working set has a protection other than a writable one
+/// (asked 64 pages a call; the query touches no page).
+fn resident_pages_writable(p: usize, end: usize) -> bool {
+    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
+    const BATCH: usize = 64;
+    // PAGE_READWRITE / WRITECOPY / EXECUTE_READWRITE / EXECUTE_WRITECOPY; PAGE_GUARD
+    const WRITABLE: u32 = 0x04 | 0x08 | 0x40 | 0x80;
+    let (first, last) = (p >> 12, (end - 1) >> 12);
+    let mut ws: [PSAPI_WORKING_SET_EX_INFORMATION; BATCH] = unsafe { std::mem::zeroed() };
+    let mut page = first;
+    while page <= last {
+        let k = (last - page + 1).min(BATCH);
+        for (i, e) in ws[..k].iter_mut().enumerate() {
+            *e = unsafe { std::mem::zeroed() };
+            e.VirtualAddress = ((page + i) << 12) as *mut c_void;
+        }
+        let size = (k * std::mem::size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32;
+        if unsafe { K32QueryWorkingSetEx(windows_sys::Win32::System::Threading::GetCurrentProcess(), ws.as_mut_ptr() as *mut c_void, size) } == 0 {
+            return false;
+        }
+        // PSAPI_WORKING_SET_EX_BLOCK: bit 0 Valid, bits 4-14 Win32Protection
+        let bad = ws[..k].iter().any(|e| {
+            let flags = unsafe { e.VirtualAttributes.Flags };
+            let protect = ((flags >> 4) & 0x7FF) as u32;
+            flags & 1 != 0 && (protect & WRITABLE == 0 || protect & 0x100 != 0)
+        });
+        if bad {
+            return false;
+        }
+        page += k;
+    }
+    true
+}
+
 /// The sparse windows' tiles with video memory as sorted (start, end) runs: where a CPU write
 /// has to reach the GPU.
 pub fn mapped_ranges() -> Vec<(usize, usize)> {
@@ -1935,6 +2006,49 @@ mod tests {
     /// Sub-tile decommits (two 32 KiB halves, sixteen 4 KiB pages, or decommitting the last
     /// remaining committed page) must unmap the tile and return unpinned pool tiles to `free`
     /// once `holes` reaches `0xFFFF`, pruning stale `to_zero` entries for unmapped tiles.
+    #[test]
+    fn recorded_committed_needs_every_page_in_a_mapped_tile_and_no_hole() {
+        let mut mapped: FxHashMap<usize, TileEntry> = FxHashMap::default();
+        let (t0, t1) = (0x10_0000usize, 0x11_0000usize);
+        mapped.insert(t0, TileEntry::with_holes((0, 1), 0));
+        mapped.insert(t1, TileEntry::with_holes((0, 2), 1 << 2)); // page 2 of t1 uncommitted
+        // a whole tile, a range across both tiles up to the hole, a byte range in one page
+        assert!(recorded_committed(&mapped, t0, t0 + TILE));
+        assert!(recorded_committed(&mapped, t0 + 0x800, t1 + 2 * PAGE));
+        assert!(recorded_committed(&mapped, t1 + 3 * PAGE + 8, t1 + 3 * PAGE + 72));
+        // the hole, a range that reaches it, a tile with no video memory (not in the record)
+        assert!(!recorded_committed(&mapped, t1 + 2 * PAGE, t1 + 2 * PAGE + 64));
+        assert!(!recorded_committed(&mapped, t0, t1 + 2 * PAGE + 1));
+        assert!(!recorded_committed(&mapped, t1 + TILE - 8, t1 + TILE + 8));
+        assert!(!recorded_committed(&mapped, 0x20_0000, 0x20_0040));
+    }
+
+    #[test]
+    fn resident_pages_writable_judges_the_pages_in_the_working_set() {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE, PAGE_READONLY};
+        unsafe {
+            // 0 written (read-write, resident); 1 read-only and read (resident); 2 read-write,
+            // never touched (not resident)
+            let base = VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE, PAGE_NOACCESS) as usize;
+            assert_ne!(base, 0);
+            assert!(!VirtualAlloc(base as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            assert!(!VirtualAlloc((base + PAGE) as *const c_void, PAGE, MEM_COMMIT, PAGE_READONLY).is_null());
+            assert!(!VirtualAlloc((base + 2 * PAGE) as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            std::ptr::write_volatile(base as *mut u8, 1);
+            assert_eq!(std::ptr::read_volatile((base + PAGE) as *const u8), 0);
+            assert!(resident_pages_writable(base, base + PAGE));
+            assert!(resident_pages_writable(base + 2 * PAGE, base + 3 * PAGE));
+            assert!(!resident_pages_writable(base + PAGE, base + PAGE + 8));
+            assert!(!resident_pages_writable(base, base + 3 * PAGE));
+            // asking touched nothing: page 2 is still out of the working set
+            let mut ws: windows_sys::Win32::System::ProcessStatus::PSAPI_WORKING_SET_EX_INFORMATION = std::mem::zeroed();
+            ws.VirtualAddress = (base + 2 * PAGE) as *mut c_void;
+            assert_ne!(windows_sys::Win32::System::ProcessStatus::K32QueryWorkingSetEx(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut ws as *mut _ as *mut c_void, std::mem::size_of_val(&ws) as u32), 0);
+            assert_eq!(ws.VirtualAttributes.Flags & 1, 0);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
     #[test]
     fn decommit_sub_tile_reclaims_pool_tile_when_all_pages_become_holes() {
         let mut mapped: FxHashMap<usize, TileEntry> = FxHashMap::default();
