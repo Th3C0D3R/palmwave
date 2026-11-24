@@ -50,6 +50,7 @@ Road to a playable 30 fps, most urgent first:
    - GPU waits between the title's queues complete only when `XCL_GPU_WAIT_WATCHDOG_MS` releases them.
    - When GPU work runs too long, Windows resets the GPU and the title stops on "device removed".
 2. **Nothing of the world is visible.** The world's geometry is drawn with mesh shaders. Through XCL's two-pass mesh path, its depth buffer receives thin "needle" triangles, as if correct vertices were joined by wrong indices; with `XCL_MESH=0` it stays empty. Its colour targets keep their cleared values (`XCL_RT_DUMP=1` writes them as images).
+   - The title keeps its streamed data in a 16–24 GB "GPU view" of its memory, whose pages it maps with queue method `CopyPageMappingsBatchX`. Textures, buffers and `CopyMemoryToMemoryX` copies there now read the pages mapped under them; before, buffers there read nothing or another memory window's bytes. Whether the geometry is right with it is not measured yet. `XCL_GPU_VIEW_BUFFERS=0` turns the buffer part off; `XCL_GPU_VIEW_BUFFERS_MB=n` is the address space it may take (4096).
 3. **Video memory.** 15–17 GB on a 16 GB card. The title's render targets, kept on 64 KiB pages of video memory, take 9.8 GB of it.
 4. **BCPack textures.** BC1, BC3, BC4, BC5, BC6H and BC7 streams are decoded; the title's BC1, BC5, BC6H and BC7 requests unpack in its runs. BC2 is refused. With `XCL_DSTORAGE_BCPACK_FILL=neutral`, a request that is refused or whose stream the decoder does not take completes with neutral grey blocks instead of failing.
 
