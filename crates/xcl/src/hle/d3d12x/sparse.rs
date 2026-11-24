@@ -389,6 +389,15 @@ unsafe impl Send for State {}
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
+/// (pool heaps, bytes of the UPLOAD staging ring and zero buffer made, bytes of the READBACK
+/// staging buffer made) – `XCL_ACTIVITY`
+pub fn buffer_counts() -> (usize, usize, usize) {
+    let g = STATE.lock().unwrap();
+    let Some(s) = g.as_ref() else { return (0, 0, 0) };
+    let upload = if s.staging.is_some() { STAGING } else { 0 } + if s.zero_buf.is_some() { ZERO_BUF } else { 0 };
+    (s.pools.iter().filter(|p| p.is_some()).count(), upload, if s.readback.is_some() { READBACK_STAGING } else { 0 })
+}
+
 /// (bytes of video memory in pool heaps, of those mapped) – `XCL_ACTIVITY`
 pub fn pool_bytes() -> (usize, usize) {
     let g = STATE.lock().unwrap();

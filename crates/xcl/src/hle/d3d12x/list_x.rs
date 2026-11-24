@@ -1002,6 +1002,12 @@ unsafe fn device_of(list: *mut c_void) -> Option<ID3D12Device> {
 /// upload buffers holding a repeated 16-byte pattern: (pattern, buffer, bytes)
 static PATTERNS: Mutex<Vec<([u8; 16], ID3D12Resource, u64)>> = Mutex::new(Vec::new());
 
+/// (pattern buffers kept, their bytes) – UPLOAD resources that live on – `XCL_ACTIVITY`
+pub fn pattern_bytes() -> (usize, u64) {
+    let g = PATTERNS.lock().unwrap();
+    (g.len(), g.iter().map(|p| p.2).sum())
+}
+
 /// A buffer of at least `n` bytes repeating `pat` (the device's upload heap).
 unsafe fn pattern_buffer(list: *mut c_void, pat: [u8; 16], n: u64) -> Option<usize> {
     let mut cache = PATTERNS.lock().unwrap();

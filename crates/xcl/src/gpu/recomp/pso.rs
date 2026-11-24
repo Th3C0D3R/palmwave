@@ -121,7 +121,21 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
         cache_dir: dxc::cache_dir(),
     };
     let from_disk = || translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compile_one);
-    cached_shader(cache, key, blob, from_disk).map(|shader| shader.as_ref().clone())
+    let shader = cached_shader(cache, key, blob, from_disk).map(|shader| shader.as_ref().clone());
+    if crate::host::activity() {
+        let c = cache.lock().unwrap();
+        SHADER_CACHE[0].store(c.entries.len(), std::sync::atomic::Ordering::Relaxed);
+        SHADER_CACHE[1].store(c.bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+    shader
+}
+
+/// (shaders, bytes) in the in-memory `ShaderCache` after its last use
+static SHADER_CACHE: [std::sync::atomic::AtomicUsize; 2] = [const { std::sync::atomic::AtomicUsize::new(0) }; 2];
+
+/// (shaders, bytes) kept in memory by the `ShaderCache` – `XCL_ACTIVITY`
+pub fn shader_cache() -> (usize, usize) {
+    (SHADER_CACHE[0].load(std::sync::atomic::Ordering::Relaxed), SHADER_CACHE[1].load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Translations on disk: a console program's (DXIL, static samplers) by its bytes, so a run

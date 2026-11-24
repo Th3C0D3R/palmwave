@@ -319,6 +319,24 @@ static WATCH_CACHE: Mutex<Option<((u64, u64, u64), Arc<Vec<(usize, usize)>>)>> =
 static QUEUES: Mutex<BTreeMap<usize, ID3D12CommandQueue>> = Mutex::new(BTreeMap::new());
 static UPLOADS: AtomicU64 = AtomicU64::new(0);
 
+/// detiled bytes (`subresources`) of the upload batch being made or run, and the most so far
+static UPLOAD_VEC_BYTES: AtomicU64 = AtomicU64::new(0);
+static UPLOAD_VEC_PEAK: AtomicU64 = AtomicU64::new(0);
+
+/// `XCL_ACTIVITY`: textures kept in step – active and shadowed (count, bytes of the title's
+/// memory they stand for, bytes of their layouts' tables on the CPU), those waiting for their
+/// first upload, and the detiled bytes of the upload batch alive now and at most so far.
+pub fn memory() -> ([u64; 3], [u64; 3], u64, u64, u64) {
+    let sum = |m: &BTreeMap<usize, Entry>| {
+        m.values().fold([0u64; 3], |a, e| {
+            let tables: usize = e.tex.planes.iter().map(|p| if let xg::PlaneKind::Surface(s) = &p.kind { s.chain.layout.table_bytes() } else { 0 }).sum();
+            [a[0] + 1, a[1] + e.tex.size(), a[2] + tables as u64]
+        })
+    };
+    let t = TEXTURES.lock().unwrap();
+    (sum(&t.by_res), sum(&t.shadowed), PENDING.load(Ordering::Relaxed) as u64, UPLOAD_VEC_BYTES.load(Ordering::Relaxed), UPLOAD_VEC_PEAK.load(Ordering::Relaxed))
+}
+
 /// Number of textures kept in title memory and uploads done so far.
 pub fn counts() -> (usize, u64) {
     (TEXTURES.lock().unwrap().by_res.len(), UPLOADS.load(Ordering::Relaxed))
@@ -841,6 +859,7 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12C
     while todo.peek().is_some() {
         let mut picked = Vec::new();
         let mut bytes = 0usize;
+        let mut vec_bytes = 0u64;
         let mut device = 0usize;
         while let Some((_, (dev, _, tex, _))) = todo.peek() {
             if !picked.is_empty() && (bytes + tex.size() as usize > BATCH_BYTES || *dev != device) {
@@ -857,8 +876,19 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12C
             if super::present::trace_frame() {
                 note_content(va, &r, &subs);
             }
+            vec_bytes += subs.iter().map(|s| s.data.capacity() as u64).sum::<u64>();
             batch.push((r, subs, states));
         }
+        // (`XCL_ACTIVITY`; the batch is dropped at the end of this turn of the loop)
+        let alive = UPLOAD_VEC_BYTES.fetch_add(vec_bytes, Ordering::Relaxed) + vec_bytes;
+        UPLOAD_VEC_PEAK.fetch_max(alive, Ordering::Relaxed);
+        struct Alive(u64);
+        impl Drop for Alive {
+            fn drop(&mut self) {
+                UPLOAD_VEC_BYTES.fetch_sub(self.0, Ordering::Relaxed);
+            }
+        }
+        let _alive = Alive(vec_bytes);
         let d = device as *mut c_void;
         let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { continue };
         if let Some(tq) = title_queue_for(dev, title) {

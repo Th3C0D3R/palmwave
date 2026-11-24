@@ -759,6 +759,30 @@ static REQUESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 static BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// bytes of the buffers (source read, inflated payload) of the requests running now
+static IN_FLIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Bytes in the buffers of the requests running now – `XCL_ACTIVITY`.
+pub fn in_flight_bytes() -> u64 {
+    IN_FLIGHT.load(Ordering::Relaxed)
+}
+
+/// A request's buffers count as in flight until this is dropped.
+struct InFlight(u64);
+
+impl InFlight {
+    fn add(&mut self, bytes: usize) {
+        self.0 += bytes as u64;
+        IN_FLIGHT.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        IN_FLIGHT.fetch_sub(self.0, Ordering::Relaxed);
+    }
+}
+
 /// (requests run, bytes delivered, requests failed) so far
 pub fn counters() -> (u64, u64, u64) {
     (REQUESTS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed))
@@ -790,6 +814,8 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     if !r.dest_physical_pages() && !writable(r.destination as usize, n) {
         return Err(E_ACCESS_VIOLATION);
     }
+    let mut in_flight = InFlight(0);
+    in_flight.add(r.source_size as usize);
     let src: Vec<u8> = if r.memory_source() {
         let mut b = vec![0u8; r.source_size as usize];
         if r.source_physical_pages() {
@@ -826,6 +852,7 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         if d.len() < n {
             d.resize(n, 0);
         }
+        in_flight.add(d.capacity());
         d
     } else {
         src

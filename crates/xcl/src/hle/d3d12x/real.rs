@@ -2280,6 +2280,15 @@ unsafe fn create_display_target(this: *mut c_void, props: usize, desc: usize, st
     hr
 }
 
+/// committed resources the title made in an UPLOAD heap that did not go to unified memory:
+/// (count, bytes) so far (not what is alive)
+static TITLE_UPLOADS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// (count, bytes) of the title's own committed UPLOAD resources made so far – `XCL_ACTIVITY`
+pub fn title_uploads() -> (u64, u64) {
+    (TITLE_UPLOADS[0].load(Ordering::Relaxed), TITLE_UPLOADS[1].load(Ordering::Relaxed))
+}
+
 unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, props: usize, flags: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     static SEEN: AtomicU64 = AtomicU64::new(0);
     if desc != 0 && std::env::var_os("XCL_D3D12_TRACE").is_some() && SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -2327,6 +2336,11 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
     let clear = super::device_x::pc_clear(clear as *const c_void, &mut clear_buf) as usize;
     // console-only state bits (e.g. 0x100000 on a display target) are not the PC's
     let hr = dev_create_committed_resource(this, props, flags, desc, state & PC_RESOURCE_STATES as usize, clear, riid, ppv);
+    if hr >= 0 && props != 0 && desc != 0 && *(props as *const i32) == D3D12_HEAP_TYPE_UPLOAD.0 {
+        TITLE_UPLOADS[0].fetch_add(1, Ordering::Relaxed);
+        // (a buffer's Width is its bytes; a texture in an UPLOAD heap counts its Width only)
+        TITLE_UPLOADS[1].fetch_add(*((desc + 16) as *const u64), Ordering::Relaxed);
+    }
     if hr < 0 {
         let pw = |o: usize| if props == 0 { 0 } else { *((props + o) as *const u32) };
         crate::xlog_warn!(

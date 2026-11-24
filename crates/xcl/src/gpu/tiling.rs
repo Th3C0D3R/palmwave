@@ -152,6 +152,11 @@ impl Layout {
         }
     }
 
+    /// bytes of the offset tables (`XCL_ACTIVITY`: every texture kept in step holds a layout)
+    pub fn table_bytes(&self) -> usize {
+        [&self.ox, &self.oy, &self.oz, &self.hx, &self.hy, &self.hz].iter().map(|t| t.capacity() * 4).sum()
+    }
+
     /// surface `w` × `h` elements: (blocks per row, blocks per column)
     pub fn blocks(&self, w: usize, h: usize) -> (usize, usize) {
         (w.div_ceil(self.block_w), h.div_ceil(self.block_h))

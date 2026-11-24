@@ -135,6 +135,36 @@ fn err(x: windows::core::Error) -> String {
     format!("{x}")
 }
 
+/// staging buffers of texture uploads: made so far (count, bytes) and alive now (count, bytes)
+static STAGING: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// (made, bytes made, alive, bytes alive) of the upload staging buffers – `XCL_ACTIVITY`
+pub fn staging_counts() -> [u64; 4] {
+    std::array::from_fn(|k| STAGING[k].load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The staging buffers of one upload count as alive until this is dropped (with them).
+struct StagingAlive(u64, u64);
+
+impl StagingAlive {
+    unsafe fn of<'a>(buffers: impl IntoIterator<Item = &'a ID3D12Resource>) -> StagingAlive {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (n, bytes) = buffers.into_iter().fold((0, 0), |(n, b), r| (n + 1, b + r.GetDesc().Width));
+        STAGING[0].fetch_add(n, Relaxed);
+        STAGING[1].fetch_add(bytes, Relaxed);
+        STAGING[2].fetch_add(n, Relaxed);
+        STAGING[3].fetch_add(bytes, Relaxed);
+        StagingAlive(n, bytes)
+    }
+}
+
+impl Drop for StagingAlive {
+    fn drop(&mut self) {
+        STAGING[2].fetch_sub(self.0, std::sync::atomic::Ordering::Relaxed);
+        STAGING[3].fetch_sub(self.1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// A PC texture (default heap, left in the shader-resource states) with the console
 /// texture's contents: `mem` from `Placement::start` on.
 pub unsafe fn create(dev: &ID3D12Device, queue: &ID3D12CommandQueue, t: &Image, mem: &[u8], cfg: PipeConfig) -> Result<ID3D12Resource, String> {
@@ -194,10 +224,12 @@ pub unsafe fn upload(dev: &ID3D12Device, queue: &ID3D12CommandQueue, res: &ID3D1
     let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(err)?;
     let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
     let staging = record_upload(dev, &list, res, subs, before, after)?;
+    let alive = StagingAlive::of([&staging]);
     list.Close().map_err(err)?;
     queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(err)?)]);
     let r = wait(dev, queue);
     drop(staging);
+    drop(alive);
     r
 }
 

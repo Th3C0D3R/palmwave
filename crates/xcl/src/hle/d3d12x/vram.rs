@@ -587,6 +587,12 @@ pub(super) fn page_bytes_for(device: usize) -> (usize, usize) {
     ((p.pages.len() + p.extra_pages.len()) * PAGE, p.pools.len() * POOL_PAGES as usize * PAGE)
 }
 
+/// (tiled textures on pages, pool heaps, free tiles, cooling tiles) – `XCL_ACTIVITY`
+pub fn page_counts() -> [usize; 4] {
+    let g = PAGES.lock().unwrap();
+    g.values().flatten().fold([0; 4], |a, p| [a[0] + p.targets.len(), a[1] + p.pools.len(), a[2] + p.free.len(), a[3] + p.cooling.len()])
+}
+
 /// (bytes of pages in use by tiled textures, bytes of pool heaps) – `XCL_ACTIVITY`
 pub fn page_bytes() -> (usize, usize) {
     let g = PAGES.lock().unwrap();
