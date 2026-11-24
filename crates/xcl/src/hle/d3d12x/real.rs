@@ -4968,10 +4968,19 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
     match older {
         // Signal / Wait take a fence: anything else is not one of them
         14 | 15 if is_fence(a1) => {
+            if older == 14 {
+                super::list_x::break_cycles_before_title_signal(this as usize, a1, a2 as u64);
+            }
             let f: unsafe extern "system" fn(*mut c_void, usize, usize) -> i32 = std::mem::transmute(pc(if older == 14 { PC_SIGNAL } else { PC_WAIT }));
             let hr = f(this, a1, a2);
-            if older == 14 && hr >= 0 {
-                super::fence_x::note_queue_signal(a1, a2 as u64);
+            if hr >= 0 {
+                if older == 14 {
+                    super::fence_x::note_queue_signal(a1, a2 as u64);
+                    super::list_x::note_title_queue_signal(this as usize, a1, a2 as u64);
+                } else {
+                    super::fence_x::note_queue_wait(a1, a2 as u64);
+                    super::list_x::note_title_queue_wait(this as usize, a1, a2 as u64);
+                }
             }
             hr as u32 as usize
         }
@@ -5055,10 +5064,12 @@ queue_slots!(14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
 /// never released, and the garbage collector ended the game after 10 s.)
 unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, value: u64, _flags: u32) -> HRESULT {
     const PC_SIGNAL: usize = 14;
+    super::list_x::break_cycles_before_title_signal(this as usize, fence as usize, value);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, PC_SIGNAL));
     let hr = f(this, fence, value);
     if hr >= 0 {
         super::fence_x::note_queue_signal(fence as usize, value);
+        super::list_x::note_title_queue_signal(this as usize, fence as usize, value);
     }
     hr
 }
@@ -5087,8 +5098,9 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         .map(|&l| super::console_list::pc_list(l).or_else(|| super::title_list::backing(l)).unwrap_or(l))
         .collect();
     super::list_x::note_queue_for_lists(this as usize, &mapped);
-    super::list_x::execute_with_waits(&mapped, |chunk| {
+    super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         f(this, chunk.len() as u32, chunk.as_ptr());
+        super::list_x::signal_write64_fences(this, chunk);
         super::list_x::readback_sparse_writes(this, chunk);
         super::list_x::cpu_writes_after(this, chunk);
     });
