@@ -192,6 +192,7 @@ pub mod mirrors {
             let taken: Vec<usize> = s.gpu.values().map(|&(_, c)| c).collect();
             if let Some(&(cpu, _)) = s.cpu.iter().rev().find(|&&(b, n)| n == size && !taken.contains(&b)) {
                 s.gpu.insert(base, (size, cpu));
+                super::GPU_VIEW_MAP_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
                 crate::xlog_info!("kernelx: reservation {base:#x} ({size:#x} bytes, no CPU access) is the GPU view of {cpu:#x}");
             }
         } else if p & 0xFF != super::mem::PAGE_NOACCESS {
@@ -1084,7 +1085,7 @@ pub fn physical_page_at(va: usize) -> bool {
     AWAY.lock().unwrap().as_ref().is_some_and(|a| a.at.contains_key(&(va & !(PHYS_PAGE - 1))))
 }
 
-/// Changes when pages are mapped or unmapped in a GPU view or its backing reservation is lost.
+/// Changes when a GPU view gains or loses its backing reservation or physical page mappings.
 static GPU_VIEW_MAP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Generation of the backing memory seen by textures in GPU views.

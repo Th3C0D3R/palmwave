@@ -527,7 +527,8 @@ fn source_of(va: usize, len: usize) -> Source {
     }
 }
 
-/// Physical pages were mapped or unmapped in a GPU view since the last look, or the queue's
+/// A GPU view gained or lost its backing reservation, physical pages were mapped or unmapped
+/// in one since the last look, or the queue's
 /// page-mapping method changed what some of its pages show: textures there whose source
 /// changed (a page now mapped under one, or gone from it) read from the new one, uploaded again
 /// at this submit. After the method only the textures on the pages it changed are looked at
@@ -1614,7 +1615,8 @@ mod tests {
         }
         // Larger than all four UMA windows together. These public allocations
         // must use the watched Windows fallback, reserving space rather than RAM.
-        const SIZE: usize = 24usize << 30;
+        // Distinct from the 24 GiB reservation in the parallel kernelx bookkeeping test.
+        const SIZE: usize = (24usize << 30) + PAGE;
         const OFFSET: usize = 0x2_0000;
         const PAGE: usize = 0x1_0000;
         struct Reservation(usize);
@@ -1719,6 +1721,14 @@ mod tests {
             assert!(kernelx::mirrors::apply_batches(1, [page_batch(va, &r)].as_ptr() as usize, pool.0, 4).is_some());
             refresh(queue.as_raw());
             assert_eq!(read_r8(dev, &queue, &texture), vec![0; 64 * 64], "an unmapped page reads as zeros");
+            // Keep the texture alive while its GPU address loses and regains its CPU view.
+            kernelx::mirrors::released(gpu.0);
+            recheck_gpu_view_sources();
+            assert_eq!(TEXTURES.lock().unwrap().by_res[&key].src, Source::At(va));
+            kernelx::mirrors::reserved(gpu.0, SIZE, 0x2040_2000, 0x801);
+            recheck_gpu_view_sources();
+            let src_after_reuse = TEXTURES.lock().unwrap().by_res[&key].src.clone();
+            assert_eq!(src_after_reuse, Source::At(src));
             dev.GetDeviceRemovedReason().unwrap();
         }
     }
