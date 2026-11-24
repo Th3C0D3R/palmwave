@@ -13,6 +13,8 @@
 //! The copy needs each target's state at the present. A bound target is in RENDER_TARGET or
 //! DEPTH_WRITE; the transitions the title records are followed list by list, in submission
 //! order (as `title_textures` does for the textures it uploads into).
+//!
+//! `XCL_SHOW_TARGET` (`show_target`) follows the targets the same way, without the dump.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -23,7 +25,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 /// Targets smaller than this are not dumped (shadow tiles, luminance chains, …).
-const MIN_SIZE: (u64, u32) = (640, 360);
+pub(super) const MIN_SIZE: (u64, u32) = (640, 360);
 /// Targets dumped per frame at most, without `XCL_RT_DUMP_MAX`.
 const MAX_TARGETS: usize = 24;
 
@@ -56,8 +58,9 @@ fn settings() -> Option<Settings> {
     })
 }
 
+/// The frame's targets are followed: for the dump, or for `XCL_SHOW_TARGET`.
 pub(super) fn enabled() -> bool {
-    settings().is_some()
+    settings().is_some() || super::show_target::enabled()
 }
 
 /// How the title used a target.
@@ -109,6 +112,11 @@ static ALIVE: Mutex<Option<[HashMap<usize, ID3D12Resource>; 2]>> = Mutex::new(No
 /// depth-stencil view handle → its resource (with a reference, as `present` keeps the render
 /// targets'), and whether the view only reads the depth
 static DSVS: Mutex<Option<HashMap<usize, (ID3D12Resource, bool)>>> = Mutex::new(None);
+/// `XCL_SHOW_TARGET`: PC command list → its OMSetRenderTargets of enough color targets for a
+/// G-buffer pass (the targets, 0 for a slot without one, and the depth buffer), as `NOTES`
+static BINDINGS: Mutex<Option<HashMap<usize, Vec<(Vec<usize>, Option<usize>)>>>> = Mutex::new(None);
+/// … those of the lists submitted since the last present, each with how often it was set
+static FRAME_BINDINGS: Mutex<Vec<((Vec<usize>, Option<usize>), u32)>> = Mutex::new(Vec::new());
 
 fn note(list: usize, n: Note) {
     NOTES.lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().push(n);
@@ -159,6 +167,17 @@ pub(super) unsafe fn note_depth_bound(list: usize, dsv: usize) {
     note(list, Note::Used(res, View::Dsv, state, !read_only));
 }
 
+/// The title bound the color targets `rts` (0: none in that slot) with the depth-stencil view
+/// `dsv` on PC list `list` (after `note_bound` / `note_depth_bound`): kept for `XCL_SHOW_TARGET`
+/// when there are enough of them for a G-buffer pass.
+pub(super) fn note_binding(list: usize, rts: &[usize], dsv: Option<usize>) {
+    if !super::show_target::enabled() || rts.iter().filter(|&&r| r != 0).count() < super::show_target::GBUFFER_TARGETS {
+        return;
+    }
+    let depth = dsv.and_then(|d| DSVS.lock().unwrap().as_ref()?.get(&d).map(|(r, _)| r.as_raw() as usize));
+    BINDINGS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().push((rts.to_vec(), depth));
+}
+
 /// The title recorded a transition of `res` from `before` to `after` on PC list `list`
 /// (`begin_only`: the first half of a split barrier, which changes nothing yet).
 pub(super) unsafe fn note_transition(list: usize, res: usize, subresource: u32, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES, begin_only: bool) {
@@ -181,6 +200,9 @@ pub(super) unsafe fn note_transition(list: usize, res: usize, subresource: u32, 
 pub(super) fn list_reset(list: usize) {
     if enabled() {
         if let Some(m) = NOTES.lock().unwrap().as_mut() {
+            m.remove(&list);
+        }
+        if let Some(m) = BINDINGS.lock().unwrap().as_mut() {
             m.remove(&list);
         }
     }
@@ -208,12 +230,21 @@ pub(super) fn submitted(lists: &[*mut c_void]) {
     if !enabled() {
         return;
     }
-    let notes = NOTES.lock().unwrap();
-    let Some(m) = notes.as_ref() else { return };
-    let mut frame = FRAME.lock().unwrap();
-    for l in lists {
-        if let Some(n) = m.get(&(*l as usize)) {
-            apply(&mut frame, n);
+    if let Some(m) = NOTES.lock().unwrap().as_ref() {
+        let mut frame = FRAME.lock().unwrap();
+        for l in lists {
+            if let Some(n) = m.get(&(*l as usize)) {
+                apply(&mut frame, n);
+            }
+        }
+    }
+    if let Some(m) = BINDINGS.lock().unwrap().as_ref() {
+        let mut frame = FRAME_BINDINGS.lock().unwrap();
+        for b in lists.iter().filter_map(|l| m.get(&(*l as usize))).flatten() {
+            match frame.iter_mut().find(|(x, _)| x == b) {
+                Some((_, binds)) => *binds += 1,
+                None => frame.push((b.clone(), 1)),
+            }
         }
     }
 }
@@ -228,7 +259,7 @@ fn select<T>(mut targets: Vec<(T, bool, u64, u32)>, max: usize) -> Vec<(T, bool,
     targets
 }
 
-/// A target to copy for the dump: its description, the state it is in, how the title used it.
+/// A target of the frame: its description, the state it is in, how the title used it.
 pub(super) struct Source {
     pub res: ID3D12Resource,
     pub desc: D3D12_RESOURCE_DESC,
@@ -236,27 +267,71 @@ pub(super) struct Source {
     pub view: View,
 }
 
-/// The frame about to be presented as the `n`-th ends: the targets to copy for its dump
-/// (none when this frame is not dumped).
-pub(super) unsafe fn frame_targets(n: u64) -> Vec<Source> {
+/// A target of an OMSetRenderTargets as it is at the present.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Bound {
+    pub res: usize,
+    pub width: u64,
+    pub height: u32,
+    pub format: DXGI_FORMAT,
+}
+
+/// An OMSetRenderTargets of the frame (`note_binding`): its color targets (None: an empty
+/// slot, or a target gone by the present), its depth buffer, and how often it was set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Binding {
+    pub rts: Vec<Option<Bound>>,
+    pub dsv: Option<Bound>,
+    pub binds: u32,
+}
+
+/// What the present takes of the frame it presents (`take_frame`).
+pub(super) struct Frame {
+    /// the frame's number (`n`)
+    pub number: u64,
+    /// its targets, numbered as the dump numbers them: depth and IDs first, then the largest
+    pub targets: Vec<Source>,
+    /// how many of them its dump copies (0: the frame is not dumped)
+    pub dumped: usize,
+    /// its OMSetRenderTargets of enough color targets for a G-buffer pass (`XCL_SHOW_TARGET`)
+    pub bindings: Vec<Binding>,
+}
+
+/// The frame about to be presented as the `n`-th ends: its targets, which of them its dump
+/// copies (none when this frame is not dumped), and its bindings.
+pub(super) unsafe fn take_frame(n: u64) -> Frame {
     let bound = std::mem::take(&mut *FRAME.lock().unwrap());
+    let raw_bindings = std::mem::take(&mut *FRAME_BINDINGS.lock().unwrap());
     let mut found = Vec::new();
+    let mut bindings = Vec::new();
     let settings = settings().filter(|s| super::present::dump_due(n, s.every, s.from));
     let old = {
         let mut g = ALIVE.lock().unwrap();
         let alive = g.get_or_insert_with(Default::default);
-        for t in bound.iter().filter(|_| settings.is_some()) {
-            let Some(res) = alive[0].get(&t.res).or_else(|| alive[1].get(&t.res)).cloned() else { continue };
+        let get = |r: usize| alive[0].get(&r).or_else(|| alive[1].get(&r)).cloned();
+        for t in &bound {
+            let Some(res) = get(t.res) else { continue };
             let d = res.GetDesc();
             if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.Width < MIN_SIZE.0 || d.Height < MIN_SIZE.1 {
                 continue;
             }
             let Some((kind, _)) = kind(d.Format, t.view == View::Dsv).filter(|_| d.SampleDesc.Count <= 1) else {
-                crate::xlog_info!("rt dump: frame {n}: {} target {:#x} {}x{} skipped – format {} ({} samples) is not converted", t.view.name(), t.res, d.Width, d.Height, d.Format.0, d.SampleDesc.Count);
+                if settings.is_some() {
+                    crate::xlog_info!("rt dump: frame {n}: {} target {:#x} {}x{} skipped – format {} ({} samples) is not converted", t.view.name(), t.res, d.Width, d.Height, d.Format.0, d.SampleDesc.Count);
+                }
                 continue;
             };
             let first = t.view == View::Dsv || matches!(kind, Kind::Rg32Uint | Kind::R32Uint | Kind::Float32 | Kind::Depth24 | Kind::Depth16);
             found.push((Source { res, desc: d, state: t.state, view: t.view }, first, d.Width, d.Height));
+        }
+        let at_present = |r: usize| {
+            get(r).map(|x| {
+                let d = x.GetDesc();
+                Bound { res: r, width: d.Width, height: d.Height, format: d.Format }
+            })
+        };
+        for ((rts, dsv), binds) in raw_bindings {
+            bindings.push(Binding { rts: rts.iter().map(|&r| at_present(r)).collect(), dsv: dsv.and_then(at_present), binds });
         }
         // this frame's resources stay alive through the next one: a list recorded now may be
         // submitted then
@@ -264,10 +339,12 @@ pub(super) unsafe fn frame_targets(n: u64) -> Vec<Source> {
         std::mem::replace(&mut alive[1], this)
     };
     drop(old);
-    let Some(settings) = settings else { return Vec::new() };
-    let chosen = select(found, settings.max);
-    crate::xlog_info!("rt dump: frame {n}: {} of the {} targets of the frame are copied", chosen.len(), bound.len());
-    chosen.into_iter().map(|t| t.0).collect()
+    let targets: Vec<Source> = select(found, usize::MAX).into_iter().map(|t| t.0).collect();
+    let dumped = settings.map_or(0, |s| s.max.min(targets.len()));
+    if settings.is_some() {
+        crate::xlog_info!("rt dump: frame {n}: {dumped} of the {} targets of the frame are copied", bound.len());
+    }
+    Frame { number: n, targets, dumped, bindings }
 }
 
 /// How the texels of a format become colors.

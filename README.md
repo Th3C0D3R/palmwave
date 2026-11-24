@@ -58,6 +58,7 @@ Tools used for these measurements:
 - `XCL_GPU_PROFILE=1` times each draw and dispatch on the GPU.
 - `XCL_FRAME_DUMP_FROM=n` writes every presented frame from frame n.
 - `XCL_RT_DUMP=1` writes the frame's render targets and depth.
+- `XCL_SHOW_TARGET=albedo`, `lit`, `depth` or a number shows in the window, in place of the title's picture, what its G-buffer pass drew: the albedo, the albedo under one fixed light with the pass's normals, the depth, or the frame's n-th target as `XCL_RT_DUMP` numbers them. It is a debug view, not the title's lighting.
 - `XCL_FRAME_CENSUS=n` lists frame n's draws and dispatches (pipeline, targets, viewport, depth state, the counts the GPU ran of each ExecuteIndirect) in the log and in `census_<n>.csv`; `XCL_FRAME_CENSUS_FROM=n` does so for frames n to n+2. With `XCL_FRAME_CENSUS_MIN_OPS=m`, frames with fewer than m operations are passed over and the first three from n that have m are kept (the world's first frame is not the same from run to run).
 
 Sound: the title's Opus sound is decoded. It has not been checked by ear on the test machine yet.
